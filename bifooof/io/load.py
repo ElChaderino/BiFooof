@@ -1,7 +1,7 @@
 """Load EEG recordings into one microvolt array.
 
 MNE reads EDF/EDF+, BDF, GDF, BrainVision, Neuroscan CNT, EEGLAB, and FIF.
-WinEEG ``.eeg`` is parsed in memory by the Mitsar converter already on disk.
+WinEEG ``.eeg`` is read by :mod:`bifooof.io.wineeg`.
 BioExplorer ``.bxs`` is converted with ``bxs2edf.exe`` when that tool is present.
 CSV and JSON follow the EDF Studio tabular contract.
 """
@@ -12,7 +12,6 @@ import csv
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -21,13 +20,7 @@ import numpy as np
 from .channels import clean_channel_name, is_auxiliary, match_standard_19
 from .recording import Recording
 from .sniff import sniff
-
-WINEEG_ROOT = Path(
-    os.environ.get(
-        "BIFOOF_WINEEG_CONVERTER",
-        r"G:\Game Rig\Mitsar\EDF_EEG_Converter_Rebuilt",
-    )
-)
+from .wineeg import legacy_physical_channels, read_legacy_eeg
 
 _BXS_CANDIDATES = [
     Path(os.environ["BIFOOF_BXS2EDF"]) if os.environ.get("BIFOOF_BXS2EDF") else None,
@@ -195,53 +188,7 @@ def _recording_from_raw(raw, path: Path, kind: str) -> Recording:
     return finalize(data, list(raw.ch_names), float(raw.info["sfreq"]), str(path), kind)
 
 
-def _wineeg_roots() -> list[Path]:
-    """Places a clean install can still find the WinEEG reader."""
-    roots = []
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", "")
-        if meipass:
-            roots.append(Path(meipass))
-        roots.append(Path(sys.executable).resolve().parent)
-    env = os.environ.get("BIFOOF_WINEEG_CONVERTER")
-    if env:
-        roots.append(Path(env))
-    roots.append(WINEEG_ROOT)
-    unique: list[Path] = []
-    for root in roots:
-        if root not in unique:
-            unique.append(root)
-    return unique
-
-
-def _import_wineeg():
-    """Import the Mitsar reader from the bundle or from a converter checkout."""
-    last: Exception | None = None
-    searches: list[Path | None] = [None, *_wineeg_roots()]
-    for root in searches:
-        if root is not None:
-            if not root.is_dir():
-                continue
-            text = str(root)
-            if text not in sys.path:
-                sys.path.insert(0, text)
-        for name in ("wineeg_converter.core", "wineeg_converter"):
-            sys.modules.pop(name, None)
-        try:
-            from wineeg_converter.core import legacy_physical_channels, read_legacy_eeg
-            return legacy_physical_channels, read_legacy_eeg
-        except ImportError as exc:
-            last = exc
-    searched = ", ".join(str(root) for root in _wineeg_roots())
-    raise FileNotFoundError(
-        "The WinEEG reader was not found. Set BIFOOF_WINEEG_CONVERTER to "
-        f"EDF_EEG_Converter_Rebuilt. Looked in: {searched}."
-    ) from last
-
-
 def _load_wineeg(path: Path) -> Recording:
-    legacy_physical_channels, read_legacy_eeg = _import_wineeg()
-
     eeg = read_legacy_eeg(path)
     logical = int(eeg.header.get("logical_frame_count", 0))
     physical = legacy_physical_channels(eeg, logical_only=logical > 0)

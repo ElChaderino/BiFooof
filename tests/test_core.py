@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -67,6 +68,29 @@ class FormatTests(unittest.TestCase):
             header = root / "traces.vhdr"
             header.write_text("Brain Vision Data Exchange Header File Version 1.0\n", encoding="ascii")
             self.assertEqual(sniff(orphan), "brainvision")
+
+    def test_wineeg_is_read_without_an_external_converter(self):
+        raw = bytearray(0xC8)
+        struct.pack_into("<H", raw, 0x00, 0x0F0E)
+        struct.pack_into("<H", raw, 0x02, 1)
+        struct.pack_into("<H", raw, 0x04, 256)
+        struct.pack_into("<H", raw, 0x0A, 2)
+        struct.pack_into("<I", raw, 0x10, 4)
+        struct.pack_into("<I", raw, 0x18, 0x80)
+        struct.pack_into("<I", raw, 0x1C, 0xC0)
+        struct.pack_into("<I", raw, 0x20, 0xC8)
+        raw[0x80:0x82] = b"O1"
+        struct.pack_into("<f", raw, 0x80 + 0x18, 0.5)
+        struct.pack_into("<hhhh", raw, 0xC0, 10, 20, 30, 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rest.eeg"
+            path.write_bytes(raw)
+            recording = load_recording(path)
+        self.assertEqual(recording.source_format, "wineeg")
+        self.assertEqual(recording.ch_names, ["O1"])
+        self.assertEqual(recording.sfreq, 256.0)
+        self.assertEqual(recording.data.shape, (1, 4))
+        self.assertTrue(np.allclose(recording.data[0], [5.0, 10.0, 15.0, 20.0]))
 
     def test_csv_and_json_roundtrip(self):
         times, data, names = _synthetic()

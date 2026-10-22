@@ -10,11 +10,9 @@ The result is dist\\BiFooof.exe. Copy that file by itself.
 Double-click it for the window. From a command prompt the same exe runs
 info, run, and compare. The first launch unpacks into a temporary folder, so
 it takes longer to appear than a later launch in the same session.
-WinEEG .eeg reading is included when the Mitsar converter is on this machine
-at build time, or when BIFOOF_WINEEG_CONVERTER points at it.
+WinEEG .eeg reading is part of the app.
 """
 
-import os
 from pathlib import Path
 
 import mne
@@ -113,13 +111,7 @@ def _needed_mne_modules() -> list[str]:
 
 
 root = Path(SPECPATH)
-wineeg = Path(os.environ.get(
-    "BIFOOF_WINEEG_CONVERTER",
-    r"G:\Game Rig\Mitsar\EDF_EEG_Converter_Rebuilt",
-))
 pathex = [str(root)]
-if wineeg.is_dir():
-    pathex.append(str(wineeg))
 
 hidden = [
     "specparam",
@@ -146,8 +138,6 @@ hidden += _needed_mne_modules()
 hidden += collect_submodules("specparam")
 hidden += collect_submodules("bycycle")
 hidden += collect_submodules("neurodsp")
-if wineeg.is_dir():
-    hidden += ["wineeg_converter", "wineeg_converter.core", "wineeg_converter.service"]
 
 icon = root / "bifooof" / "assets" / "bifooof.ico"
 # MNE loads its public API from these stubs. They have to sit beside the package.
