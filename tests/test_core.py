@@ -19,10 +19,11 @@ matplotlib.use("QtAgg")
 import numpy as np
 from PySide6.QtWidgets import QApplication
 
-from bifooof.analysis.compare import alpha_peak, compare_spectra
+from bifooof.analysis.compare import ChannelComparison, alpha_peak, compare_spectra
 from bifooof.analysis.cycles import fit_cycles
-from bifooof.analysis.settings import FitSettings
+from bifooof.analysis.settings import FitSettings, band_label, band_phrase
 from bifooof.analysis.specparam_fit import ChannelFit, fit_spectra
+from bifooof.export import comparison_rows
 from bifooof.io.channels import clean_channel_name
 from bifooof.io.condition import guess_condition
 from bifooof.io.load import load_recording, needs_sfreq
@@ -157,6 +158,16 @@ class FitTests(unittest.TestCase):
         item = ChannelFit(name="O1", index=0, usable=True, peaks=[(6.2, 1.0, 1.0), (10.1, 0.4, 1.0)])
         self.assertAlmostEqual(alpha_peak(item)[0], 10.1)
         self.assertAlmostEqual(alpha_peak(item, (4.0, 8.0))[0], 6.2)
+        self.assertEqual(band_label(8.0, 12.0), "Alpha")
+        self.assertEqual(band_label(4.0, 8.0), "Theta")
+        self.assertEqual(band_label(7.0, 13.0), "7–13 Hz")
+        self.assertEqual(band_phrase(13.0, 30.0), "Beta 13–30 Hz")
+        self.assertEqual(band_phrase(7.0, 13.0), "7–13 Hz")
+        exported = comparison_rows([ChannelComparison(name="O1", alpha_reactivity=1.0)], (4.0, 8.0))
+        self.assertEqual(exported[0]["band"], "Theta")
+        self.assertEqual(exported[0]["band_low_hz"], 4.0)
+        self.assertEqual(exported[0]["band_high_hz"], 8.0)
+        self.assertEqual(exported[0]["alpha_reactivity_ec_minus_eo"], 1.0)
 
     def test_bycycle_alpha_period(self):
         cycles = fit_cycles(self.recording, 0, (8.0, 12.0))
@@ -210,6 +221,12 @@ class WindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNotNone(window.cycles.fit)
         self.assertEqual(window.cycles.fit.band, (1.0, 4.0))
+        low, high = window.fit_bar.current_band()
+        self.assertAlmostEqual(low, 1.0)
+        self.assertAlmostEqual(high, 4.0)
+        self.assertTrue(window.fit_bar.band.currentText().startswith("Delta"))
+        for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig, window.cycles.canvas.fig):
+            self.assertTrue(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
         window.close()
 
 
@@ -257,6 +274,9 @@ class SessionTests(unittest.TestCase):
             time.sleep(0.05)
         self.app.processEvents()
         self.assertTrue(window.compare.ready, window.statusBar().currentMessage())
+        self.assertTrue(any(
+            text.get_text() == "EEG Paradox Solutions" for text in window.compare.canvas.fig.texts
+        ))
         fp1 = next(row for row in window.compare.rows if row.name == "Fp1")
         self.assertIsNotNone(fp1.alpha_cf_ec)
         self.assertIsNotNone(fp1.alpha_cf_eo)
@@ -276,6 +296,8 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(window.active, "ec")
         self.assertEqual(window.trace.channels.item(1).checkState(), Qt.Unchecked)
         self.assertIn("Eyes closed", window.trace.canvas.fig.axes[0].get_title(loc="left"))
+        for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig):
+            self.assertTrue(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
         with tempfile.TemporaryDirectory() as tmp:
             written = window.save_session(tmp)
             names = {path.name for path in written}
@@ -289,6 +311,8 @@ class SessionTests(unittest.TestCase):
             text = Path(tmp, "comparison.csv").read_text(encoding="utf-8")
             self.assertIn("Fp1", text)
             self.assertIn("alpha_reactivity_ec_minus_eo", text)
+            self.assertIn("band_low_hz", text)
+            self.assertIn("band_high_hz", text)
         closed, opened = window.spectrum.fits["ec"], window.spectrum.fits["eo"]
         again = compare_spectra(closed, opened)
         self.assertEqual(again[0].name, "Fp1")

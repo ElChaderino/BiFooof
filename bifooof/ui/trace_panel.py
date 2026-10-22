@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..io.recording import Recording
+from ..plots import stamp_figure
 from .canvas import MplCanvas, style_axes
 
 _WINDOWS = [("5 s", 5.0), ("10 s", 10.0), ("15 s", 15.0), ("20 s", 20.0), ("30 s", 30.0)]
@@ -254,4 +255,5 @@ class TracePanel(QWidget):
         )
         style_axes(ax)
         fig.tight_layout()
+        stamp_figure(fig)
         self.canvas.draw_idle()

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..analysis.cycles import BANDS
 from ..analysis.settings import BURST_PRESETS, RANGE_PRESETS, SEGMENT_PRESETS, TIME_PRESETS, FitSettings
 
 
@@ -15,6 +16,7 @@ class FitBar(QFrame):
     """The choices resting-state specparam and bycycle work actually changes."""
 
     apply_requested = Signal(object)
+    band_changed = Signal(float, float)
 
     def __init__(self):
         super().__init__()
@@ -84,22 +86,35 @@ class FitBar(QFrame):
         self.peak_threshold.setToolTip(
             "How many standard deviations a peak must stand above the spectrum to count. Papers leave this at 2."
         )
+        self.band = QComboBox()
+        for label, limits in BANDS:
+            self.band.addItem(label, limits)
+        self.band.addItem("Custom", None)
+        self.band.setCurrentIndex(2)
+        self.band.setToolTip(
+            "Band for the reactivity peak and for bycycle. Alpha 8–12 Hz is the usual eyes-closed band. "
+            "Delta, theta, beta, gamma, or a custom range use the same views."
+        )
         self.alpha_low = _hertz(8.0)
         self.alpha_high = _hertz(12.0)
-        self.alpha_low.setToolTip("Low edge of the band used for alpha reactivity, in Hz.")
-        self.alpha_high.setToolTip("High edge of the band used for alpha reactivity, in Hz.")
+        self.alpha_low.setToolTip("Low edge of the selected band, in Hz. The same range is used for reactivity and for bycycle.")
+        self.alpha_high.setToolTip("High edge of the selected band, in Hz. The same range is used for reactivity and for bycycle.")
 
         self.bursts = QComboBox()
         for label, *_rest in BURST_PRESETS:
             self.bursts.addItem(label)
         self.bursts.setToolTip(
             "Library keeps every consistent run of 3 cycles. "
-            "Resting alpha and paper alpha require a taller amplitude before a run counts as a burst."
+            "Resting alpha and paper alpha are amplitude rules, not a frequency range. "
+            "They still apply to the band you select, and they require a taller amplitude before a run counts as a burst."
         )
 
         self.apply = QPushButton("Refit")
         self.apply.setObjectName("Secondary")
-        self.apply.setToolTip("Run specparam and bycycle again with these settings.")
+        self.apply.setToolTip(
+            "Run specparam and bycycle again with the time window, spectrum range, and burst rule. "
+            "The band updates on its own."
+        )
         self.apply.clicked.connect(self._emit)
 
         self.time.currentIndexChanged.connect(self._on_time)
@@ -111,6 +126,9 @@ class FitBar(QFrame):
         for box in (self.fmin, self.fmax, self.width_low, self.width_high, self.min_height, self.max_peaks):
             box.valueChanged.connect(self._mark_custom_range)
         self.peak_threshold.valueChanged.connect(self._mark_custom_range)
+        self.band.currentIndexChanged.connect(self._on_band)
+        self.alpha_low.valueChanged.connect(self._on_band_edge)
+        self.alpha_high.valueChanged.connect(self._on_band_edge)
         self._on_time()
 
         top = QHBoxLayout()
@@ -151,7 +169,8 @@ class FitBar(QFrame):
         bottom.addWidget(_label("threshold"))
         bottom.addWidget(self.peak_threshold)
         bottom.addSpacing(12)
-        bottom.addWidget(_label("ALPHA"))
+        bottom.addWidget(_label("BAND"))
+        bottom.addWidget(self.band)
         bottom.addWidget(self.alpha_low)
         bottom.addWidget(_label("–"))
         bottom.addWidget(self.alpha_high)
@@ -194,8 +213,53 @@ class FitBar(QFrame):
             min_n_cycles=int(min_cycles),
         )
 
+    def current_band(self) -> tuple[float, float]:
+        return float(self.alpha_low.value()), float(self.alpha_high.value())
+
+    def set_band(self, low: float, high: float, *, named: bool) -> None:
+        """Show a band chosen on the Cycles page. This does not emit band_changed."""
+        self._filling = True
+        self._show_band(float(low), float(high), named)
+        self.alpha_low.setValue(float(low))
+        self.alpha_high.setValue(float(high))
+        self._filling = False
+
     def _emit(self) -> None:
         self.apply_requested.emit(self.settings())
+
+    def _on_band(self, _index: int = 0) -> None:
+        if self._filling:
+            return
+        data = self.band.currentData()
+        if data is not None:
+            self._filling = True
+            self.alpha_low.setValue(float(data[0]))
+            self.alpha_high.setValue(float(data[1]))
+            self._filling = False
+        low, high = self.current_band()
+        self.band_changed.emit(low, high)
+
+    def _on_band_edge(self, _value: float = 0.0) -> None:
+        if self._filling:
+            return
+        self._filling = True
+        custom = self.band.findData(None)
+        if custom >= 0 and self.band.currentIndex() != custom:
+            self.band.setCurrentIndex(custom)
+        self._filling = False
+        low, high = self.current_band()
+        self.band_changed.emit(low, high)
+
+    def _show_band(self, low: float, high: float, named: bool) -> None:
+        if named:
+            for index in range(self.band.count()):
+                data = self.band.itemData(index)
+                if data is not None and abs(float(data[0]) - low) < 0.05 and abs(float(data[1]) - high) < 0.05:
+                    self.band.setCurrentIndex(index)
+                    return
+        custom = self.band.findData(None)
+        if custom >= 0:
+            self.band.setCurrentIndex(custom)
 
     def _on_time(self, _index: int = 0) -> None:
         custom = self.time.currentText() == "Custom"

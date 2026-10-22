@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .analysis.compare import ChannelComparison
 from .analysis.cycles import CycleFit
+from .analysis.settings import band_label
 from .analysis.specparam_fit import SpectrumFit
 from .io.condition import CONDITION_LABELS
 
@@ -61,11 +62,20 @@ def spectrum_rows(fit: SpectrumFit, condition: str, source: str = "") -> list[di
     return rows
 
 
-def comparison_rows(rows: list[ChannelComparison]) -> list[dict]:
+def comparison_rows(
+    rows: list[ChannelComparison],
+    band: tuple[float, float] | None = None,
+) -> list[dict]:
+    """Write the comparison. The alpha_* columns are the peak inside `band`."""
+    low, high = (8.0, 12.0) if band is None else (float(band[0]), float(band[1]))
+    name = band_label(low, high)
     exported = []
     for row in rows:
         exported.append({
             "channel": row.name,
+            "band": name,
+            "band_low_hz": low,
+            "band_high_hz": high,
             "offset_ec": row.offset_ec,
             "offset_eo": row.offset_eo,
             "exponent_ec": row.exponent_ec,

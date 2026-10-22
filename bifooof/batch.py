@@ -144,7 +144,7 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
     written = [
         write_csv(destination / "ec_spectrum.csv", spectrum_rows(closed_fit, "ec", closed.source_path)),
         write_csv(destination / "eo_spectrum.csv", spectrum_rows(opened_fit, "eo", opened.source_path)),
-        write_csv(destination / "comparison.csv", comparison_rows(rows)),
+        write_csv(destination / "comparison.csv", comparison_rows(rows, fit_settings.alpha_band())),
     ]
     if plots:
         fig = Figure(figsize=(10, 7), dpi=120, facecolor="white")

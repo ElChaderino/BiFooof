@@ -28,6 +28,7 @@ class FitSettings:
     max_n_peaks: int = 6
     min_peak_height: float = 0.05
     peak_threshold: float = 2.0
+    # Selected band for the reactivity peak. In the window this is also the bycycle band.
     alpha_low: float = 8.0
     alpha_high: float = 12.0
     amp_fraction: float = 0.0
@@ -52,7 +53,7 @@ class FitSettings:
         if self.max_n_peaks < 1:
             raise ValueError("At least one peak has to be allowed.")
         if self.alpha_high <= self.alpha_low:
-            raise ValueError("The alpha band needs a low frequency below the high one.")
+            raise ValueError("The band needs a low frequency below the high one.")
         if self.peak_threshold <= 0:
             raise ValueError("The peak threshold must be above 0.")
         if self.min_n_cycles < 1:
@@ -70,6 +71,7 @@ class FitSettings:
         }
 
     def alpha_band(self) -> tuple[float, float]:
+        """Selected band. The default is alpha, 8–12 Hz, and any other range is allowed."""
         return (float(self.alpha_low), float(self.alpha_high))
 
     def cycle_thresholds(self) -> dict:
@@ -133,6 +135,31 @@ BURST_PRESETS: list[tuple] = [
     ("Resting alpha", 0.2, 0.5, 0.5, 0.9, 2),
     ("Paper alpha", 0.2, 0.4, 0.4, 0.8, 3),
 ]
+
+# Short name and the edges used by the fit bar, the cycle page, and reactivity.
+NAMED_BANDS: list[tuple[str, float, float]] = [
+    ("Delta", 1.0, 4.0),
+    ("Theta", 4.0, 8.0),
+    ("Alpha", 8.0, 12.0),
+    ("Beta", 13.0, 30.0),
+    ("Gamma", 30.0, 45.0),
+]
+
+
+def band_label(low: float, high: float) -> str:
+    """Short name for a range. 8–12 Hz is Alpha. Anything else unmatched is written as 7–13 Hz."""
+    for name, edge_low, edge_high in NAMED_BANDS:
+        if abs(float(low) - edge_low) < 0.05 and abs(float(high) - edge_high) < 0.05:
+            return name
+    return f"{float(low):g}–{float(high):g} Hz"
+
+
+def band_phrase(low: float, high: float) -> str:
+    """Label with the range, such as Alpha 8–12 Hz or 7–13 Hz."""
+    name = band_label(low, high)
+    if name.isalpha():
+        return f"{name} {float(low):g}–{float(high):g} Hz"
+    return name
 
 
 def clip_recording(recording: Recording, settings: FitSettings) -> Recording:

@@ -127,9 +127,10 @@ class MainWindow(QMainWindow):
         self.spectrum.fit_ready.connect(lambda _condition: self._sync_compare())
         self.spectrum.status.connect(self.statusBar().showMessage)
         self.cycles.status.connect(self.statusBar().showMessage)
-        self.cycles.band.currentIndexChanged.connect(lambda _index: self._sync_compare())
-        self.cycles.low.valueChanged.connect(lambda _value: self._sync_compare())
-        self.cycles.high.valueChanged.connect(lambda _value: self._sync_compare())
+        self.cycles.band.currentIndexChanged.connect(self._on_cycle_band)
+        self.cycles.low.valueChanged.connect(self._on_cycle_band)
+        self.cycles.high.valueChanged.connect(self._on_cycle_band)
+        self.fit_bar.band_changed.connect(self._on_fit_band)
         self.compare.channel_selected.connect(self._select_name)
         self.compare.status.connect(self.statusBar().showMessage)
 
@@ -272,11 +273,12 @@ class MainWindow(QMainWindow):
         if self.compare.ready:
             self.compare.canvas.draw()
             written.append(save_figure(self.compare.canvas.fig, destination / "comparison.png"))
+            band = self.fit_bar.settings().alpha_band()
             written.append(write_csv(
                 destination / "comparison.csv",
                 comparison_rows(compare_spectra(
-                    self.spectrum.fits["ec"], self.spectrum.fits["eo"], self.fit_bar.settings().alpha_band(),
-                )),
+                    self.spectrum.fits["ec"], self.spectrum.fits["eo"], band,
+                ), band),
             ))
             summaries = []
             for key in CONDITIONS:
@@ -312,7 +314,7 @@ class MainWindow(QMainWindow):
         if widget is self.cycles and self.cycles.fit is not None:
             return cycle_detail_rows(self.cycles.fit, self.active)
         if widget is self.compare and self.compare.rows:
-            return comparison_rows(self.compare.rows)
+            return comparison_rows(self.compare.rows, self.compare.settings.alpha_band())
         if widget is self.trace and self.recording is not None:
             return [
                 {
@@ -437,8 +439,17 @@ class MainWindow(QMainWindow):
             f"Refitting {window}, {settings.fmin:g}–{settings.fmax:.0f} Hz, {settings.aperiodic_mode} slope."
         )
 
+    def _on_fit_band(self, low: float, high: float) -> None:
+        self.cycles.set_band(float(low), float(high), named=self.fit_bar.band.currentData() is not None)
+        self._sync_compare()
+
+    def _on_cycle_band(self, *_args) -> None:
+        low, high = self.cycles.current_band()
+        self.fit_bar.set_band(low, high, named=self.cycles.band.currentData() is not None)
+        self._sync_compare()
+
     def _sync_compare(self) -> None:
-        band = self.cycles.current_band()
+        band = self.fit_bar.current_band()
         self.compare.set_pair(self.recordings, self.spectrum.fits, self._channel_name(), band)
 
     def _channel_name(self) -> str:
@@ -498,8 +509,9 @@ class MainWindow(QMainWindow):
             f"<b>BiFooof {__version__}</b><br><br>"
             "Spectral parameterization with specparam, and cycle-by-cycle shape with bycycle.<br><br>"
             "Open an eyes-closed recording and an eyes-open recording. Both fits keep running. "
-            "Compare overlays the two spectra, the exponent change, and alpha reactivity "
-            "(eyes closed minus eyes open).<br><br>"
+            "Compare overlays the two spectra, the exponent change, and reactivity "
+            "in the selected band (eyes closed minus eyes open). Alpha 8–12 Hz is the default. "
+            "Delta, theta, beta, gamma, and a custom range use the same views.<br><br>"
             "Save image writes the current view. Save data writes the current table. "
             "Save session writes both conditions and the comparison into one folder.",
         )

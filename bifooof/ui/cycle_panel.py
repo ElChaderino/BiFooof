@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 from ..analysis.cycles import BANDS, CycleFit, fit_cycles
 from ..analysis.settings import FitSettings
 from ..io.recording import Recording
+from ..plots import stamp_figure
 from .canvas import MplCanvas, style_axes
 from .workers import CallWorker, launch, wait_for
 
@@ -38,7 +39,10 @@ class CyclePanel(QWidget):
             self.band.addItem(label, limits)
         self.band.addItem("Custom", None)
         self.band.setCurrentIndex(2)
-        self.band.setToolTip("Frequency band passed to bycycle. Alpha is the usual eyes-closed band.")
+        self.band.setToolTip(
+            "Same band as the fit bar. Alpha is the usual eyes-closed band. "
+            "Delta, theta, beta, gamma, or a custom range refit bycycle and the comparison."
+        )
         self.low = _hertz(8.0)
         self.high = _hertz(12.0)
         self.low.setToolTip("Low edge of a custom cycle band, in Hz.")
@@ -47,7 +51,7 @@ class CyclePanel(QWidget):
         self.low.valueChanged.connect(self._on_custom_band)
         self.high.valueChanged.connect(self._on_custom_band)
 
-        self.caption = QLabel("Alpha is the default band. Bursts are shaded teal.")
+        self.caption = QLabel("The fit bar chooses the band. Bursts are shaded teal.")
         self.caption.setObjectName("Muted")
         controls = QHBoxLayout()
         band_label = QLabel("Band")
@@ -94,6 +98,39 @@ class CyclePanel(QWidget):
 
     def current_band(self) -> tuple[float, float]:
         return float(self.low.value()), float(self.high.value())
+
+    def set_band(self, low: float, high: float, *, named: bool) -> None:
+        """Match the fit bar. Signals stay blocked so this does not echo or refit twice."""
+        same = (
+            abs(float(self.low.value()) - float(low)) < 0.05
+            and abs(float(self.high.value()) - float(high)) < 0.05
+        )
+        self.band.blockSignals(True)
+        self.low.blockSignals(True)
+        self.high.blockSignals(True)
+        if named:
+            matched = False
+            for index in range(self.band.count()):
+                data = self.band.itemData(index)
+                if data is not None and abs(float(data[0]) - low) < 0.05 and abs(float(data[1]) - high) < 0.05:
+                    self.band.setCurrentIndex(index)
+                    matched = True
+                    break
+            if not matched:
+                custom = self.band.findData(None)
+                if custom >= 0:
+                    self.band.setCurrentIndex(custom)
+        else:
+            custom = self.band.findData(None)
+            if custom >= 0:
+                self.band.setCurrentIndex(custom)
+        self.low.setValue(float(low))
+        self.high.setValue(float(high))
+        self.band.blockSignals(False)
+        self.low.blockSignals(False)
+        self.high.blockSignals(False)
+        if not same:
+            self._refit()
 
     def apply_settings(self, settings: FitSettings) -> None:
         self.settings = settings
@@ -248,6 +285,7 @@ class CyclePanel(QWidget):
         ax.legend(frameon=False, fontsize=8, loc="upper right")
         style_axes(ax)
         fig.tight_layout()
+        stamp_figure(fig)
         self.canvas.draw_idle()
 
 

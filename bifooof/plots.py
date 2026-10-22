@@ -22,6 +22,7 @@ import numpy as np
 
 from .analysis.compare import alpha_peak, compare_spectra
 from .analysis.cycles import CycleFit
+from .analysis.settings import band_phrase
 from .analysis.specparam_fit import SpectrumFit
 from .ui.headmap import draw_head
 
@@ -50,6 +51,15 @@ def mark_spectrum(ax, fmin: float, fmax: float) -> None:
         ax.set_xticklabels([f"{tick:g}" for tick in ticks])
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_xlim(fmin, fmax)
+
+
+def stamp_figure(fig) -> None:
+    """Faint brand mark, drawn over the axes and kept on saved images."""
+    fig.text(
+        0.5, 0.5, "EEG Paradox Solutions",
+        ha="center", va="center", fontsize=15, color="#7f93a8", alpha=0.20,
+        rotation=24, zorder=20, clip_on=False,
+    )
 
 
 def finish_figure(fig) -> None:
@@ -118,6 +128,7 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "") -> None:
     names = [channel.name for channel in fit.channels]
     draw_head(fig.add_subplot(grid[1, 0]), names, exponents, "Exponent", "viridis", item.name)
     draw_head(fig.add_subplot(grid[1, 1]), names, centers, "Peak frequency (Hz)", "plasma", item.name)
+    stamp_figure(fig)
 
 
 def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, channel: str,
@@ -135,7 +146,8 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     _plot_condition(ax, _by_name(eyes_open, channel), _EO, "Eyes open", alpha)
     ax.set_xlabel("")
     ax.set_ylabel("log10 power")
-    ax.set_title(f"{channel}   ·   eyes closed vs eyes open   ·   frequency (Hz)", fontsize=10, loc="left")
+    shown = band_phrase(*alpha)
+    ax.set_title(f"{channel}   ·   eyes closed vs eyes open   ·   {shown}", fontsize=10, loc="left")
     ax.legend(frameon=False, fontsize=8)
     style_axes(ax, grid=True)
     names = [row.name for row in rows]
@@ -147,8 +159,9 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     draw_head(
         fig.add_subplot(grid[1, 1]), names,
         [row.alpha_reactivity for row in rows],
-        f"Alpha {alpha[0]:g}–{alpha[1]:g} Hz   EC − EO", "plasma", channel,
+        f"{shown}   EC − EO", "plasma", channel,
     )
+    stamp_figure(fig)
     return rows
 
 
@@ -184,6 +197,7 @@ def render_cycles(fig, fit: CycleFit, seconds: float = 10.0) -> None:
     )
     style_axes(ax)
     fig.tight_layout()
+    stamp_figure(fig)
 
 
 def _by_name(fit: SpectrumFit, name: str):

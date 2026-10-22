@@ -8,14 +8,10 @@ import numpy as np
 from scipy.signal import butter, detrend, sosfiltfilt
 
 from ..io.recording import Recording
-from .settings import FitSettings, clip_recording
+from .settings import NAMED_BANDS, FitSettings, clip_recording
 
 BANDS: list[tuple[str, tuple[float, float]]] = [
-    ("Delta 1–4 Hz", (1.0, 4.0)),
-    ("Theta 4–8 Hz", (4.0, 8.0)),
-    ("Alpha 8–12 Hz", (8.0, 12.0)),
-    ("Beta 13–30 Hz", (13.0, 30.0)),
-    ("Gamma 30–45 Hz", (30.0, 45.0)),
+    (f"{name} {low:g}–{high:g} Hz", (low, high)) for name, low, high in NAMED_BANDS
 ]
 
 

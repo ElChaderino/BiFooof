@@ -11,21 +11,18 @@ from PySide6.QtWidgets import (
 
 from ..analysis.compare import ChannelComparison, alpha_peak, compare_spectra
 from ..analysis.cycles import CycleFit, fit_cycles
-from ..analysis.settings import FitSettings
+from ..analysis.settings import FitSettings, band_label, band_phrase
 from ..analysis.specparam_fit import ChannelFit, SpectrumFit
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
-from ..plots import mark_spectrum
+from ..plots import mark_spectrum, stamp_figure
 from .canvas import MplCanvas, finish_figure, style_axes
 from .headmap import draw_head
 from .workers import CallWorker, launch, wait_for
 
 _EC = "#1c4e78"
 _EO = "#c2410c"
-_COLUMNS = [
-    "Channel", "Offset EC", "Offset EO", "Exp EC", "Exp EO", "EO − EC",
-    "Alpha EC", "Alpha EO", "EC − EO", "CF EC", "CF EO",
-]
+_LEAD = ["Channel", "Offset EC", "Offset EO", "Exp EC", "Exp EO", "EO − EC"]
 
 
 class ComparePanel(QWidget):
@@ -47,13 +44,13 @@ class ComparePanel(QWidget):
 
         self.caption = QLabel(
             "Open an eyes-closed and an eyes-open recording. "
-            "Alpha reactivity is eyes-closed peak power minus eyes-open."
+            "Reactivity is eyes-closed peak power minus eyes-open in the band on the fit bar."
         )
         self.caption.setObjectName("Muted")
         self.caption.setWordWrap(True)
         self.canvas = MplCanvas(width=8.0, height=6.0)
-        self.table = QTableWidget(0, len(_COLUMNS))
-        self.table.setHorizontalHeaderLabels(_COLUMNS)
+        self.table = QTableWidget(0, 11)
+        self._refresh_headers()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -87,7 +84,9 @@ class ComparePanel(QWidget):
 
     def apply_settings(self, settings: FitSettings) -> None:
         self.settings = settings
+        self.band = settings.alpha_band()
         self._cycle_key = None
+        self._refresh_headers()
         if self.ready:
             self.rows = compare_spectra(self.fits["ec"], self.fits["eo"], self._alpha())
             self._fill_table()
@@ -102,6 +101,9 @@ class ComparePanel(QWidget):
         self.recordings = recordings
         self.fits = fits
         self.band = (float(band[0]), float(band[1]))
+        self.settings.alpha_low = self.band[0]
+        self.settings.alpha_high = self.band[1]
+        self._refresh_headers()
         if not self.ready:
             self.rows = []
             self.table.setRowCount(0)
@@ -125,6 +127,13 @@ class ComparePanel(QWidget):
 
     def shutdown(self) -> None:
         wait_for(self)
+
+    def _refresh_headers(self) -> None:
+        name = band_label(*self._alpha())
+        self.table.setHorizontalHeaderLabels([
+            *_LEAD,
+            f"{name} EC", f"{name} EO", "EC − EO", "CF EC", "CF EO",
+        ])
 
     def _fill_table(self) -> None:
         self.table.blockSignals(True)
@@ -180,12 +189,13 @@ class ComparePanel(QWidget):
         fmax = max(item.fmax for item in self.fits.values())
         mark_spectrum(ax, fmin, fmax)
         alpha = self._alpha()
+        shown = band_phrase(*alpha)
         _plot_condition(ax, ec_item, _EC, "Eyes closed", alpha)
         _plot_condition(ax, eo_item, _EO, "Eyes open", alpha)
         ax.set_xlabel("")
         ax.set_ylabel("log10 power")
         ax.set_title(
-            f"{self.channel}   ·   eyes closed vs eyes open   ·   alpha {alpha[0]:g}–{alpha[1]:g} Hz",
+            f"{self.channel}   ·   eyes closed vs eyes open   ·   {shown}",
             fontsize=10, loc="left",
         )
         ax.legend(frameon=False, fontsize=8)
@@ -200,15 +210,18 @@ class ComparePanel(QWidget):
         draw_head(
             fig.add_subplot(grid[1, 1]), names,
             [row.alpha_reactivity for row in self.rows],
-            f"Alpha {self._alpha()[0]:g}–{self._alpha()[1]:g} Hz   EC − EO", "plasma", self.channel,
+            f"{shown}   EC − EO", "plasma", self.channel,
         )
+        stamp_figure(fig)
         self.canvas.draw_idle()
         ec_power = next((row.alpha_power_ec for row in self.rows if row.name == self.channel), None)
         eo_power = next((row.alpha_power_eo for row in self.rows if row.name == self.channel), None)
         reactivity = None if ec_power is None or eo_power is None else ec_power - eo_power
+        name = band_label(*alpha)
+        kind = name.lower() if name.isalpha() else name
         self.caption.setText(
-            f"{self.channel}: alpha reactivity (EC − EO) {_num(reactivity, 3)}. "
-            "Positive means more alpha with eyes closed."
+            f"{self.channel}: {kind} reactivity (EC − EO) {_num(reactivity, 3)}. "
+            "Positive means more power in this band with eyes closed."
         )
 
     def _maybe_cycles(self) -> None:
