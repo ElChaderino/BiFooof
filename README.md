@@ -18,7 +18,7 @@ Alpha, 8–12 Hz, is the default. The same control is delta 1–4, theta 4–8, 
 
 Burst detection can stay on the library rule, or use the resting-alpha and paper-alpha amplitude rules. Those rules still apply to whichever band is selected.
 
-Plots in the window and saved images carry an EEG Paradox Solutions watermark.
+
 
 ## Screenshots
 
