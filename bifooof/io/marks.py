@@ -94,6 +94,7 @@ def _clip_span(
         for mark in recording.marks
         if t0 - 1e-9 <= mark.onset_s < t1 + 1e-9
     ]
+    valid, spans = recording.slice_exclusions(i0, i1, t0)
     name = CONDITION_LABELS.get(condition, condition)
     shown = label or name
     note = f"{name} mark, {t0:.1f}–{t1:.1f} s ({shown})."
@@ -105,4 +106,7 @@ def _clip_span(
         source_format=recording.source_format,
         notes=[*recording.notes, note],
         marks=kept,
+        valid=valid,
+        bad_channels=list(recording.bad_channels),
+        rejected_spans=spans,
     )

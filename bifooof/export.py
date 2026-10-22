@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
+from . import __version__
 from .analysis.compare import ChannelComparison
 from .analysis.cycles import CycleFit
-from .analysis.settings import band_label
+from .analysis.settings import FitSettings, band_label
 from .analysis.specparam_fit import SpectrumFit
 from .io.condition import CONDITION_LABELS
+from .io.recording import Recording
 
 
 def save_figure(fig, path: str | Path) -> Path:
@@ -47,6 +50,14 @@ def spectrum_rows(fit: SpectrumFit, condition: str, source: str = "") -> list[di
             "condition": CONDITION_LABELS.get(condition, condition),
             "source": source,
             "channel": item.name,
+            "t_start_s": fit.t_start,
+            "t_end_s": fit.t_end,
+            "fmin_hz": fit.fmin,
+            "fmax_hz": fit.fmax,
+            "welch_segment_s": fit.segment_s,
+            "welch_nperseg": fit.welch_nperseg,
+            "detrend": fit.detrend,
+            "aperiodic_mode": fit.aperiodic_mode,
             "usable": item.usable,
             "offset": item.offset,
             "knee": item.knee,
@@ -59,6 +70,25 @@ def spectrum_rows(fit: SpectrumFit, condition: str, source: str = "") -> list[di
             "error": item.error,
             "note": item.reason,
         })
+    return rows
+
+
+def peak_rows(fit: SpectrumFit, condition: str, source: str = "") -> list[dict]:
+    """One row per fitted peak, with center, height, and bandwidth."""
+    label = CONDITION_LABELS.get(condition, condition)
+    rows = []
+    for item in fit.channels:
+        for index, (center, height, width) in enumerate(item.peaks, start=1):
+            rows.append({
+                "condition": label,
+                "source": source,
+                "channel": item.name,
+                "peak": index,
+                "center_frequency_hz": center,
+                "peak_height_log10": height,
+                "bandwidth_hz": width,
+                "above_aperiodic": True,
+            })
     return rows
 
 
@@ -86,6 +116,12 @@ def comparison_rows(
             "alpha_power_ec": row.alpha_power_ec,
             "alpha_power_eo": row.alpha_power_eo,
             "alpha_reactivity_ec_minus_eo": row.alpha_reactivity,
+            "peak_height_definition": "aperiodic-adjusted peak height, log10 power, EC minus EO",
+            "peak_center_difference_hz": row.peak_center_difference_hz,
+            "band_power_ec": row.band_power_ec,
+            "band_power_eo": row.band_power_eo,
+            "band_power_reactivity_percent": row.band_power_reactivity_percent,
+            "band_power_definition": "mean Welch power in the band, (EC - EO) / EO * 100",
         })
     return exported
 
@@ -98,7 +134,10 @@ def cycle_summary_row(fit: CycleFit, condition: str, source: str = "") -> dict:
         "band_low_hz": fit.band[0],
         "band_high_hz": fit.band[1],
         "n_cycles": fit.n_cycles,
-        "n_bursts": fit.n_bursts,
+        "n_burst_cycles": fit.n_burst_cycles,
+        "n_burst_episodes": fit.n_burst_episodes,
+        "burst_duration_s": fit.burst_duration_s,
+        "burst_fraction": fit.burst_fraction,
         "burst_note": fit.burst_note,
         "period_ms": fit.period_ms,
         "rise_decay": fit.rise_decay,
@@ -117,6 +156,81 @@ def cycle_detail_rows(fit: CycleFit, condition: str) -> list[dict]:
         {"condition": label, "channel": fit.channel, "cycle": index + 1, **row}
         for index, row in enumerate(fit.cycles)
     ]
+
+
+def write_json(path: str | Path, payload: dict) -> Path:
+    destination = Path(path)
+    if destination.suffix.lower() != ".json":
+        destination = destination.with_suffix(".json")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return destination
+
+
+def fit_metadata(
+    recording: Recording,
+    settings: FitSettings,
+    fit: SpectrumFit | None = None,
+    condition: str = "",
+) -> dict:
+    """Settings and exclusions behind one fit, so a table can be read later."""
+    invalid = 0 if recording.valid is None else int((~recording.valid).sum())
+    accepted = recording.n_samples if recording.valid is None else int(recording.valid.any(axis=0).sum())
+    payload = {
+        "bifooof": __version__,
+        "specparam": _package_version("specparam"),
+        "bycycle": _package_version("bycycle"),
+        "mne": _package_version("mne"),
+        "numpy": _package_version("numpy"),
+        "condition": CONDITION_LABELS.get(condition, condition),
+        "source": recording.source_path,
+        "format": recording.source_format,
+        "sfreq_hz": recording.sfreq,
+        "units": "microvolts",
+        "reference": "as stored in the file; BiFooof does not re-reference",
+        "time_window_start_s": None if fit is None else fit.t_start,
+        "time_window_end_s": None if fit is None else fit.t_end,
+        "fmin_hz": settings.fmin if fit is None else fit.fmin,
+        "fmax_hz": settings.fmax if fit is None else fit.fmax,
+        "welch_segment_s": settings.segment_s if fit is None else fit.segment_s,
+        "welch_nperseg": None if fit is None else fit.welch_nperseg,
+        "detrend": "linear",
+        "aperiodic_mode": settings.aperiodic_mode,
+        "peak_width_hz": [settings.peak_width_low, settings.peak_width_high],
+        "max_n_peaks": settings.max_n_peaks,
+        "min_peak_height": settings.min_peak_height,
+        "peak_threshold_sd": settings.peak_threshold,
+        "band_hz": [settings.alpha_low, settings.alpha_high],
+        "burst_thresholds": settings.cycle_thresholds(),
+        "bad_channels": list(recording.bad_channels),
+        "rejected_spans_s": [
+            {"start": start, "end": stop} for start, stop in recording.rejected_spans
+        ],
+        "invalid_channel_samples": invalid,
+        "accepted_duration_s": accepted / recording.sfreq if recording.sfreq else 0.0,
+        "notes": list(recording.notes),
+        "peak_height_definition": (
+            "EC minus EO fitted peak height above the aperiodic background, in log10 power. "
+            "Each condition picks its own tallest peak in the band. A missing peak stays missing."
+        ),
+        "band_power_definition": (
+            "Mean linear Welch power in the band. Reactivity percent is (EC - EO) / EO * 100."
+        ),
+        "burst_definition": (
+            "n_burst_cycles counts cycles labelled as part of a burst. "
+            "n_burst_episodes counts contiguous runs of those cycles. "
+            "A run cannot cross a rejected interval."
+        ),
+    }
+    return payload
+
+
+def _package_version(name: str) -> str:
+    try:
+        module = __import__(name)
+    except Exception:
+        return ""
+    return str(getattr(module, "__version__", ""))
 
 
 def _cell(value) -> str:

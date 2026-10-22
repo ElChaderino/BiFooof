@@ -49,7 +49,7 @@ class ComparePanel(QWidget):
         self.caption.setObjectName("Muted")
         self.caption.setWordWrap(True)
         self.canvas = MplCanvas(width=8.0, height=6.0)
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 12)
         self._refresh_headers()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -137,8 +137,18 @@ class ComparePanel(QWidget):
         name = band_label(*self._alpha())
         self.table.setHorizontalHeaderLabels([
             *_LEAD,
-            f"{name} EC", f"{name} EO", "EC − EO", "CF EC", "CF EO",
+            f"{name} EC", f"{name} EO", "Peak Δ", "Band %", "CF EC", "CF EO",
         ])
+        header = self.table.horizontalHeaderItem(8)
+        if header is not None:
+            header.setToolTip(
+                "Eyes-closed fitted peak height minus eyes-open fitted peak height, "
+                "above the aperiodic background. Not percent band power. "
+                "Each side picks its own tallest peak in the band."
+            )
+        band_header = self.table.horizontalHeaderItem(9)
+        if band_header is not None:
+            band_header.setToolTip("Percent change in mean Welch band power, (EC − EO) / EO × 100.")
 
     def _fill_table(self) -> None:
         self.table.blockSignals(True)
@@ -157,6 +167,7 @@ class ComparePanel(QWidget):
                 _num(row.alpha_power_ec, 3),
                 _num(row.alpha_power_eo, 3),
                 _num(row.alpha_reactivity, 3),
+                _num(row.band_power_reactivity_percent, 1),
                 _num(row.alpha_cf_ec, 2),
                 _num(row.alpha_cf_eo, 2),
             ]
@@ -215,18 +226,20 @@ class ComparePanel(QWidget):
         draw_head(
             fig.add_subplot(grid[1, 1]), names,
             [row.alpha_reactivity for row in self.rows],
-            f"{shown}   EC − EO", "plasma", self.channel,
+            f"{shown} peak height  EC − EO", "plasma", self.channel,
         )
         stamp_figure(fig)
         self.canvas.draw_idle()
-        ec_power = next((row.alpha_power_ec for row in self.rows if row.name == self.channel), None)
-        eo_power = next((row.alpha_power_eo for row in self.rows if row.name == self.channel), None)
-        reactivity = None if ec_power is None or eo_power is None else ec_power - eo_power
+        chosen = next((row for row in self.rows if row.name == self.channel), None)
+        reactivity = None if chosen is None else chosen.alpha_reactivity
+        percent = None if chosen is None else chosen.band_power_reactivity_percent
+        percent_text = "not available" if percent is None else f"{percent:.1f}%"
         name = band_label(*alpha)
         kind = name.lower() if name.isalpha() else name
         self.caption.setText(
-            f"{self.channel}: {kind} reactivity (EC − EO) {_num(reactivity, 3)}. "
-            "Positive means more power in this band with eyes closed."
+            f"{self.channel}: {kind} peak height EC−EO {_num(reactivity, 3)} "
+            "(above the aperiodic fit; a missing peak stays missing). "
+            f"Band power reactivity {percent_text}."
         )
 
     def _maybe_cycles(self) -> None:

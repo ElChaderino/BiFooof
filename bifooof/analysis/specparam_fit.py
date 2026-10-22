@@ -44,6 +44,8 @@ class SpectrumFit:
     t_end: float = 0.0
     segment_s: float = 4.0
     aperiodic_mode: str = "fixed"
+    welch_nperseg: int = 0
+    detrend: str = "linear"
 
 
 def fit_spectra(
@@ -62,18 +64,43 @@ def fit_spectra(
     fmin = float(chosen.fmin)
     fmax = float(chosen.fmax)
     data = np.asarray(recording.data, dtype=np.float64)
-    usable = [index for index in range(data.shape[0]) if float(np.std(data[index])) > 1e-6]
-    results = [
-        ChannelFit(name=name, index=index, usable=index in usable,
-                   reason="" if index in usable else "Flat channel.")
-        for index, name in enumerate(recording.ch_names)
-    ]
-    if not usable:
-        raise ValueError("Every channel is flat, so there is no spectrum to fit.")
+    bad = set(recording.bad_channels)
+    results = []
+    candidates: list[int] = []
+    for index, name in enumerate(recording.ch_names):
+        if name in bad:
+            results.append(ChannelFit(name=name, index=index, usable=False, reason="Bad channel."))
+            continue
+        mask = recording.mask(index)
+        samples = data[index, mask]
+        samples = samples[np.isfinite(samples)]
+        if samples.size < 16 or float(np.std(samples)) <= 1e-6:
+            reason = "No accepted samples." if samples.size < 16 else "Flat channel."
+            results.append(ChannelFit(name=name, index=index, usable=False, reason=reason))
+            continue
+        results.append(ChannelFit(name=name, index=index, usable=True))
+        candidates.append(index)
+    if not candidates:
+        raise ValueError("Every channel is flat or rejected, so there is no spectrum to fit.")
 
-    freqs, power = welch_spectra(
-        data[usable], recording.sfreq, fmin=fmin, fmax=fmax, segment_s=chosen.segment_s,
+    masks = np.vstack([recording.mask(index) for index in candidates])
+    freqs, power, nperseg = welch_spectra(
+        data[candidates], recording.sfreq, fmin=fmin, fmax=fmax,
+        segment_s=chosen.segment_s, valid=masks,
     )
+    usable = []
+    kept_rows = []
+    for slot, channel_index in enumerate(candidates):
+        if np.isfinite(power[slot]).all():
+            usable.append(channel_index)
+            kept_rows.append(slot)
+            continue
+        item = results[channel_index]
+        item.usable = False
+        item.reason = "Accepted samples are shorter than the Welch window."
+    if not usable:
+        raise ValueError("No accepted stretch is long enough for the Welch window.")
+    power = power[kept_rows]
     kwargs = chosen.model_kwargs()
     group = SpectralGroupModel(**kwargs)
     try:
@@ -95,6 +122,7 @@ def fit_spectra(
         t_end=t_end,
         segment_s=float(chosen.segment_s),
         aperiodic_mode=chosen.aperiodic_mode,
+        welch_nperseg=int(nperseg),
     )
 
 
@@ -119,7 +147,7 @@ def _fill_one_by_one(spectral_model, results, usable, freqs, power, kwargs: dict
         item = results[channel_index]
         model = spectral_model(**kwargs)
         try:
-            model.fit(freqs, power[slot], n_jobs=1, progress=None)
+            model.fit(freqs, power[slot])
             _store_curves(item, model)
             aperiodic = np.atleast_1d(np.asarray(model.get_params("aperiodic"), dtype=np.float64))
             item.offset, item.exponent, item.knee = _read_aperiodic(aperiodic)

@@ -8,6 +8,7 @@ import numpy as np
 from scipy.signal import butter, detrend, sosfiltfilt
 
 from ..io.recording import Recording
+from .segments import accepted_runs, covered_length, episode_count
 from .settings import NAMED_BANDS, FitSettings, clip_recording
 
 BANDS: list[tuple[str, tuple[float, float]]] = [
@@ -23,7 +24,10 @@ class CycleFit:
     sfreq: float
     filtered: np.ndarray
     n_cycles: int
-    n_bursts: int
+    n_burst_cycles: int
+    n_burst_episodes: int
+    burst_duration_s: float
+    burst_fraction: float | None
     period_ms: float | None
     rise_decay: float | None
     peak_trough: float | None
@@ -37,6 +41,11 @@ class CycleFit:
     cycles: list[dict] = field(default_factory=list)
     t_offset: float = 0.0
     burst_note: str = ""
+
+    @property
+    def n_bursts(self) -> int:
+        """Cycles that belong to a burst. Prefer ``n_burst_cycles``; this is not an episode count."""
+        return self.n_burst_cycles
 
 
 def fit_cycles(
@@ -64,19 +73,44 @@ def fit_cycles(
     t_offset = min(max(0.0, float(chosen.t_start)), recording.duration_s)
     recording = clip_recording(recording, chosen)
 
-    # WinEEG files can carry a large linear drift. The spectrum fit removes the
-    # same straight line before Welch. bycycle needs it gone before the bandpass,
-    # or the ramp swallows the cycles.
-    signal = detrend(np.asarray(recording.data[channel_index], dtype=np.float64), type="linear")
-    filtered = _bandpass(signal, recording.sfreq, low, high)
+    # WinEEG files can carry a large linear drift. Each accepted run is detrended
+    # on its own, and a BAD or nonfinite gap is never part of a cycle.
+    signal = np.asarray(recording.data[channel_index], dtype=np.float64)
+    mask = recording.mask(channel_index) & np.isfinite(signal)
+    filtered = np.full(signal.shape, np.nan, dtype=np.float64)
     model = Bycycle(
         center_extrema="peak",
         burst_method="cycles",
         thresholds=chosen.cycle_thresholds(),
         return_samples=True,
     )
-    model.fit(signal, recording.sfreq, (low, high))
-    frame = model.df_features
+    frames = []
+    episodes = 0
+    minimum = max(int(round(recording.sfreq)), int(round(3.0 * recording.sfreq / low)))
+    for start, stop in accepted_runs(mask):
+        if stop - start < minimum:
+            continue
+        piece = signal[start:stop]
+        if not np.isfinite(piece).all():
+            continue
+        piece = detrend(piece, type="linear")
+        try:
+            filtered[start:stop] = _bandpass(piece, recording.sfreq, low, high)
+            model.fit(piece, recording.sfreq, (low, high))
+        except Exception:
+            filtered[start:stop] = np.nan
+            continue
+        piece_frame = model.df_features
+        if piece_frame is None or not len(piece_frame):
+            continue
+        piece_frame = piece_frame.copy()
+        for column in piece_frame.columns:
+            if str(column).startswith("sample_"):
+                piece_frame[column] = piece_frame[column] + start
+        if "is_burst" in piece_frame:
+            episodes += episode_count(np.asarray(piece_frame["is_burst"], dtype=bool))
+        frames.append(piece_frame)
+    frame = _concat_frames(frames)
     spans: list[tuple[int, int, bool]] = []
     peaks: list[int] = []
     burst_mask = np.zeros(0, dtype=bool)
@@ -105,8 +139,11 @@ def fit_cycles(
 
     period = _median("period")
     burst_period = _median("period", burst_mask)
-    n_bursts = int(burst_mask.sum()) if burst_mask.size else 0
-    note = "" if n_bursts else burst_note(frame, chosen.cycle_thresholds())
+    n_burst_cycles = int(burst_mask.sum()) if burst_mask.size else 0
+    covered = covered_length(spans)
+    accepted = int(mask.sum())
+    fraction = None if accepted <= 0 else covered / accepted
+    note = "" if n_burst_cycles else burst_note(frame, chosen.cycle_thresholds())
     return CycleFit(
         channel=recording.ch_names[channel_index],
         channel_index=channel_index,
@@ -114,7 +151,10 @@ def fit_cycles(
         sfreq=float(recording.sfreq),
         filtered=filtered,
         n_cycles=len(spans),
-        n_bursts=n_bursts,
+        n_burst_cycles=n_burst_cycles,
+        n_burst_episodes=episodes,
+        burst_duration_s=covered / recording.sfreq,
+        burst_fraction=fraction,
         period_ms=None if period is None else period / recording.sfreq * 1000.0,
         rise_decay=_median("time_rdsym"),
         peak_trough=_median("time_ptsym"),
@@ -206,6 +246,16 @@ def _join(parts: list[str]) -> str:
 
 def _cutoff_text(value: float) -> str:
     return f"{value:g}"
+
+
+def _concat_frames(frames: list):
+    if not frames:
+        return None
+    if len(frames) == 1:
+        return frames[0]
+    import pandas as pd
+
+    return pd.concat(frames, ignore_index=True)
 
 
 def _cycle_rows(frame, sfreq: float) -> list[dict]:

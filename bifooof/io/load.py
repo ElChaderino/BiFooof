@@ -101,14 +101,32 @@ def finalize(
     source_path: str,
     source_format: str,
     notes: list[str] | None = None,
+    valid: np.ndarray | None = None,
+    bad_channels: list[str] | None = None,
+    rejected_spans: list[tuple[float, float]] | None = None,
 ) -> Recording:
-    """Clean names, drop annotation channels, and prefer the standard 19."""
+    """Clean names, drop annotation channels, and prefer the standard 19.
+
+    Samples that are nonfinite, inside a BAD annotation, or on a bad channel
+    stay excluded. They are stored as NaN and are not turned into zeros.
+    """
     notes = list(notes or [])
-    array = np.nan_to_num(np.asarray(data, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    array = np.asarray(data, dtype=np.float64)
     if array.ndim != 2:
         raise ValueError("Expected a channels-by-samples array.")
     if array.shape[0] != len(names):
         raise ValueError("Channel name count does not match the data.")
+    finite = np.isfinite(array)
+    if valid is None:
+        accepted = finite
+    else:
+        accepted = np.asarray(valid, dtype=bool) & finite
+        if accepted.shape != array.shape:
+            raise ValueError("The validity mask must have the same shape as the data.")
+    bad_names = {clean_channel_name(name) for name in (bad_channels or []) if clean_channel_name(name)}
+    for index, raw_name in enumerate(names):
+        if clean_channel_name(raw_name) in bad_names:
+            accepted[index, :] = False
 
     kept_rows: list[int] = []
     cleaned: list[str] = []
@@ -134,10 +152,12 @@ def finalize(
         raise ValueError("No EEG channels remained after dropping annotation and marker channels.")
 
     array = array[kept_rows]
+    accepted = accepted[kept_rows]
     matched = match_standard_19(cleaned)
     if matched:
         order = [cleaned.index(name) for name in matched]
         array = array[order]
+        accepted = accepted[order]
         cleaned = [cleaned[i] for i in order]
         skipped = len(kept_rows) - len(order)
         if skipped:
@@ -149,6 +169,21 @@ def finalize(
     if dropped_dup:
         notes.append(f"Dropped {dropped_dup} duplicate channel(s) after renaming.")
 
+    kept_bad = [name for name in cleaned if name in bad_names]
+    if kept_bad:
+        notes.append("Bad channels left out of the fit: " + ", ".join(kept_bad) + ".")
+    excluded = int((~accepted).sum())
+    if rejected_spans:
+        listed = ", ".join(f"{start:.1f}–{stop:.1f} s" for start, stop in rejected_spans)
+        notes.append(f"BAD annotations left out of the fit: {listed}.")
+    if excluded:
+        notes.append(f"Left {excluded} nonfinite or BAD-marked channel-samples out of the fit.")
+        array = array.copy()
+        array[~accepted] = np.nan
+        stored_valid: np.ndarray | None = accepted
+    else:
+        stored_valid = None
+
     return Recording(
         data=array,
         ch_names=cleaned,
@@ -156,6 +191,9 @@ def finalize(
         source_path=source_path,
         source_format=source_format,
         notes=notes,
+        valid=stored_valid,
+        bad_channels=kept_bad,
+        rejected_spans=list(rejected_spans or []),
     )
 
 
@@ -186,7 +224,36 @@ def _load_cnt(path: Path) -> Recording:
 
 def _recording_from_raw(raw, path: Path, kind: str) -> Recording:
     data = np.asarray(raw.get_data(), dtype=np.float64) * 1e6
-    return finalize(data, list(raw.ch_names), float(raw.info["sfreq"]), str(path), kind)
+    sfreq = float(raw.info["sfreq"])
+    valid = np.ones(data.shape, dtype=bool)
+    spans: list[tuple[float, float]] = []
+    annotations = getattr(raw, "annotations", None)
+    descriptions = [] if annotations is None else list(annotations.description)
+    channel_lists = getattr(annotations, "ch_names", None) if annotations is not None else None
+    names = list(raw.ch_names)
+    for index, description in enumerate(descriptions):
+        if not str(description).upper().startswith("BAD"):
+            continue
+        onset = float(annotations.onset[index])
+        end = onset + float(annotations.duration[index])
+        i0 = min(max(0, int(round(onset * sfreq))), data.shape[1])
+        i1 = min(max(i0, int(round(end * sfreq))), data.shape[1])
+        named: list[str] = []
+        if channel_lists is not None and index < len(channel_lists) and channel_lists[index]:
+            named = [clean_channel_name(str(name)) for name in channel_lists[index]]
+            named = [name for name in named if name]
+        if not named:
+            valid[:, i0:i1] = False
+            spans.append((max(0.0, onset), max(0.0, end)))
+            continue
+        for row, raw_name in enumerate(names):
+            if clean_channel_name(raw_name) in named:
+                valid[row, i0:i1] = False
+    bads = [str(name) for name in raw.info.get("bads", [])]
+    return finalize(
+        data, names, sfreq, str(path), kind,
+        valid=valid, bad_channels=bads, rejected_spans=spans,
+    )
 
 
 def _load_wineeg(path: Path) -> Recording:

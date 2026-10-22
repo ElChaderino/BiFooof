@@ -159,7 +159,7 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     draw_head(
         fig.add_subplot(grid[1, 1]), names,
         [row.alpha_reactivity for row in rows],
-        f"{shown}   EC − EO", "plasma", channel,
+        f"{shown} peak height  EC − EO", "plasma", channel,
     )
     stamp_figure(fig)
     return rows
@@ -192,7 +192,8 @@ def render_cycles(fig, fit: CycleFit, seconds: float = 10.0) -> None:
     ax.set_ylabel("µV")
     ax.set_title(
         f"{fit.channel} filtered {fit.band[0]:g}–{fit.band[1]:g} Hz"
-        f"    ·    {fit.n_cycles} cycles, {fit.n_bursts} in bursts",
+        f"    ·    {fit.n_cycles} cycles, {fit.n_burst_cycles} burst cycles "
+        f"in {fit.n_burst_episodes} episodes",
         fontsize=9, loc="left",
     )
     style_axes(ax)

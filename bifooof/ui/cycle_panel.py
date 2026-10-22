@@ -192,7 +192,8 @@ class CyclePanel(QWidget):
         self._draw()
         text = (
             f"{result.channel}  ·  {result.band[0]:g}–{result.band[1]:g} Hz  ·  "
-            f"{result.n_cycles} cycles, {result.n_bursts} in bursts"
+            f"{result.n_cycles} cycles, {result.n_burst_cycles} burst cycles "
+            f"in {result.n_burst_episodes} episodes"
         )
         if result.burst_note:
             text = f"{text}. {result.burst_note}"

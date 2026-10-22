@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
 from .. import __version__
 from ..analysis.compare import compare_spectra
 from ..export import (
-    comparison_rows, cycle_detail_rows, cycle_summary_row, save_figure, spectrum_rows,
-    write_csv,
+    comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
+    save_figure, spectrum_rows, write_csv, write_json,
 )
 from ..io.condition import CONDITION_LABELS, CONDITIONS, guess_condition
 from ..io.marks import span_text, split_marked_conditions
@@ -259,6 +259,14 @@ class MainWindow(QMainWindow):
                 destination / f"{key}_spectrum.csv",
                 spectrum_rows(fit, key, source),
             ))
+            peaks = peak_rows(fit, key, source)
+            if peaks:
+                written.append(write_csv(destination / f"{key}_peaks.csv", peaks))
+            if recording is not None:
+                written.append(write_json(
+                    destination / f"{key}_metadata.json",
+                    fit_metadata(recording, self.spectrum.settings, fit, key),
+                ))
 
         if self.cycles.fit is not None:
             self.cycles.canvas.draw()

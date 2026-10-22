@@ -11,7 +11,8 @@ from .analysis.cycles import BANDS, fit_cycles
 from .analysis.settings import FitSettings
 from .analysis.specparam_fit import fit_spectra
 from .export import (
-    comparison_rows, cycle_detail_rows, cycle_summary_row, save_figure, spectrum_rows, write_csv,
+    comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
+    save_figure, spectrum_rows, write_csv, write_json,
 )
 from .io.condition import CONDITION_LABELS, guess_condition
 from .io.load import load_recording
@@ -105,6 +106,13 @@ def run_file(path: str | Path, out_dir: str | Path, condition: str | None = None
         destination / "spectrum.csv",
         spectrum_rows(fit, chosen, recording.source_path),
     ))
+    peaks = peak_rows(fit, chosen, recording.source_path)
+    if peaks:
+        written.append(write_csv(destination / "peaks.csv", peaks))
+    written.append(write_json(
+        destination / "metadata.json",
+        fit_metadata(recording, fit_settings, fit, chosen),
+    ))
     if plots:
         fig = Figure(figsize=(10, 7), dpi=120, facecolor="white")
         render_spectrum(fig, fit, index, CONDITION_LABELS[chosen])
@@ -145,7 +153,15 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
         write_csv(destination / "ec_spectrum.csv", spectrum_rows(closed_fit, "ec", closed.source_path)),
         write_csv(destination / "eo_spectrum.csv", spectrum_rows(opened_fit, "eo", opened.source_path)),
         write_csv(destination / "comparison.csv", comparison_rows(rows, fit_settings.alpha_band())),
+        write_json(destination / "metadata.json", {
+            "ec": fit_metadata(closed, fit_settings, closed_fit, "ec"),
+            "eo": fit_metadata(opened, fit_settings, opened_fit, "eo"),
+        }),
     ]
+    for key, fit, recording in (("ec", closed_fit, closed), ("eo", opened_fit, opened)):
+        peaks = peak_rows(fit, key, recording.source_path)
+        if peaks:
+            written.append(write_csv(destination / f"{key}_peaks.csv", peaks))
     if plots:
         fig = Figure(figsize=(10, 7), dpi=120, facecolor="white")
         render_comparison(fig, closed_fit, opened_fit, name, fit_settings.alpha_band())

@@ -24,7 +24,13 @@ The spectrum fit removes a straight drift line from each channel before the Welc
 
 When cycles are found and none of them form a burst, the Cycles page names the cutoff that stopped the run. The library rule needs monotonicity above 0.8 for three cycles in a row.
 
-A WinEEG mark that says eyes closed or eyes open cuts that side out of the file. A file with both marks opens both sides. A clock-time mark is kept as a note and does not cut the recording.
+A WinEEG mark that says eyes closed or eyes open cuts that side out of the file. A file with both marks opens both sides. A clock-time mark is kept as a note and does not cut the recording. Two separate files still open exactly as before.
+
+Samples marked `BAD` in an MNE file, bad channels, and nonfinite samples stay out of the spectrum and the cycle fit. They are not replaced with zeros, and a cycle cannot cross a rejected gap.
+
+The comparison has two different numbers. Peak Δ is eyes-closed fitted peak height minus eyes-open fitted peak height, above the aperiodic background. Each side picks its own peak, and a missing peak stays missing. Band % is the percent change in mean Welch power in that band, `(EC − EO) / EO × 100`.
+
+A burst count is split in two. Burst cycles are cycles that passed the burst rule. Burst episodes are the separate runs of those cycles. Save session writes `metadata.json` and a one-row-per-peak table beside the spectrum CSV.
 
 ## Screenshots
 

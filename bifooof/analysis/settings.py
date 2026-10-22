@@ -183,6 +183,7 @@ def clip_recording(recording: Recording, settings: FitSettings) -> Recording:
         for mark in recording.marks
         if t0 - 1e-9 <= mark.onset_s < t1 + 1e-9
     ]
+    valid, spans = recording.slice_exclusions(i0, i1, t0)
     return Recording(
         data=recording.data[:, i0:i1],
         ch_names=list(recording.ch_names),
@@ -191,6 +192,9 @@ def clip_recording(recording: Recording, settings: FitSettings) -> Recording:
         source_format=recording.source_format,
         notes=[*recording.notes, f"Fit window {t0:.1f}–{t1:.1f} s."],
         marks=kept,
+        valid=valid,
+        bad_channels=list(recording.bad_channels),
+        rejected_spans=spans,
     )
 
 

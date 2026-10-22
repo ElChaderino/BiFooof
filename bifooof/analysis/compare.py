@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from .specparam_fit import ChannelFit, SpectrumFit
 
 ALPHA = (8.0, 12.0)
@@ -22,6 +24,10 @@ class ChannelComparison:
     alpha_power_ec: float | None = None
     alpha_power_eo: float | None = None
     alpha_reactivity: float | None = None
+    band_power_ec: float | None = None
+    band_power_eo: float | None = None
+    band_power_reactivity_percent: float | None = None
+    peak_center_difference_hz: float | None = None
 
 
 def alpha_peak(
@@ -38,12 +44,43 @@ def alpha_peak(
     return max(chosen, key=lambda peak: peak[1])
 
 
+def band_power(channel: ChannelFit | None, band: tuple[float, float]) -> float | None:
+    """Mean linear power in ``band``, in microvolts squared per Hz.
+
+    This is the Welch spectrum inside the band, not the fitted peak height.
+    """
+    if channel is None or channel.freqs is None or channel.spectrum is None:
+        return None
+    low, high = band
+    chosen = (channel.freqs >= low) & (channel.freqs <= high) & np.isfinite(channel.spectrum)
+    if not np.any(chosen):
+        return None
+    linear = np.power(10.0, np.asarray(channel.spectrum[chosen], dtype=np.float64))
+    return float(np.mean(linear))
+
+
+def band_reactivity_percent(eyes_closed: float | None, eyes_open: float | None) -> float | None:
+    """``(EC − EO) / EO × 100``. Missing when either side is missing or eyes-open power is 0."""
+    if eyes_closed is None or eyes_open is None or eyes_open <= 0:
+        return None
+    return float((eyes_closed - eyes_open) / eyes_open * 100.0)
+
+
 def compare_spectra(
     eyes_closed: SpectrumFit,
     eyes_open: SpectrumFit,
     alpha: tuple[float, float] | None = None,
 ) -> list[ChannelComparison]:
-    """Match channels by name and subtract eyes-open from eyes-closed alpha power."""
+    """Match channels by name.
+
+    ``alpha_reactivity`` is the eyes-closed fitted peak height minus the
+    eyes-open fitted peak height. Each side keeps its own tallest peak in the
+    band, so the two centers need not be the same component. A missing peak
+    stays missing; it is not treated as zero.
+
+    ``band_power_reactivity_percent`` is the separate, conventional change in
+    mean Welch power across the same band.
+    """
     band = ALPHA if alpha is None else alpha
     closed = {item.name: item for item in eyes_closed.channels}
     opened = {item.name: item for item in eyes_open.channels}
@@ -57,6 +94,10 @@ def compare_spectra(
         exponent_eo = None if eo is None else eo.exponent
         power_ec = None if ec_alpha is None else ec_alpha[1]
         power_eo = None if eo_alpha is None else eo_alpha[1]
+        cf_ec = None if ec_alpha is None else ec_alpha[0]
+        cf_eo = None if eo_alpha is None else eo_alpha[0]
+        band_ec = band_power(ec, band)
+        band_eo = band_power(eo, band)
         rows.append(ChannelComparison(
             name=name,
             offset_ec=None if ec is None else ec.offset,
@@ -64,11 +105,15 @@ def compare_spectra(
             exponent_ec=exponent_ec,
             exponent_eo=exponent_eo,
             exponent_delta=_sub(exponent_eo, exponent_ec),
-            alpha_cf_ec=None if ec_alpha is None else ec_alpha[0],
-            alpha_cf_eo=None if eo_alpha is None else eo_alpha[0],
+            alpha_cf_ec=cf_ec,
+            alpha_cf_eo=cf_eo,
             alpha_power_ec=power_ec,
             alpha_power_eo=power_eo,
             alpha_reactivity=_sub(power_ec, power_eo),
+            band_power_ec=band_ec,
+            band_power_eo=band_eo,
+            band_power_reactivity_percent=band_reactivity_percent(band_ec, band_eo),
+            peak_center_difference_hz=None if cf_ec is None or cf_eo is None else abs(cf_ec - cf_eo),
         ))
     return rows
 

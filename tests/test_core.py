@@ -22,13 +22,14 @@ from PySide6.QtWidgets import QApplication
 
 from bifooof.analysis.compare import ChannelComparison, alpha_peak, compare_spectra
 from bifooof.analysis.cycles import burst_note, fit_cycles
+from bifooof.analysis.segments import episode_count
 from bifooof.analysis.settings import FitSettings, band_label, band_phrase
 from bifooof.analysis.specparam_fit import ChannelFit, fit_spectra
 from bifooof.analysis.spectra import welch_spectra
 from bifooof.export import comparison_rows, cycle_summary_row
 from bifooof.io.channels import clean_channel_name
 from bifooof.io.condition import guess_condition
-from bifooof.io.load import load_recording, needs_sfreq
+from bifooof.io.load import _recording_from_raw, finalize, load_recording, needs_sfreq
 from bifooof.io.marks import split_marked_conditions
 from bifooof.io.recording import Mark, Recording
 from bifooof.io.sniff import sniff
@@ -290,11 +291,96 @@ class FitTests(unittest.TestCase):
         times = np.arange(int(8.0 * sfreq)) / sfreq
         tone = 20.0 * np.sin(2 * np.pi * 10.0 * times)
         drifted = tone + np.linspace(0.0, 20000.0, tone.size)
-        freqs, clean = welch_spectra(tone[None, :], sfreq)
-        _, dirty = welch_spectra(drifted[None, :], sfreq)
+        freqs, clean, _nperseg = welch_spectra(tone[None, :], sfreq)
+        _, dirty, _ignored = welch_spectra(drifted[None, :], sfreq)
         peak = int(np.argmin(np.abs(freqs - 10.0)))
         self.assertLess(abs(clean[0, peak] - dirty[0, peak]) / clean[0, peak], 0.05)
         self.assertLess(dirty[0, 0], clean[0, peak])
+
+    def test_nonfinite_samples_stay_excluded(self):
+        recording = finalize(np.array([[1.0, np.nan, 3.0, 4.0]]), ["Cz"], 256.0, "gap.csv", "csv")
+        self.assertTrue(np.isnan(recording.data[0, 1]))
+        self.assertIsNotNone(recording.valid)
+        self.assertFalse(bool(recording.valid[0, 1]))
+        self.assertTrue(bool(recording.valid[0, 0]))
+        self.assertNotIn("0.0", " ".join(f"{value:.1f}" for value in recording.data[0] if np.isfinite(value)))
+
+    def test_bad_annotation_is_left_out_of_the_fit(self):
+        import mne
+
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        signal = 20e-6 * np.sin(2 * np.pi * 10.0 * times)
+        signal = signal.copy()
+        gap = (times >= 3.0) & (times < 4.0)
+        signal[gap] = 500e-6 * np.sin(2 * np.pi * 25.0 * times[gap])
+        raw = mne.io.RawArray(
+            signal[None, :], mne.create_info(["Cz"], sfreq, "eeg"), verbose="ERROR",
+        )
+        raw.set_annotations(mne.Annotations(onset=[3.0], duration=[1.0], description=["BAD_artifact"]))
+        recording = _recording_from_raw(raw, Path("marked.fif"), "fif")
+        i0, i1 = int(3.0 * sfreq), int(4.0 * sfreq)
+        self.assertTrue(np.isnan(recording.data[0, i0:i1]).all())
+        self.assertFalse(bool(recording.valid[0, i0:i1].any()))
+        self.assertTrue(any("BAD" in note for note in recording.notes))
+        fit = fit_spectra(recording)
+        peak = fit.channels[0].dominant_peak
+        self.assertIsNotNone(peak)
+        self.assertGreater(peak[0], 8.0)
+        self.assertLess(peak[0], 12.0)
+        self.assertTrue(all(not (24.0 <= center <= 26.0) for center, _height, _width in fit.channels[0].peaks))
+        cycles = fit_cycles(recording, 0, (8.0, 12.0))
+        for start, stop, _is_burst in cycles.spans:
+            self.assertTrue(stop <= i0 or start >= i1)
+
+    def test_bad_channel_is_not_fit(self):
+        import mne
+
+        sfreq = 256.0
+        times = np.arange(int(4.0 * sfreq)) / sfreq
+        data = np.vstack([
+            20e-6 * np.sin(2 * np.pi * 10.0 * times),
+            20e-6 * np.sin(2 * np.pi * 6.0 * times),
+        ])
+        raw = mne.io.RawArray(data, mne.create_info(["Cz", "O1"], sfreq, "eeg"), verbose="ERROR")
+        raw.info["bads"] = ["Cz"]
+        recording = _recording_from_raw(raw, Path("bads.fif"), "fif")
+        self.assertEqual(recording.bad_channels, ["Cz"])
+        self.assertFalse(bool(recording.valid[recording.ch_names.index("Cz")].any()))
+        fit = fit_spectra(recording)
+        by_name = {item.name: item for item in fit.channels}
+        self.assertFalse(by_name["Cz"].usable)
+        self.assertEqual(by_name["Cz"].reason, "Bad channel.")
+        self.assertTrue(by_name["O1"].usable)
+
+    def test_single_channel_fallback_does_not_pass_group_arguments(self):
+        import specparam
+
+        group_fit = specparam.SpectralGroupModel.fit
+        model_fit = specparam.SpectralModel.fit
+        calls: list[dict] = []
+
+        def fail(self, *args, **kwargs):
+            raise RuntimeError("group fit forced to fail")
+
+        def spy(self, *args, **kwargs):
+            calls.append(dict(kwargs))
+            return model_fit(self, *args, **kwargs)
+
+        specparam.SpectralGroupModel.fit = fail
+        specparam.SpectralModel.fit = spy
+        try:
+            fit = fit_spectra(self.recording)
+        finally:
+            specparam.SpectralGroupModel.fit = group_fit
+            specparam.SpectralModel.fit = model_fit
+        self.assertTrue(calls)
+        self.assertNotIn("n_jobs", calls[0])
+        self.assertNotIn("progress", calls[0])
+        self.assertIsNotNone(next(item.exponent for item in fit.channels if item.name == "Fp1"))
+
+    def test_burst_episodes_are_separate_from_burst_cycles(self):
+        self.assertEqual(episode_count(np.array([0, 1, 1, 0, 1, 1, 1, 0], dtype=bool)), 2)
 
 
 class WindowTests(unittest.TestCase):
@@ -442,8 +528,15 @@ class SessionTests(unittest.TestCase):
             text = Path(tmp, "comparison.csv").read_text(encoding="utf-8")
             self.assertIn("Fp1", text)
             self.assertIn("alpha_reactivity_ec_minus_eo", text)
+            self.assertIn("peak_height_definition", text)
+            self.assertIn("band_power_reactivity_percent", text)
             self.assertIn("band_low_hz", text)
             self.assertIn("band_high_hz", text)
+            metadata = Path(tmp, "ec_metadata.json").read_text(encoding="utf-8")
+            self.assertIn("microvolts", metadata)
+            self.assertIn("linear", metadata)
+            self.assertIn("n_burst_cycles", metadata)
+            self.assertTrue(Path(tmp, "ec_peaks.csv").is_file())
         closed, opened = window.spectrum.fits["ec"], window.spectrum.fits["eo"]
         again = compare_spectra(closed, opened)
         self.assertEqual(again[0].name, "Fp1")
