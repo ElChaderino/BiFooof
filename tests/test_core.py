@@ -19,9 +19,10 @@ matplotlib.use("QtAgg")
 import numpy as np
 from PySide6.QtWidgets import QApplication
 
-from bifooof.analysis.compare import compare_spectra
+from bifooof.analysis.compare import alpha_peak, compare_spectra
 from bifooof.analysis.cycles import fit_cycles
-from bifooof.analysis.specparam_fit import fit_spectra
+from bifooof.analysis.settings import FitSettings
+from bifooof.analysis.specparam_fit import ChannelFit, fit_spectra
 from bifooof.io.channels import clean_channel_name
 from bifooof.io.condition import guess_condition
 from bifooof.io.load import load_recording, needs_sfreq
@@ -138,6 +139,24 @@ class FitTests(unittest.TestCase):
         self.assertLess(peak[0], 12.0)
         self.assertIsNotNone(by_name["Fp1"].exponent)
         self.assertGreater(by_name["Fp1"].r_squared or 0, 0.5)
+        self.assertEqual(fit.aperiodic_mode, "fixed")
+        self.assertAlmostEqual(fit.t_start, 0.0)
+        self.assertAlmostEqual(fit.t_end, self.recording.duration_s, delta=0.05)
+
+    def test_fit_window_and_range(self):
+        settings = FitSettings(t_start=1.0, t_length=4.0, fmin=2.0, fmax=30.0, segment_s=2.0)
+        fit = fit_spectra(self.recording, settings)
+        self.assertAlmostEqual(fit.fmin, 2.0)
+        self.assertGreater(fit.fmax, 20.0)
+        self.assertLessEqual(fit.fmax, 30.0)
+        self.assertAlmostEqual(fit.t_start, 1.0, delta=0.02)
+        self.assertAlmostEqual(fit.t_end, 5.0, delta=0.05)
+        self.assertAlmostEqual(fit.segment_s, 2.0)
+
+    def test_alpha_band_can_move(self):
+        item = ChannelFit(name="O1", index=0, usable=True, peaks=[(6.2, 1.0, 1.0), (10.1, 0.4, 1.0)])
+        self.assertAlmostEqual(alpha_peak(item)[0], 10.1)
+        self.assertAlmostEqual(alpha_peak(item, (4.0, 8.0))[0], 6.2)
 
     def test_bycycle_alpha_period(self):
         cycles = fit_cycles(self.recording, 0, (8.0, 12.0))

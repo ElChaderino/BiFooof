@@ -24,27 +24,35 @@ class ChannelComparison:
     alpha_reactivity: float | None = None
 
 
-def alpha_peak(channel: ChannelFit | None) -> tuple[float, float, float] | None:
-    """Highest peak whose center sits in 8–12 Hz."""
+def alpha_peak(
+    channel: ChannelFit | None,
+    band: tuple[float, float] | None = None,
+) -> tuple[float, float, float] | None:
+    """Highest peak whose center sits in the alpha band. The default band is 8–12 Hz."""
     if channel is None or not channel.peaks:
         return None
-    low, high = ALPHA
+    low, high = ALPHA if band is None else band
     chosen = [peak for peak in channel.peaks if low <= peak[0] <= high]
     if not chosen:
         return None
     return max(chosen, key=lambda peak: peak[1])
 
 
-def compare_spectra(eyes_closed: SpectrumFit, eyes_open: SpectrumFit) -> list[ChannelComparison]:
+def compare_spectra(
+    eyes_closed: SpectrumFit,
+    eyes_open: SpectrumFit,
+    alpha: tuple[float, float] | None = None,
+) -> list[ChannelComparison]:
     """Match channels by name and subtract eyes-open from eyes-closed alpha power."""
+    band = ALPHA if alpha is None else alpha
     closed = {item.name: item for item in eyes_closed.channels}
     opened = {item.name: item for item in eyes_open.channels}
     rows = []
     for name in _order([*closed.keys(), *opened.keys()]):
         ec = closed.get(name)
         eo = opened.get(name)
-        ec_alpha = alpha_peak(ec)
-        eo_alpha = alpha_peak(eo)
+        ec_alpha = alpha_peak(ec, band)
+        eo_alpha = alpha_peak(eo, band)
         exponent_ec = None if ec is None else ec.exponent
         exponent_eo = None if eo is None else eo.exponent
         power_ec = None if ec_alpha is None else ec_alpha[1]

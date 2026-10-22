@@ -11,6 +11,7 @@ def welch_spectra(
     sfreq: float,
     fmin: float = 1.0,
     fmax: float = 40.0,
+    segment_s: float = 4.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(freqs, linear_power)`` with power shaped ``(n_channels, n_freqs)``.
 
@@ -28,7 +29,8 @@ def welch_spectra(
             f"Sampling rate {sfreq:.1f} Hz is too low for a {fmin:g}–{fmax:g} Hz spectrum."
         )
 
-    target = int(round(sfreq / 0.25))
+    # 4 s is 0.25 Hz. Longer segments smooth the spectrum; specparam fits those better.
+    target = int(round(sfreq * float(segment_s)))
     nperseg = int(min(data.shape[1], max(target, 256)))
     nperseg = min(nperseg, data.shape[1])
     if nperseg < 16:

@@ -48,6 +48,7 @@ def spectrum_rows(fit: SpectrumFit, condition: str, source: str = "") -> list[di
             "channel": item.name,
             "usable": item.usable,
             "offset": item.offset,
+            "knee": item.knee,
             "exponent": item.exponent,
             "peak_cf_hz": None if peak is None else peak[0],
             "peak_power": None if peak is None else peak[1],

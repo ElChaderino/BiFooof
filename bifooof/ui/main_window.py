@@ -23,6 +23,7 @@ from ..io.recording import Recording
 from ..io.sniff import FILE_FILTER
 from . import icons
 from .compare_panel import ComparePanel
+from .fit_bar import FitBar
 from .cycle_panel import CyclePanel
 from .spectrum_panel import SpectrumPanel, render_spectrum
 from .theme import ACCENT, MUTED
@@ -113,6 +114,9 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(top)
         header_layout.addLayout(buttons)
 
+        self.fit_bar = FitBar()
+        self.fit_bar.apply_requested.connect(self._apply_fit)
+
         self.trace = TracePanel()
         self.spectrum = SpectrumPanel()
         self.cycles = CyclePanel()
@@ -124,6 +128,8 @@ class MainWindow(QMainWindow):
         self.spectrum.status.connect(self.statusBar().showMessage)
         self.cycles.status.connect(self.statusBar().showMessage)
         self.cycles.band.currentIndexChanged.connect(lambda _index: self._sync_compare())
+        self.cycles.low.valueChanged.connect(lambda _value: self._sync_compare())
+        self.cycles.high.valueChanged.connect(lambda _value: self._sync_compare())
         self.compare.channel_selected.connect(self._select_name)
         self.compare.status.connect(self.statusBar().showMessage)
 
@@ -142,6 +148,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(header)
+        layout.addWidget(self.fit_bar)
         body = QVBoxLayout()
         body.setContentsMargins(12, 12, 12, 8)
         body.addWidget(self.tabs)
@@ -267,7 +274,9 @@ class MainWindow(QMainWindow):
             written.append(save_figure(self.compare.canvas.fig, destination / "comparison.png"))
             written.append(write_csv(
                 destination / "comparison.csv",
-                comparison_rows(compare_spectra(self.spectrum.fits["ec"], self.spectrum.fits["eo"])),
+                comparison_rows(compare_spectra(
+                    self.spectrum.fits["ec"], self.spectrum.fits["eo"], self.fit_bar.settings().alpha_band(),
+                )),
             ))
             summaries = []
             for key in CONDITIONS:
@@ -410,8 +419,26 @@ class MainWindow(QMainWindow):
             return
         self._select(self.recording.ch_names.index(name))
 
+    def _apply_fit(self, settings) -> None:
+        try:
+            settings.validate()
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc))
+            return
+        self.spectrum.apply_settings(settings)
+        self.cycles.apply_settings(settings)
+        self.compare.apply_settings(settings)
+        if settings.t_length is None and settings.t_start <= 0:
+            window = "the whole recording"
+        else:
+            end = "the end" if settings.t_length is None else f"{settings.t_start + settings.t_length:.0f} s"
+            window = f"{settings.t_start:.0f} s to {end}"
+        self.statusBar().showMessage(
+            f"Refitting {window}, {settings.fmin:g}–{settings.fmax:.0f} Hz, {settings.aperiodic_mode} slope."
+        )
+
     def _sync_compare(self) -> None:
-        band = self.cycles.band.currentData() or (8.0, 12.0)
+        band = self.cycles.current_band()
         self.compare.set_pair(self.recordings, self.spectrum.fits, self._channel_name(), band)
 
     def _channel_name(self) -> str:

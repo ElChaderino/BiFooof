@@ -11,9 +11,11 @@ from PySide6.QtWidgets import (
 
 from ..analysis.compare import ChannelComparison, alpha_peak, compare_spectra
 from ..analysis.cycles import CycleFit, fit_cycles
+from ..analysis.settings import FitSettings
 from ..analysis.specparam_fit import ChannelFit, SpectrumFit
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
+from ..plots import mark_spectrum
 from .canvas import MplCanvas, finish_figure, style_axes
 from .headmap import draw_head
 from .workers import CallWorker, launch, wait_for
@@ -37,6 +39,7 @@ class ComparePanel(QWidget):
         self.fits: dict[str, SpectrumFit] = {}
         self.channel = ""
         self.band = (8.0, 12.0)
+        self.settings = FitSettings()
         self.cycle_fits: dict[str, CycleFit] = {}
         self._cycle_key: tuple | None = None
         self._generations: dict[str, int] = {}
@@ -82,6 +85,18 @@ class ComparePanel(QWidget):
     def ready(self) -> bool:
         return "ec" in self.fits and "eo" in self.fits
 
+    def apply_settings(self, settings: FitSettings) -> None:
+        self.settings = settings
+        self._cycle_key = None
+        if self.ready:
+            self.rows = compare_spectra(self.fits["ec"], self.fits["eo"], self._alpha())
+            self._fill_table()
+            self._draw()
+            self._maybe_cycles()
+
+    def _alpha(self) -> tuple[float, float]:
+        return self.settings.alpha_band()
+
     def set_pair(self, recordings: dict[str, Recording], fits: dict[str, SpectrumFit],
                  channel: str, band: tuple[float, float]) -> None:
         self.recordings = recordings
@@ -99,7 +114,7 @@ class ComparePanel(QWidget):
             else:
                 self._empty("Open both an eyes-closed and an eyes-open file to compare them.")
             return
-        self.rows = compare_spectra(fits["ec"], fits["eo"])
+        self.rows = compare_spectra(fits["ec"], fits["eo"], self._alpha())
         if channel and any(row.name == channel for row in self.rows):
             self.channel = channel
         elif self.rows and self.channel not in {row.name for row in self.rows}:
@@ -161,13 +176,16 @@ class ComparePanel(QWidget):
         ax = fig.add_subplot(grid[0, :])
         ec_item = _by_name(self.fits.get("ec"), self.channel)
         eo_item = _by_name(self.fits.get("eo"), self.channel)
-        _plot_condition(ax, ec_item, _EC, "Eyes closed")
-        _plot_condition(ax, eo_item, _EO, "Eyes open")
-        ax.set_xscale("log")
+        fmin = min(item.fmin for item in self.fits.values())
+        fmax = max(item.fmax for item in self.fits.values())
+        mark_spectrum(ax, fmin, fmax)
+        alpha = self._alpha()
+        _plot_condition(ax, ec_item, _EC, "Eyes closed", alpha)
+        _plot_condition(ax, eo_item, _EO, "Eyes open", alpha)
         ax.set_xlabel("")
         ax.set_ylabel("log10 power")
         ax.set_title(
-            f"{self.channel}   ·   eyes closed vs eyes open   ·   frequency (Hz)",
+            f"{self.channel}   ·   eyes closed vs eyes open   ·   alpha {alpha[0]:g}–{alpha[1]:g} Hz",
             fontsize=10, loc="left",
         )
         ax.legend(frameon=False, fontsize=8)
@@ -182,7 +200,7 @@ class ComparePanel(QWidget):
         draw_head(
             fig.add_subplot(grid[1, 1]), names,
             [row.alpha_reactivity for row in self.rows],
-            "Alpha power  EC − EO", "plasma", self.channel,
+            f"Alpha {self._alpha()[0]:g}–{self._alpha()[1]:g} Hz   EC − EO", "plasma", self.channel,
         )
         self.canvas.draw_idle()
         ec_power = next((row.alpha_power_ec for row in self.rows if row.name == self.channel), None)
@@ -197,6 +215,7 @@ class ComparePanel(QWidget):
         key = (
             self.channel,
             self.band,
+            self.settings.key(),
             id(self.recordings.get("ec")),
             id(self.recordings.get("eo")),
         )
@@ -211,7 +230,7 @@ class ComparePanel(QWidget):
             index = recording.ch_names.index(self.channel)
             self._generations[condition] = self._generations.get(condition, 0) + 1
             generation = self._generations[condition]
-            worker = CallWorker(generation, fit_cycles, (recording, index, self.band))
+            worker = CallWorker(generation, fit_cycles, (recording, index, self.band, self.settings))
             worker.succeeded.connect(
                 lambda gen, result, cond=condition: self._cycle_done(cond, gen, result)
             )
@@ -268,13 +287,14 @@ def _by_name(fit: SpectrumFit | None, name: str) -> ChannelFit | None:
     return None
 
 
-def _plot_condition(ax, item: ChannelFit | None, color: str, label: str) -> None:
+def _plot_condition(ax, item: ChannelFit | None, color: str, label: str,
+                    alpha: tuple[float, float]) -> None:
     if item is None or item.freqs is None or item.spectrum is None:
         return
     ax.plot(item.freqs, item.spectrum, color=color, lw=1.8, label=label)
     if item.aperiodic is not None:
         ax.plot(item.freqs, item.aperiodic, color=color, lw=1.2, ls="--", alpha=0.85)
-    peak = alpha_peak(item)
+    peak = alpha_peak(item, alpha)
     if peak is not None and item.aperiodic is not None:
         base = float(np.interp(peak[0], item.freqs, item.aperiodic))
         ax.plot(peak[0], base + peak[1], "o", color=color, ms=6)

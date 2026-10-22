@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from ..analysis.settings import FitSettings
 from ..analysis.specparam_fit import SpectrumFit, fit_spectra
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
@@ -17,8 +18,8 @@ from .canvas import MplCanvas
 from .workers import CallWorker, launch, wait_for
 
 _COLUMNS = [
-    "Channel", "Offset", "Exponent", "Peak CF (Hz)", "Peak power",
-    "Bandwidth (Hz)", "Peaks", "R²", "Error",
+    "Channel", "Offset", "Exponent", "CF (Hz)", "Power",
+    "BW (Hz)", "Peaks", "R²", "Error",
 ]
 
 
@@ -38,6 +39,7 @@ class SpectrumPanel(QWidget):
         self._generations: dict[str, int] = {}
         self._workers: dict[str, CallWorker] = {}
         self._worker: CallWorker | None = None
+        self.settings = FitSettings()
 
         self.caption = QLabel("Welch spectrum, 1–40 Hz, with the specparam aperiodic fit and peaks.")
         self.caption.setObjectName("Muted")
@@ -51,8 +53,8 @@ class SpectrumPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setMinimumWidth(420)
-        self.table.setMaximumWidth(560)
+        self.table.setMinimumWidth(520)
+        self.table.setMaximumWidth(680)
         self.table.setAlternatingRowColors(True)
         self.table.itemSelectionChanged.connect(self._on_table)
 
@@ -88,6 +90,17 @@ class SpectrumPanel(QWidget):
         self._fill_table()
         self._draw()
 
+    def apply_settings(self, settings: FitSettings) -> None:
+        self.settings = settings
+        self.fits.clear()
+        self.fit = None
+        self.table.setRowCount(0)
+        if not self.recordings:
+            return
+        self._empty("Fitting spectra…")
+        for condition in list(self.recordings):
+            self._start(condition)
+
     def set_selected(self, index: int) -> None:
         if self.fit is None or not 0 <= index < len(self.fit.channels):
             self._selected = index
@@ -109,7 +122,7 @@ class SpectrumPanel(QWidget):
         generation = self._generations[condition]
         label = "eyes closed" if condition == "ec" else "eyes open"
         self.status.emit(f"Fitting {label} spectra…")
-        worker = CallWorker(generation, fit_spectra, (recording,))
+        worker = CallWorker(generation, fit_spectra, (recording, self.settings))
         worker.succeeded.connect(lambda gen, result, cond=condition: self._fitted(cond, gen, result))
         worker.failed.connect(lambda gen, message, cond=condition: self._failed(cond, gen, message))
         self._workers[condition] = worker
@@ -202,7 +215,17 @@ class SpectrumPanel(QWidget):
         peak = "no peak" if item.dominant_peak is None else f"peak {item.dominant_peak[0]:.1f} Hz"
         exponent = "—" if item.exponent is None else f"exponent {item.exponent:.2f}"
         r_squared = "—" if item.r_squared is None else f"R² {item.r_squared:.2f}"
-        self.caption.setText(f"{label}  ·  {item.name}  ·  {exponent}  ·  {peak}  ·  {r_squared}")
+        knee = ""
+        if item.knee is not None and item.exponent not in (None, 0):
+            knee_hz = item.knee ** (1.0 / item.exponent)
+            if np.isfinite(knee_hz) and knee_hz > 0:
+                knee = f"  ·  knee {knee_hz:.1f} Hz"
+        window = f"{self.fit.t_start:.0f}–{self.fit.t_end:.0f} s"
+        span = f"{self.fit.fmin:g}–{self.fit.fmax:.0f} Hz"
+        self.caption.setText(
+            f"{label}  ·  {item.name}  ·  {window}  ·  {span}  ·  "
+            f"{self.fit.aperiodic_mode}{knee}  ·  {exponent}  ·  {peak}  ·  {r_squared}"
+        )
 
 
 def _num(value: float | None, digits: int) -> str:

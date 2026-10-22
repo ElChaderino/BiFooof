@@ -58,12 +58,12 @@ def _stylesheet(chevron: str) -> str:
         padding: 6px; font-weight: 600;
     }}
     QPushButton#Ghost:hover {{ background: {ACCENT_SOFT}; }}
-    QComboBox, QLineEdit {{
+    QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
         background: {PANEL}; border: 1px solid {LINE_STRONG}; border-radius: 8px;
         padding: 6px 10px; min-height: 18px;
         selection-background-color: {ACCENT_SOFT}; selection-color: {INK};
     }}
-    QComboBox:hover, QComboBox:focus, QLineEdit:focus {{ border-color: {ACCENT}; }}
+    QComboBox:hover, QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {ACCENT}; }}
     QComboBox::drop-down {{
         subcontrol-origin: padding; subcontrol-position: center right;
         width: 26px; border: none;

@@ -8,6 +8,7 @@ from matplotlib.figure import Figure
 
 from .analysis.compare import compare_spectra
 from .analysis.cycles import BANDS, fit_cycles
+from .analysis.settings import FitSettings
 from .analysis.specparam_fit import fit_spectra
 from .export import (
     comparison_rows, cycle_detail_rows, cycle_summary_row, save_figure, spectrum_rows, write_csv,
@@ -85,7 +86,8 @@ def pick_channel(recording: Recording, name: str | None) -> int:
 
 def run_file(path: str | Path, out_dir: str | Path, condition: str | None = None,
              channel: str | None = None, band: str = "alpha",
-             cycles: bool = True, plots: bool = True) -> list[Path]:
+             cycles: bool = True, plots: bool = True,
+             settings: FitSettings | None = None) -> list[Path]:
     """Fit one recording and write its tables and plots."""
     recording = load_recording(path)
     chosen = condition or guess_condition(recording.source_path) or "ec"
@@ -97,7 +99,8 @@ def run_file(path: str | Path, out_dir: str | Path, condition: str | None = None
     limits = resolve_band(band)
     written: list[Path] = []
 
-    fit = fit_spectra(recording)
+    fit_settings = settings or FitSettings()
+    fit = fit_spectra(recording, fit_settings)
     written.append(write_csv(
         destination / "spectrum.csv",
         spectrum_rows(fit, chosen, recording.source_path),
@@ -108,7 +111,7 @@ def run_file(path: str | Path, out_dir: str | Path, condition: str | None = None
         written.append(save_figure(fig, destination / "spectrum.png"))
 
     if cycles:
-        cycle_fit = fit_cycles(recording, index, limits)
+        cycle_fit = fit_cycles(recording, index, limits, fit_settings)
         written.append(write_csv(
             destination / "cycle_summary.csv",
             [cycle_summary_row(cycle_fit, chosen, recording.source_path)],
@@ -125,7 +128,8 @@ def run_file(path: str | Path, out_dir: str | Path, condition: str | None = None
 
 def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str | Path,
                   channel: str | None = None, band: str = "alpha",
-                  cycles: bool = True, plots: bool = True) -> list[Path]:
+                  cycles: bool = True, plots: bool = True,
+                  settings: FitSettings | None = None) -> list[Path]:
     """Fit both conditions and write the comparison."""
     closed = load_recording(eyes_closed)
     opened = load_recording(eyes_open)
@@ -133,9 +137,10 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
     destination.mkdir(parents=True, exist_ok=True)
     name = _shared_channel(closed, opened, channel)
     limits = resolve_band(band)
-    closed_fit = fit_spectra(closed)
-    opened_fit = fit_spectra(opened)
-    rows = compare_spectra(closed_fit, opened_fit)
+    fit_settings = settings or FitSettings()
+    closed_fit = fit_spectra(closed, fit_settings)
+    opened_fit = fit_spectra(opened, fit_settings)
+    rows = compare_spectra(closed_fit, opened_fit, fit_settings.alpha_band())
     written = [
         write_csv(destination / "ec_spectrum.csv", spectrum_rows(closed_fit, "ec", closed.source_path)),
         write_csv(destination / "eo_spectrum.csv", spectrum_rows(opened_fit, "eo", opened.source_path)),
@@ -143,7 +148,7 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
     ]
     if plots:
         fig = Figure(figsize=(10, 7), dpi=120, facecolor="white")
-        render_comparison(fig, closed_fit, opened_fit, name)
+        render_comparison(fig, closed_fit, opened_fit, name, fit_settings.alpha_band())
         written.append(save_figure(fig, destination / "comparison.png"))
         closed_index = closed.ch_names.index(name) if name in closed.ch_names else 0
         opened_index = opened.ch_names.index(name) if name in opened.ch_names else 0
@@ -156,7 +161,7 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
         for key, recording in (("ec", closed), ("eo", opened)):
             if name not in recording.ch_names:
                 continue
-            cycle_fit = fit_cycles(recording, recording.ch_names.index(name), limits)
+            cycle_fit = fit_cycles(recording, recording.ch_names.index(name), limits, fit_settings)
             summaries.append(cycle_summary_row(cycle_fit, key, recording.source_path))
             details = cycle_detail_rows(cycle_fit, key)
             if details:

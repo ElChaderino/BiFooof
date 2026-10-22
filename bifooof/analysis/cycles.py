@@ -8,16 +8,7 @@ import numpy as np
 from scipy.signal import butter, detrend, sosfiltfilt
 
 from ..io.recording import Recording
-
-# Documented bycycle defaults. Passing them avoids the "no thresholds" warning
-# while keeping the library's own burst rule.
-_CYCLE_THRESHOLDS = {
-    "amp_fraction_threshold": 0.0,
-    "amp_consistency_threshold": 0.5,
-    "period_consistency_threshold": 0.5,
-    "monotonicity_threshold": 0.8,
-    "min_n_cycles": 3,
-}
+from .settings import FitSettings, clip_recording
 
 BANDS: list[tuple[str, tuple[float, float]]] = [
     ("Delta 1–4 Hz", (1.0, 4.0)),
@@ -48,9 +39,15 @@ class CycleFit:
     spans: list[tuple[int, int, bool]] = field(default_factory=list)
     peaks: list[int] = field(default_factory=list)
     cycles: list[dict] = field(default_factory=list)
+    t_offset: float = 0.0
 
 
-def fit_cycles(recording: Recording, channel_index: int, band: tuple[float, float]) -> CycleFit:
+def fit_cycles(
+    recording: Recording,
+    channel_index: int,
+    band: tuple[float, float],
+    settings: FitSettings | None = None,
+) -> CycleFit:
     """Run :class:`bycycle.Bycycle` on one channel."""
     from bycycle import Bycycle
 
@@ -65,6 +62,11 @@ def fit_cycles(recording: Recording, channel_index: int, band: tuple[float, floa
             f"The {low:g}–{high:g} Hz band is above the Nyquist frequency ({nyquist:.1f} Hz)."
         )
 
+    chosen = settings or FitSettings()
+    chosen.validate()
+    t_offset = min(max(0.0, float(chosen.t_start)), recording.duration_s)
+    recording = clip_recording(recording, chosen)
+
     # WinEEG files can carry a large linear drift. Welch removes it before the
     # spectrum fit; bycycle does not, and the drift swallows the alpha cycles.
     signal = detrend(np.asarray(recording.data[channel_index], dtype=np.float64), type="linear")
@@ -72,7 +74,7 @@ def fit_cycles(recording: Recording, channel_index: int, band: tuple[float, floa
     model = Bycycle(
         center_extrema="peak",
         burst_method="cycles",
-        thresholds=_CYCLE_THRESHOLDS,
+        thresholds=chosen.cycle_thresholds(),
         return_samples=True,
     )
     model.fit(signal, recording.sfreq, (low, high))
@@ -124,6 +126,7 @@ def fit_cycles(recording: Recording, channel_index: int, band: tuple[float, floa
         spans=spans,
         peaks=peaks,
         cycles=cycle_rows,
+        t_offset=t_offset,
     )
 
 

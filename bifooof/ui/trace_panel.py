@@ -236,8 +236,13 @@ class TracePanel(QWidget):
             if channel_index == self._selected:
                 label.set_color(_SELECTED)
                 label.set_fontweight("bold")
-        ax.set_ylim(-separation * 0.8, count * separation)
+        ax.set_ylim(-separation * 0.85, (count - 0.15) * separation)
         ax.set_xlim(times[0], times[-1])
+        bar_x = times[0] + (times[-1] - times[0]) * 0.012
+        bar_y = -separation * 0.55
+        ax.plot([bar_x, bar_x], [bar_y, bar_y + 0.5], color="#16232f", lw=1.6, solid_capstyle="butt", zorder=3)
+        ax.text(bar_x + (times[-1] - times[0]) * 0.012, bar_y + 0.25, f"{self._gain:.0f} µV",
+                va="center", ha="left", fontsize=7, color="#63748a")
         ax.set_xlabel("Time (s)")
         end = min(self._t0 + self._win_s, recording.duration_s)
         prefix = f"{self.condition_label}   ·   " if self.condition_label else ""

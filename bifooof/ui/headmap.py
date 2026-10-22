@@ -58,7 +58,10 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
             weight = "bold" if name == selected else "regular"
             ax.annotate(name, (x, y), ha="center", va="center", fontsize=6,
                         color="#16232f", fontweight=weight, zorder=4)
-        ax.figure.colorbar(mapper, ax=ax, fraction=0.046, pad=0.03, shrink=0.82)
+        bar = ax.figure.colorbar(mapper, ax=ax, fraction=0.046, pad=0.04, shrink=0.78)
+        bar.ax.tick_params(labelsize=7, length=2, colors="#63748a")
+        bar.outline.set_edgecolor("#d2dbe6")
+        bar.outline.set_linewidth(0.6)
 
     ax.set_title(title, fontsize=9, color="#16232f")
     ax.set_aspect("equal")

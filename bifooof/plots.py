@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import matplotlib
+from matplotlib.ticker import NullFormatter
 
 matplotlib.rcParams.update({
     "axes.edgecolor": "#d2dbe6",
@@ -26,6 +27,29 @@ from .ui.headmap import draw_head
 
 _EC = "#1c4e78"
 _EO = "#c2410c"
+_BANDS = (
+    (1.0, 4.0, "#f4f7fb"),
+    (4.0, 8.0, "#eef6f5"),
+    (8.0, 12.0, "#e8f0f8"),
+    (13.0, 30.0, "#fbf6f1"),
+    (30.0, 45.0, "#f7f4fb"),
+)
+
+
+def mark_spectrum(ax, fmin: float, fmax: float) -> None:
+    """Shade the usual bands and label a few frequencies on a log axis."""
+    ax.set_xscale("log")
+    for low, high, color in _BANDS:
+        left = max(low, fmin)
+        right = min(high, fmax)
+        if right > left + 0.2:
+            ax.axvspan(left, right, color=color, zorder=0, lw=0)
+    ticks = [tick for tick in (1, 2, 4, 8, 10, 13, 20, 30, 40, 45) if fmin - 0.05 <= tick <= fmax + 0.05]
+    if ticks:
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{tick:g}" for tick in ticks])
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.set_xlim(fmin, fmax)
 
 
 def finish_figure(fig) -> None:
@@ -70,20 +94,19 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "") -> None:
         spectrum.text(0.5, 0.5, item.reason or "No fit for this channel.",
                       ha="center", va="center", color="#63748a")
     else:
-        spectrum.plot(item.freqs, item.spectrum, color="#16324f", lw=1.6, label="Spectrum")
+        mark_spectrum(spectrum, fit.fmin, fit.fmax)
+        spectrum.plot(item.freqs, item.spectrum, color="#16324f", lw=1.7, label="Spectrum", zorder=2)
         if item.model is not None:
-            spectrum.plot(item.freqs, item.model, color="#c2410c", lw=2.0, alpha=0.9, label="Model")
+            spectrum.plot(item.freqs, item.model, color="#c2410c", lw=2.0, alpha=0.95, label="Model", zorder=3)
         if item.aperiodic is not None:
-            spectrum.plot(item.freqs, item.aperiodic, color="#0e8f86", lw=1.6, ls="--", label="Aperiodic")
-        for center, power, _width in item.peaks:
-            if item.aperiodic is None:
-                continue
-            base = float(np.interp(center, item.freqs, item.aperiodic))
-            spectrum.plot(center, base + power, "o", color="#b3261e", ms=5)
-        spectrum.set_xscale("log")
+            spectrum.plot(item.freqs, item.aperiodic, color="#0e8f86", lw=1.5, ls="--", label="Aperiodic", zorder=3)
+        _mark_peaks(spectrum, item)
         spectrum.set_xlabel("")
         spectrum.set_ylabel("log10 power")
-        title = f"{item.name}   ·   {fit.fmin:g}–{fit.fmax:.0f} Hz   ·   frequency"
+        title = (
+            f"{item.name}   ·   {fit.t_start:.0f}–{fit.t_end:.0f} s"
+            f"   ·   {fit.fmin:g}–{fit.fmax:.0f} Hz   ·   frequency"
+        )
         if label:
             title = f"{label}   ·   {title}"
         spectrum.set_title(title, fontsize=10, loc="left")
@@ -97,16 +120,19 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "") -> None:
     draw_head(fig.add_subplot(grid[1, 1]), names, centers, "Peak frequency (Hz)", "plasma", item.name)
 
 
-def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, channel: str):
+def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, channel: str,
+                      alpha: tuple[float, float] = (8.0, 12.0)):
     """Overlay eyes-closed and eyes-open spectra. Returns the comparison rows."""
-    rows = compare_spectra(eyes_closed, eyes_open)
+    rows = compare_spectra(eyes_closed, eyes_open, alpha)
     fig.clear()
     finish_figure(fig)
     grid = fig.add_gridspec(2, 2, height_ratios=[2.0, 1.45])
     ax = fig.add_subplot(grid[0, :])
-    _plot_condition(ax, _by_name(eyes_closed, channel), _EC, "Eyes closed")
-    _plot_condition(ax, _by_name(eyes_open, channel), _EO, "Eyes open")
-    ax.set_xscale("log")
+    fmin = min(eyes_closed.fmin, eyes_open.fmin)
+    fmax = max(eyes_closed.fmax, eyes_open.fmax)
+    mark_spectrum(ax, fmin, fmax)
+    _plot_condition(ax, _by_name(eyes_closed, channel), _EC, "Eyes closed", alpha)
+    _plot_condition(ax, _by_name(eyes_open, channel), _EO, "Eyes open", alpha)
     ax.set_xlabel("")
     ax.set_ylabel("log10 power")
     ax.set_title(f"{channel}   ·   eyes closed vs eyes open   ·   frequency (Hz)", fontsize=10, loc="left")
@@ -121,7 +147,7 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     draw_head(
         fig.add_subplot(grid[1, 1]), names,
         [row.alpha_reactivity for row in rows],
-        "Alpha power  EC − EO", "plasma", channel,
+        f"Alpha {alpha[0]:g}–{alpha[1]:g} Hz   EC − EO", "plasma", channel,
     )
     return rows
 
@@ -135,15 +161,19 @@ def render_cycles(fig, fit: CycleFit, seconds: float = 10.0) -> None:
         ax.text(0.5, 0.5, "No samples in this cycle fit.", ha="center", va="center", color="#63748a")
         return
     stop = min(fit.filtered.size, max(1, int(round(seconds * fit.sfreq))))
-    times = np.arange(stop) / fit.sfreq
+    times = fit.t_offset + np.arange(stop) / fit.sfreq
     step = max(1, stop // 2500)
     for span_start, span_stop, is_burst in fit.spans:
-        if span_start >= stop:
-            break
-        left = span_start / fit.sfreq
-        right = min(span_stop, stop) / fit.sfreq
-        ax.axvspan(left, right, color="#0e8f86" if is_burst else "#d5dde6", alpha=0.45, lw=0)
-    ax.plot(times[::step], fit.filtered[:stop][::step], color="#16324f", lw=0.9)
+        if not is_burst or span_start >= stop:
+            continue
+        left = fit.t_offset + span_start / fit.sfreq
+        right = fit.t_offset + min(span_stop, stop) / fit.sfreq
+        ax.axvspan(left, right, color="#0e8f86", alpha=0.28, lw=0, zorder=0)
+    peaks = [peak for peak in fit.peaks if 0 <= peak < stop]
+    if peaks:
+        ax.plot(fit.t_offset + np.asarray(peaks) / fit.sfreq, fit.filtered[peaks],
+                linestyle="none", marker="o", ms=3.5, color="#b3261e", zorder=3)
+    ax.plot(times[::step], fit.filtered[:stop][::step], color="#16324f", lw=0.9, zorder=2)
     ax.set_xlim(times[0], times[-1])
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("µV")
@@ -163,13 +193,31 @@ def _by_name(fit: SpectrumFit, name: str):
     return None
 
 
-def _plot_condition(ax, item, color: str, label: str) -> None:
+def _mark_peaks(ax, item) -> None:
+    if item.aperiodic is None or not item.peaks:
+        return
+    dominant = item.dominant_peak
+    for center, power, _width in item.peaks:
+        base = float(np.interp(center, item.freqs, item.aperiodic))
+        ax.plot(center, base + power, "o", color="#b3261e", ms=5, zorder=4)
+    if dominant is None:
+        return
+    base = float(np.interp(dominant[0], item.freqs, item.aperiodic))
+    ax.annotate(
+        f"{dominant[0]:.1f} Hz",
+        (dominant[0], base + dominant[1]),
+        textcoords="offset points", xytext=(6, 6),
+        fontsize=8, color="#b3261e",
+    )
+
+
+def _plot_condition(ax, item, color: str, label: str, alpha: tuple[float, float] = (8.0, 12.0)) -> None:
     if item is None or item.freqs is None or item.spectrum is None:
         return
     ax.plot(item.freqs, item.spectrum, color=color, lw=1.8, label=label)
     if item.aperiodic is not None:
         ax.plot(item.freqs, item.aperiodic, color=color, lw=1.2, ls="--", alpha=0.85)
-    peak = alpha_peak(item)
+    peak = alpha_peak(item, alpha)
     if peak is not None and item.aperiodic is not None:
         base = float(np.interp(peak[0], item.freqs, item.aperiodic))
         ax.plot(peak[0], base + peak[1], "o", color=color, ms=6)

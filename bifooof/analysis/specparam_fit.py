@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..io.recording import Recording
+from .settings import FitSettings, clip_recording, window_bounds
 from .spectra import welch_spectra
 
 
@@ -17,6 +18,7 @@ class ChannelFit:
     usable: bool
     reason: str = ""
     offset: float | None = None
+    knee: float | None = None
     exponent: float | None = None
     r_squared: float | None = None
     error: float | None = None
@@ -38,12 +40,27 @@ class SpectrumFit:
     channels: list[ChannelFit]
     fmin: float
     fmax: float
+    t_start: float = 0.0
+    t_end: float = 0.0
+    segment_s: float = 4.0
+    aperiodic_mode: str = "fixed"
 
 
-def fit_spectra(recording: Recording, fmin: float = 1.0, fmax: float = 40.0) -> SpectrumFit:
+def fit_spectra(
+    recording: Recording,
+    settings: FitSettings | None = None,
+    fmin: float = 1.0,
+    fmax: float = 40.0,
+) -> SpectrumFit:
     """Fit a :class:`specparam.SpectralGroupModel` to every usable channel."""
     from specparam import SpectralGroupModel, SpectralModel
 
+    chosen = settings or FitSettings(fmin=fmin, fmax=fmax)
+    chosen.validate()
+    t_start, t_end = window_bounds(recording, chosen)
+    recording = clip_recording(recording, chosen)
+    fmin = float(chosen.fmin)
+    fmax = float(chosen.fmax)
     data = np.asarray(recording.data, dtype=np.float64)
     usable = [index for index in range(data.shape[0]) if float(np.std(data[index])) > 1e-6]
     results = [
@@ -54,27 +71,31 @@ def fit_spectra(recording: Recording, fmin: float = 1.0, fmax: float = 40.0) -> 
     if not usable:
         raise ValueError("Every channel is flat, so there is no spectrum to fit.")
 
-    freqs, power = welch_spectra(data[usable], recording.sfreq, fmin=fmin, fmax=fmax)
-    group = SpectralGroupModel(
-        aperiodic_mode="fixed",
-        periodic_mode="gaussian",
-        verbose=False,
-        peak_width_limits=(0.5, 12.0),
-        max_n_peaks=6,
-        min_peak_height=0.05,
+    freqs, power = welch_spectra(
+        data[usable], recording.sfreq, fmin=fmin, fmax=fmax, segment_s=chosen.segment_s,
     )
+    kwargs = chosen.model_kwargs()
+    group = SpectralGroupModel(**kwargs)
     try:
         group.fit(freqs, power, n_jobs=1, progress=None)
         _fill_from_group(group, results, usable)
     except Exception:
-        _fill_one_by_one(SpectralModel, results, usable, freqs, power)
+        _fill_one_by_one(SpectralModel, results, usable, freqs, power, kwargs)
 
     fitted = [item for item in results if item.usable and item.freqs is not None]
     if not fitted:
         reasons = [item.reason for item in results if item.reason]
         detail = reasons[-1] if reasons else "no spectrum could be modeled"
         raise ValueError(f"specparam could not fit any channel. {detail}")
-    return SpectrumFit(channels=results, fmin=fmin, fmax=min(fmax, float(freqs[-1])))
+    return SpectrumFit(
+        channels=results,
+        fmin=fmin,
+        fmax=min(fmax, float(freqs[-1])),
+        t_start=t_start,
+        t_end=t_end,
+        segment_s=float(chosen.segment_s),
+        aperiodic_mode=chosen.aperiodic_mode,
+    )
 
 
 def _fill_from_group(group, results: list[ChannelFit], usable: list[int]) -> None:
@@ -86,32 +107,22 @@ def _fill_from_group(group, results: list[ChannelFit], usable: list[int]) -> Non
         model = group.get_model(int(slot), regenerate=True)
         item = results[channel_index]
         _store_curves(item, model)
-        if aperiodic.ndim == 2 and slot < aperiodic.shape[0] and aperiodic.shape[1] >= 2:
-            item.offset = float(aperiodic[slot, 0])
-            item.exponent = float(aperiodic[slot, 1])
+        if aperiodic.ndim == 2 and slot < aperiodic.shape[0]:
+            item.offset, item.exponent, item.knee = _read_aperiodic(aperiodic[slot])
         item.error = float(errors[slot]) if slot < errors.size else None
         item.r_squared = float(gof[slot]) if slot < gof.size else None
         item.peaks = _peaks_for(peaks, slot)
 
 
-def _fill_one_by_one(spectral_model, results, usable, freqs, power) -> None:
+def _fill_one_by_one(spectral_model, results, usable, freqs, power, kwargs: dict) -> None:
     for slot, channel_index in enumerate(usable):
         item = results[channel_index]
-        model = spectral_model(
-            aperiodic_mode="fixed",
-            periodic_mode="gaussian",
-            verbose=False,
-            peak_width_limits=(0.5, 12.0),
-            max_n_peaks=6,
-            min_peak_height=0.05,
-        )
+        model = spectral_model(**kwargs)
         try:
             model.fit(freqs, power[slot], n_jobs=1, progress=None)
             _store_curves(item, model)
             aperiodic = np.atleast_1d(np.asarray(model.get_params("aperiodic"), dtype=np.float64))
-            if aperiodic.size >= 2:
-                item.offset = float(aperiodic[0])
-                item.exponent = float(aperiodic[1])
+            item.offset, item.exponent, item.knee = _read_aperiodic(aperiodic)
             metrics = model.get_metrics("all")
             flat = np.atleast_1d(np.asarray(metrics, dtype=np.float64)).ravel()
             if flat.size >= 2:
@@ -129,6 +140,17 @@ def _store_curves(item: ChannelFit, model) -> None:
     item.spectrum = np.asarray(model.data.power_spectrum, dtype=np.float64).copy()
     item.model = np.asarray(components.get_component("full", "log"), dtype=np.float64).copy()
     item.aperiodic = np.asarray(components.get_component("aperiodic", "log"), dtype=np.float64).copy()
+
+
+def _read_aperiodic(row) -> tuple[float | None, float | None, float | None]:
+    """Return offset, exponent, and knee. Knee mode is offset, knee, exponent."""
+    values = np.atleast_1d(np.asarray(row, dtype=np.float64)).ravel()
+    finite = values[np.isfinite(values)]
+    if finite.size >= 3:
+        return float(values[0]), float(values[2]), float(values[1])
+    if finite.size >= 2:
+        return float(values[0]), float(values[1]), None
+    return None, None, None
 
 
 def _peak_table(values) -> np.ndarray:

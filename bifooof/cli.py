@@ -15,6 +15,7 @@ import traceback
 from pathlib import Path
 
 from . import __version__
+from .analysis.settings import BURST_PRESETS, FitSettings
 from .batch import compare_files, describe, format_description, run_file
 from .io.load import load_recording
 from .io.sniff import FILE_FILTER
@@ -68,6 +69,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--band", default="alpha", help="Cycle band: delta, theta, alpha, beta, gamma, or 8-12.")
     run.add_argument("--no-cycles", action="store_true", help="Skip the bycycle fit.")
     run.add_argument("--no-plots", action="store_true", help="Write tables only.")
+    _add_fit_args(run)
 
     compare = commands.add_parser("compare", parents=[common], help="Fit an eyes-closed and an eyes-open recording.")
     compare.add_argument("--ec", required=True, help="Eyes-closed file.")
@@ -77,6 +79,7 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--band", default="alpha", help="Cycle band: delta, theta, alpha, beta, gamma, or 8-12.")
     compare.add_argument("--no-cycles", action="store_true")
     compare.add_argument("--no-plots", action="store_true")
+    _add_fit_args(compare)
 
     commands.add_parser("formats", help="List the file types BiFooof opens.")
     commands.add_parser("gui", help="Open the desktop window.")
@@ -108,6 +111,7 @@ def _run(args: argparse.Namespace) -> int:
                 band=args.band,
                 cycles=not args.no_cycles,
                 plots=not args.no_plots,
+                settings=_settings(args),
             )
         except Exception as exc:
             failed += 1
@@ -129,10 +133,58 @@ def _compare(args: argparse.Namespace) -> int:
         band=args.band,
         cycles=not args.no_cycles,
         plots=not args.no_plots,
+        settings=_settings(args),
     )
     for item in written:
         print(f"  {item.name}")
     return 0
+
+
+def _add_fit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tmin", type=float, default=0.0, help="Start of the fit window, in seconds.")
+    parser.add_argument("--tmax", type=float, default=None, help="End of the fit window, in seconds. Default: end of the file.")
+    parser.add_argument("--fmin", type=float, default=1.0, help="Lowest frequency in the spectrum fit.")
+    parser.add_argument("--fmax", type=float, default=40.0, help="Highest frequency in the spectrum fit.")
+    parser.add_argument("--segment", type=float, default=4.0, help="Welch segment length in seconds. 4 s is 0.25 Hz.")
+    parser.add_argument("--aperiodic", choices=("fixed", "knee"), default="fixed",
+                        help="Fixed 1/f slope, or a knee when the slope bends.")
+    parser.add_argument("--peak-width", nargs=2, type=float, default=(0.5, 12.0), metavar=("LOW", "HIGH"),
+                        help="Narrowest and widest peak, in Hz.")
+    parser.add_argument("--max-peaks", type=int, default=6)
+    parser.add_argument("--min-height", type=float, default=0.05, help="Minimum peak height in log10 power.")
+    parser.add_argument("--peak-threshold", type=float, default=2.0,
+                        help="Peak height in standard deviations. Papers leave this at 2.")
+    parser.add_argument("--alpha", nargs=2, type=float, default=(8.0, 12.0), metavar=("LOW", "HIGH"),
+                        help="Band used for alpha reactivity.")
+    parser.add_argument("--bursts", choices=("library", "resting", "paper"), default="library",
+                        help="Burst rule: library, resting alpha, or the paper alpha thresholds.")
+
+
+def _settings(args: argparse.Namespace) -> FitSettings:
+    length = None if args.tmax is None else float(args.tmax) - float(args.tmin)
+    bursts = {"library": 0, "resting": 1, "paper": 2}[args.bursts]
+    amp, amp_c, period_c, mono, min_cycles = BURST_PRESETS[bursts][1:]
+    low, high = args.peak_width
+    return FitSettings(
+        t_start=float(args.tmin),
+        t_length=length,
+        fmin=float(args.fmin),
+        fmax=float(args.fmax),
+        segment_s=float(args.segment),
+        aperiodic_mode=args.aperiodic,
+        peak_width_low=float(low),
+        peak_width_high=float(high),
+        max_n_peaks=int(args.max_peaks),
+        min_peak_height=float(args.min_height),
+        peak_threshold=float(args.peak_threshold),
+        alpha_low=float(args.alpha[0]),
+        alpha_high=float(args.alpha[1]),
+        amp_fraction=float(amp),
+        amp_consistency=float(amp_c),
+        period_consistency=float(period_c),
+        monotonicity=float(mono),
+        min_n_cycles=int(min_cycles),
+    )
 
 
 def _stem(path: str) -> str:

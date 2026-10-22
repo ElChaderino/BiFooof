@@ -5,17 +5,17 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QHeaderView, QLabel, QScrollBar, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QScrollBar,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..analysis.cycles import BANDS, CycleFit, fit_cycles
+from ..analysis.settings import FitSettings
 from ..io.recording import Recording
 from .canvas import MplCanvas, style_axes
 from .workers import CallWorker, launch, wait_for
 
 _BURST = "#0e8f86"
-_QUIET = "#d5dde6"
 _TRACE = "#16324f"
 
 
@@ -31,13 +31,21 @@ class CyclePanel(QWidget):
         self._win_s = 10.0
         self._generation = 0
         self._worker: CallWorker | None = None
+        self.settings = FitSettings()
 
         self.band = QComboBox()
         for label, limits in BANDS:
             self.band.addItem(label, limits)
+        self.band.addItem("Custom", None)
         self.band.setCurrentIndex(2)
         self.band.setToolTip("Frequency band passed to bycycle. Alpha is the usual eyes-closed band.")
-        self.band.currentIndexChanged.connect(self._refit)
+        self.low = _hertz(8.0)
+        self.high = _hertz(12.0)
+        self.low.setToolTip("Low edge of a custom cycle band, in Hz.")
+        self.high.setToolTip("High edge of a custom cycle band, in Hz.")
+        self.band.currentIndexChanged.connect(self._on_band)
+        self.low.valueChanged.connect(self._on_custom_band)
+        self.high.valueChanged.connect(self._on_custom_band)
 
         self.caption = QLabel("Alpha is the default band. Bursts are shaded teal.")
         self.caption.setObjectName("Muted")
@@ -46,6 +54,11 @@ class CyclePanel(QWidget):
         band_label.setObjectName("Muted")
         controls.addWidget(band_label)
         controls.addWidget(self.band)
+        controls.addWidget(self.low)
+        controls.addWidget(self.high)
+        hz = QLabel("Hz")
+        hz.setObjectName("Muted")
+        controls.addWidget(hz)
         controls.addWidget(self.caption, 1)
 
         self.canvas = MplCanvas(width=9.0, height=4.2)
@@ -79,6 +92,14 @@ class CyclePanel(QWidget):
             self._selected = max(0, min(int(selected), recording.n_channels - 1))
         self._refit()
 
+    def current_band(self) -> tuple[float, float]:
+        return float(self.low.value()), float(self.high.value())
+
+    def apply_settings(self, settings: FitSettings) -> None:
+        self.settings = settings
+        self._t0 = 0.0
+        self._refit()
+
     def set_selected(self, index: int) -> None:
         if index == self._selected and self.fit is not None and self.fit.channel_index == index:
             return
@@ -93,16 +114,35 @@ class CyclePanel(QWidget):
         if self.recording is None or self.recording.n_channels == 0:
             return
         index = min(max(self._selected, 0), self.recording.n_channels - 1)
-        band = self.band.currentData()
+        band = self.current_band()
         self._generation += 1
         name = self.recording.ch_names[index]
         self.caption.setText(f"Finding cycles on {name}…")
         self.status.emit(f"Finding cycles on {name}…")
-        worker = CallWorker(self._generation, fit_cycles, (self.recording, index, band))
+        worker = CallWorker(self._generation, fit_cycles, (self.recording, index, band, self.settings))
         worker.succeeded.connect(self._fitted)
         worker.failed.connect(self._failed)
         self._worker = worker
         launch(self, worker)
+
+    def _on_band(self, _index: int = 0) -> None:
+        data = self.band.currentData()
+        if data is not None:
+            self.low.blockSignals(True)
+            self.high.blockSignals(True)
+            self.low.setValue(float(data[0]))
+            self.high.setValue(float(data[1]))
+            self.low.blockSignals(False)
+            self.high.blockSignals(False)
+        self._refit()
+
+    def _on_custom_band(self, _value: float = 0.0) -> None:
+        custom = self.band.findData(None)
+        if custom >= 0 and self.band.currentIndex() != custom:
+            self.band.blockSignals(True)
+            self.band.setCurrentIndex(custom)
+            self.band.blockSignals(False)
+        self._refit()
 
     def _fitted(self, generation: int, result: object) -> None:
         if generation != self._generation or not isinstance(result, CycleFit):
@@ -173,7 +213,7 @@ class CyclePanel(QWidget):
         if stop <= start:
             self._empty("This page has no samples.")
             return
-        times = np.arange(start, stop) / sfreq
+        times = fit.t_offset + np.arange(start, stop) / sfreq
         step = max(1, len(times) // 2500)
         view_t = times[::step]
         view_y = fit.filtered[start:stop][::step]
@@ -183,29 +223,42 @@ class CyclePanel(QWidget):
         ax = fig.add_subplot(111)
         t_end = times[-1]
         for span_start, span_stop, is_burst in fit.spans:
-            left = span_start / sfreq
-            right = span_stop / sfreq
+            if not is_burst:
+                continue
+            left = fit.t_offset + span_start / sfreq
+            right = fit.t_offset + span_stop / sfreq
             if right < times[0] or left > t_end:
                 continue
-            ax.axvspan(max(left, times[0]), min(right, t_end),
-                       color=_BURST if is_burst else _QUIET, alpha=0.45, lw=0)
+            ax.axvspan(max(left, times[0]), min(right, t_end), color=_BURST, alpha=0.28, lw=0, zorder=0)
         peak_idx = [peak for peak in fit.peaks if start <= peak < stop]
         if peak_idx:
-            ax.plot(np.asarray(peak_idx) / sfreq, fit.filtered[peak_idx],
-                    linestyle="none", marker="o", ms=3.5, color="#b3261e", label="Peaks")
-        ax.plot(view_t, view_y, color=_TRACE, lw=0.9, label="Filtered")
+            ax.plot(fit.t_offset + np.asarray(peak_idx) / sfreq, fit.filtered[peak_idx],
+                    linestyle="none", marker="o", ms=3.5, color="#b3261e", label="Peaks", zorder=3)
+        ax.plot(view_t, view_y, color=_TRACE, lw=0.95, label="Filtered", zorder=2)
+        pad = max(2.0, float(np.nanmax(np.abs(view_y))) * 0.12)
+        ax.set_ylim(float(np.nanmin(view_y)) - pad, float(np.nanmax(view_y)) + pad)
         ax.set_xlim(times[0], times[-1])
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("µV")
         ax.set_title(
             f"{fit.channel} filtered {fit.band[0]:g}–{fit.band[1]:g} Hz"
-            "    ·    teal = burst, gray = other cycles",
+            "    ·    teal = burst",
             fontsize=9, loc="left", color="#16232f",
         )
         ax.legend(frameon=False, fontsize=8, loc="upper right")
         style_axes(ax)
         fig.tight_layout()
         self.canvas.draw_idle()
+
+
+def _hertz(value: float) -> QDoubleSpinBox:
+    box = QDoubleSpinBox()
+    box.setRange(0.5, 80.0)
+    box.setDecimals(1)
+    box.setSingleStep(0.5)
+    box.setValue(value)
+    box.setFixedWidth(76)
+    return box
 
 
 def _cell(text: str) -> QTableWidgetItem:
