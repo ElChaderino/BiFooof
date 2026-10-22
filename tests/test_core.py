@@ -21,14 +21,16 @@ import numpy as np
 from PySide6.QtWidgets import QApplication
 
 from bifooof.analysis.compare import ChannelComparison, alpha_peak, compare_spectra
-from bifooof.analysis.cycles import fit_cycles
+from bifooof.analysis.cycles import burst_note, fit_cycles
 from bifooof.analysis.settings import FitSettings, band_label, band_phrase
 from bifooof.analysis.specparam_fit import ChannelFit, fit_spectra
-from bifooof.export import comparison_rows
+from bifooof.analysis.spectra import welch_spectra
+from bifooof.export import comparison_rows, cycle_summary_row
 from bifooof.io.channels import clean_channel_name
 from bifooof.io.condition import guess_condition
 from bifooof.io.load import load_recording, needs_sfreq
-from bifooof.io.recording import Recording
+from bifooof.io.marks import split_marked_conditions
+from bifooof.io.recording import Mark, Recording
 from bifooof.io.sniff import sniff
 from bifooof.ui.main_window import MainWindow
 
@@ -91,6 +93,56 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(recording.sfreq, 256.0)
         self.assertEqual(recording.data.shape, (1, 4))
         self.assertTrue(np.allclose(recording.data[0], [5.0, 10.0, 15.0, 20.0]))
+        self.assertEqual(recording.marks, [])
+
+    def test_wineeg_marks_split_eyes_closed_and_open(self):
+        raw = bytearray(0x900)
+        struct.pack_into("<H", raw, 0x00, 0x0F0E)
+        struct.pack_into("<H", raw, 0x02, 1)
+        struct.pack_into("<H", raw, 0x04, 256)
+        struct.pack_into("<H", raw, 0x06, 2)
+        struct.pack_into("<H", raw, 0x0A, 2)
+        struct.pack_into("<I", raw, 0x10, 1024)
+        struct.pack_into("<I", raw, 0x18, 0x80)
+        struct.pack_into("<I", raw, 0x1C, 0xC0)
+        struct.pack_into("<I", raw, 0x20, 0x8C0)
+        raw[0x80:0x82] = b"O1"
+        struct.pack_into("<f", raw, 0x80 + 0x18, 1.0)
+        _pack_mark(raw, 0x8C0, 0, "Eyes closed")
+        _pack_mark(raw, 0x8E0, 2000, "Eyes open")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "both.eeg"
+            path.write_bytes(raw)
+            recording = load_recording(path)
+        self.assertEqual(len(recording.marks), 2)
+        self.assertIn("Eyes closed", recording.notes[-1])
+        sides = split_marked_conditions(recording)
+        self.assertEqual(set(sides), {"ec", "eo"})
+        self.assertAlmostEqual(sides["ec"].duration_s, 2.0, delta=0.02)
+        self.assertAlmostEqual(sides["eo"].duration_s, 2.0, delta=0.02)
+        self.assertIn("Eyes closed mark", sides["ec"].notes[-1])
+
+    def test_wineeg_clock_mark_does_not_cut_the_file(self):
+        raw = bytearray(0x8E0)
+        struct.pack_into("<H", raw, 0x00, 0x0F0E)
+        struct.pack_into("<H", raw, 0x02, 1)
+        struct.pack_into("<H", raw, 0x04, 256)
+        struct.pack_into("<H", raw, 0x06, 1)
+        struct.pack_into("<H", raw, 0x0A, 2)
+        struct.pack_into("<I", raw, 0x10, 1024)
+        struct.pack_into("<I", raw, 0x18, 0x80)
+        struct.pack_into("<I", raw, 0x1C, 0xC0)
+        struct.pack_into("<I", raw, 0x20, 0x8C0)
+        raw[0x80:0x82] = b"O1"
+        struct.pack_into("<f", raw, 0x80 + 0x18, 1.0)
+        _pack_mark(raw, 0x8C0, 0, " 10:36:38")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clock.eeg"
+            path.write_bytes(raw)
+            recording = load_recording(path)
+        self.assertEqual(split_marked_conditions(recording), {})
+        self.assertAlmostEqual(recording.duration_s, 4.0, delta=0.02)
+        self.assertIn("10:36:38", " ".join(recording.notes))
 
     def test_csv_and_json_roundtrip(self):
         times, data, names = _synthetic()
@@ -201,6 +253,48 @@ class FitTests(unittest.TestCase):
         self.assertIsNotNone(cycles.rise_decay)
         self.assertIsNotNone(cycles.volt_amp)
         self.assertGreater(cycles.volt_amp or 0, 1.0)
+        if cycles.n_bursts == 0 and cycles.n_cycles:
+            self.assertTrue(cycles.burst_note.startswith("No burst"))
+        else:
+            self.assertEqual(cycles.burst_note, "")
+        self.assertEqual(cycle_summary_row(cycles, "ec")["burst_note"], cycles.burst_note)
+
+    def test_burst_note_names_the_cutoff(self):
+        thresholds = FitSettings().cycle_thresholds()
+        quiet = _frame({
+            "amp_fraction": [1, 1, 1, 1, 1],
+            "amp_consistency": [1, 1, 1, 1, 1],
+            "period_consistency": [1, 1, 1, 1, 1],
+            "monotonicity": [0.9, 0.2, 0.2, 0.2, 0.9],
+        })
+        self.assertIn("monotonicity above 0.8", burst_note(quiet, thresholds))
+        exact = _frame({
+            "amp_fraction": [1, 1, 1, 1, 1],
+            "amp_consistency": [1, 1, 1, 1, 1],
+            "period_consistency": [1, 1, 1, 1, 1],
+            "monotonicity": [0.8, 0.8, 0.8, 0.8, 0.8],
+        })
+        self.assertIn("monotonicity above 0.8", burst_note(exact, thresholds))
+        short = _frame({
+            "amp_fraction": [0, 1, 0, 1, 0],
+            "amp_consistency": [1, 1, 1, 1, 1],
+            "period_consistency": [1, 1, 1, 1, 1],
+            "monotonicity": [1, 1, 1, 1, 1],
+        })
+        note = burst_note(short, thresholds)
+        self.assertIn("longest run is 1", note)
+        self.assertIn("needs 3", note)
+
+    def test_welch_removes_a_straight_drift(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        tone = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        drifted = tone + np.linspace(0.0, 20000.0, tone.size)
+        freqs, clean = welch_spectra(tone[None, :], sfreq)
+        _, dirty = welch_spectra(drifted[None, :], sfreq)
+        peak = int(np.argmin(np.abs(freqs - 10.0)))
+        self.assertLess(abs(clean[0, peak] - dirty[0, peak]) / clean[0, peak], 0.05)
+        self.assertLess(dirty[0, 0], clean[0, peak])
 
 
 class WindowTests(unittest.TestCase):
@@ -251,6 +345,19 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(window.fit_bar.band.currentText().startswith("Delta"))
         for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig, window.cycles.canvas.fig):
             self.assertTrue(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
+        window.close()
+
+    def test_marks_open_both_sides(self):
+        recording = _tone(20.0, "rest.eeg")
+        recording.marks = [Mark(0.0, "Eyes closed"), Mark(4.0, "Eyes open")]
+        window = MainWindow()
+        window._present(recording, "eo")
+        self.app.processEvents()
+        self.assertEqual(window.active, "eo")
+        self.assertAlmostEqual(window.recordings["ec"].duration_s, 4.0, delta=0.05)
+        self.assertAlmostEqual(window.recordings["eo"].duration_s, 4.0, delta=0.05)
+        self.assertIn("0.0–4.0 s", window.file_label.text())
+        self.assertIn("4.0–8.0 s", window.file_label.text())
         window.close()
 
 
@@ -381,6 +488,31 @@ class SessionTests(unittest.TestCase):
             text = (folder / "spectrum.csv").read_text(encoding="utf-8")
             self.assertIn("Fp1", text)
             self.assertIn("Eyes closed", text)
+
+
+class _Frame:
+    def __init__(self, columns: dict):
+        self._columns = columns
+
+    def __len__(self) -> int:
+        return len(next(iter(self._columns.values())))
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._columns
+
+    def __getitem__(self, key: str):
+        return self._columns[key]
+
+
+def _frame(columns: dict) -> _Frame:
+    return _Frame(columns)
+
+
+def _pack_mark(raw: bytearray, offset: int, onset_ms: int, label: str) -> None:
+    encoded = label.encode("cp1252")
+    struct.pack_into("<I", raw, offset, onset_ms)
+    struct.pack_into("<H", raw, offset + 4, len(encoded))
+    raw[offset + 6 : offset + 6 + len(encoded)] = encoded
 
 
 if __name__ == "__main__":

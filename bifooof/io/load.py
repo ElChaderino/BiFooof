@@ -18,9 +18,10 @@ from pathlib import Path
 import numpy as np
 
 from .channels import clean_channel_name, is_auxiliary, match_standard_19
-from .recording import Recording
 from .sniff import sniff
-from .wineeg import legacy_physical_channels, read_legacy_eeg
+from .marks import describe_marks
+from .recording import Mark, Recording
+from .wineeg import legacy_physical_channels, parse_legacy_marks, read_legacy_eeg
 
 _BXS_CANDIDATES = [
     Path(os.environ["BIFOOF_BXS2EDF"]) if os.environ.get("BIFOOF_BXS2EDF") else None,
@@ -220,7 +221,16 @@ def _load_wineeg(path: Path) -> Recording:
     width = min(len(row) for row in rows)
     data = np.asarray([row[:width] for row in rows], dtype=np.float64)
     sfreq = float(eeg.header["sample_rate_hz"])
-    return finalize(data, kept_names, sfreq, str(path), "wineeg", notes)
+    marks = [
+        Mark(item.onset_ms / 1000.0, item.label, item.duration_ms / 1000.0)
+        for item in parse_legacy_marks(eeg)
+    ]
+    mark_line = describe_marks(marks)
+    if mark_line:
+        notes.append(mark_line)
+    recording = finalize(data, kept_names, sfreq, str(path), "wineeg", notes)
+    recording.marks = marks
+    return recording
 
 
 def _find_bxs2edf() -> Path | None:

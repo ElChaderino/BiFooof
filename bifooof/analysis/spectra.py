@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import welch
+from scipy.signal import detrend, welch
 
 
 def welch_spectra(
@@ -16,6 +16,8 @@ def welch_spectra(
     """Return ``(freqs, linear_power)`` with power shaped ``(n_channels, n_freqs)``.
 
     Power is in microvolts squared per Hz. specparam logs it during the fit.
+    A straight drift line is removed from each channel first. WinEEG files
+    often carry a ramp large enough to bend the 1/f fit.
     """
     if data.ndim != 2:
         raise ValueError("Expected channels-by-samples data.")
@@ -36,7 +38,10 @@ def welch_spectra(
     if nperseg < 16:
         raise ValueError("The recording is too short to estimate a spectrum.")
 
-    freqs, power = welch(data, fs=sfreq, nperseg=nperseg, axis=-1)
+    values = np.asarray(data, dtype=np.float64)
+    if values.shape[1] >= 2:
+        values = detrend(values, type="linear", axis=-1)
+    freqs, power = welch(values, fs=sfreq, nperseg=nperseg, axis=-1)
     mask = (freqs >= low) & (freqs <= high)
     if int(mask.sum()) < 8:
         raise ValueError("Not enough frequency bins in the requested range.")

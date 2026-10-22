@@ -7,6 +7,15 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
+@dataclass(frozen=True)
+class Mark:
+    """One annotation, timed from the start of this recording."""
+
+    onset_s: float
+    label: str
+    duration_s: float = 0.0
+
+
 @dataclass
 class Recording:
     """One continuous recording.
@@ -23,6 +32,7 @@ class Recording:
     source_path: str
     source_format: str
     notes: list[str] = field(default_factory=list)
+    marks: list[Mark] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.data = np.ascontiguousarray(self.data, dtype=np.float64)

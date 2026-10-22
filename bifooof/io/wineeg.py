@@ -15,6 +15,8 @@ from typing import Iterable
 LEGACY_MAGIC = 0x0F0E
 LEGACY_HEADER_SIZE = 0x80
 LEGACY_CHANNEL_DESCRIPTOR_SIZE = 0x40
+LEGACY_PRIMARY_MARK_SIZE = 0x20
+LEGACY_EXTENDED_MARK_DISK_SIZE = 0x20
 
 HEADER_FIELDS: tuple[tuple[str, int, str], ...] = (
     ("magic", 0x00, "H"),
@@ -76,6 +78,14 @@ class LegacyChannel:
     kind: int
     correction: float
     zero_offset: float
+
+
+@dataclass(frozen=True)
+class LegacyMark:
+    onset_ms: int
+    label: str
+    duration_ms: int = 0
+    family: str = "primary"
 
 
 @dataclass
@@ -203,3 +213,36 @@ def legacy_physical_channels(eeg: LegacyEEG, *, logical_only: bool = True) -> li
         zero = descriptor.zero_offset if math.isfinite(descriptor.zero_offset) else 0.0
         result.append([(value - zero) * scale for value in values])
     return result
+
+
+def parse_legacy_marks(eeg: LegacyEEG, *, include_text: bool = True) -> list[LegacyMark]:
+    """Read primary and extended marks. Onset and duration are milliseconds."""
+    header = eeg.header
+    marks: list[LegacyMark] = []
+    offset = header["primary_marks_offset"]
+    count = header["primary_mark_count"]
+    if count and offset + count * LEGACY_PRIMARY_MARK_SIZE <= len(eeg.raw):
+        for index in range(count):
+            pos = offset + index * LEGACY_PRIMARY_MARK_SIZE
+            onset = _unpack(eeg.raw, pos, "I")
+            length = min(_unpack(eeg.raw, pos + 4, "H"), 24)
+            label = (
+                eeg.raw[pos + 6 : pos + 6 + length].decode("cp1252", errors="replace")
+                if include_text
+                else "<redacted>"
+            )
+            marks.append(LegacyMark(onset, label, family="primary"))
+
+    offset = header["extended_marks_offset"]
+    count = header["extended_mark_count"]
+    if count and offset + count * LEGACY_EXTENDED_MARK_DISK_SIZE <= len(eeg.raw):
+        for index in range(count):
+            pos = offset + index * LEGACY_EXTENDED_MARK_DISK_SIZE
+            kind = _unpack(eeg.raw, pos, "H")
+            onset = _unpack(eeg.raw, pos + 2, "I")
+            duration = _unpack(eeg.raw, pos + 6, "I") if kind == 0 else 0
+            label = _decode_fixed(eeg.raw[pos + 0x0E : pos + 0x20]) if include_text else "<redacted>"
+            if not label and kind == 0:
+                label = "Artifact" if include_text else "<redacted>"
+            marks.append(LegacyMark(onset, label, duration, f"extended_type_{kind}"))
+    return marks

@@ -99,6 +99,7 @@ def cycle_summary_row(fit: CycleFit, condition: str, source: str = "") -> dict:
         "band_high_hz": fit.band[1],
         "n_cycles": fit.n_cycles,
         "n_bursts": fit.n_bursts,
+        "burst_note": fit.burst_note,
         "period_ms": fit.period_ms,
         "rise_decay": fit.rise_decay,
         "peak_trough": fit.peak_trough,

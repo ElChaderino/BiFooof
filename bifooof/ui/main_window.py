@@ -18,6 +18,7 @@ from ..export import (
     write_csv,
 )
 from ..io.condition import CONDITION_LABELS, CONDITIONS, guess_condition
+from ..io.marks import span_text, split_marked_conditions
 from ..io.load import load_recording, needs_sfreq
 from ..io.recording import Recording
 from ..io.sniff import FILE_FILTER
@@ -345,6 +346,27 @@ class MainWindow(QMainWindow):
         self._enable_open(condition)
         if generation != self._load_generations.get(condition) or not isinstance(recording, Recording):
             return
+        self._present(recording, condition)
+
+    def _present(self, recording: Recording, condition: str) -> None:
+        """Open one recording, or both sides when its marks name them."""
+        sides = split_marked_conditions(recording)
+        if sides:
+            order = [cond for cond in ("ec", "eo") if cond in sides and cond != condition]
+            if condition in sides:
+                order.append(condition)
+            for cond in order:
+                self._apply(sides[cond], cond)
+            if len(sides) == 2:
+                self.statusBar().showMessage(
+                    "This file marks both eyes closed and eyes open, so both sides were opened."
+                )
+            elif condition not in sides:
+                only = next(iter(sides))
+                self.statusBar().showMessage(
+                    f"This file's mark is {CONDITION_LABELS[only].lower()}, so it was opened on that side."
+                )
+            return
         hinted = guess_condition(recording.source_path)
         if hinted and hinted != condition:
             self.statusBar().showMessage(
@@ -471,13 +493,22 @@ class MainWindow(QMainWindow):
 
     def _refresh_label(self) -> None:
         parts = []
+        tips = []
         for key in CONDITIONS:
             recording = self.recordings.get(key)
-            if recording is not None:
-                parts.append(f"{CONDITION_LABELS[key]}: {Path(recording.source_path).name}")
+            if recording is None:
+                continue
+            name = Path(recording.source_path).name
+            span = span_text(recording.notes)
+            shown = f"{CONDITION_LABELS[key]}: {name}"
+            if span:
+                shown = f"{shown} ({span})"
+            parts.append(shown)
+            detail = " ".join(recording.notes)
+            tips.append(f"{shown}. {detail}".strip())
         text = "    ".join(parts) if parts else "No recording open"
         self.file_label.setText(text)
-        self.file_label.setToolTip(text)
+        self.file_label.setToolTip("\n".join(tips) if tips else text)
 
     def _tell(self, message: str) -> None:
         self.statusBar().showMessage(message)
@@ -511,7 +542,9 @@ class MainWindow(QMainWindow):
             "Open an eyes-closed recording and an eyes-open recording. Both fits keep running. "
             "Compare overlays the two spectra, the exponent change, and reactivity "
             "in the selected band (eyes closed minus eyes open). Alpha 8–12 Hz is the default. "
-            "Delta, theta, beta, gamma, and a custom range use the same views.<br><br>"
+            "Delta, theta, beta, gamma, and a custom range use the same views. "
+            "A WinEEG file whose marks name eyes closed and eyes open opens both sides. "
+            "When cycles are found and none form a burst, the cycle page names the cutoff that stopped the run.<br><br>"
             "Save image writes the current view. Save data writes the current table. "
             "Save session writes both conditions and the comparison into one folder.",
         )

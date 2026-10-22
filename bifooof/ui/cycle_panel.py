@@ -53,6 +53,7 @@ class CyclePanel(QWidget):
 
         self.caption = QLabel("The fit bar chooses the band. Bursts are shaded teal.")
         self.caption.setObjectName("Muted")
+        self.caption.setWordWrap(True)
         controls = QHBoxLayout()
         band_label = QLabel("Band")
         band_label.setObjectName("Muted")
@@ -63,7 +64,7 @@ class CyclePanel(QWidget):
         hz = QLabel("Hz")
         hz.setObjectName("Muted")
         controls.addWidget(hz)
-        controls.addWidget(self.caption, 1)
+        controls.addStretch(1)
 
         self.canvas = MplCanvas(width=9.0, height=4.2)
         self.scroll = QScrollBar(Qt.Horizontal)
@@ -81,6 +82,7 @@ class CyclePanel(QWidget):
 
         root = QVBoxLayout(self)
         root.addLayout(controls)
+        root.addWidget(self.caption)
         root.addWidget(self.canvas, 1)
         root.addWidget(self.scroll)
         root.addWidget(self.table)
@@ -188,10 +190,13 @@ class CyclePanel(QWidget):
         self._configure_scroll()
         self._fill_table()
         self._draw()
-        self.caption.setText(
+        text = (
             f"{result.channel}  ·  {result.band[0]:g}–{result.band[1]:g} Hz  ·  "
             f"{result.n_cycles} cycles, {result.n_bursts} in bursts"
         )
+        if result.burst_note:
+            text = f"{text}. {result.burst_note}"
+        self.caption.setText(text)
         self.status.emit("Cycle fit ready.")
 
     def _failed(self, generation: int, message: str) -> None:

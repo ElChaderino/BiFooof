@@ -2,7 +2,7 @@
 
 Windows app for specparam (FOOOF) and bycycle on EEG.
 
-Open an EDF, WinEEG `.eeg`, BrainVision, EEGLAB, FIF, CNT, CSV, or JSON file. BXS files need `bxs2edf.exe` on the machine. Open an eyes-closed recording and an eyes-open recording together and the comparison view puts the two spectra side by side.
+Open an EDF, WinEEG `.eeg`, BrainVision, EEGLAB, FIF, CNT, CSV, or JSON file. The `.eeg` reader is part of the app. BXS files need `bxs2edf.exe` on the machine. Open an eyes-closed recording and an eyes-open recording together and the comparison view puts the two spectra side by side.
 
 ## Fit bar
 
@@ -18,7 +18,13 @@ Alpha, 8–12 Hz, is the default. The same control is delta 1–4, theta 4–8, 
 
 Burst detection can stay on the library rule, or use the resting-alpha and paper-alpha amplitude rules. Those rules still apply to whichever band is selected.
 
+## Drift, bursts, and marks
 
+The spectrum fit removes a straight drift line from each channel before the Welch estimate. The cycle fit does the same before its bandpass.
+
+When cycles are found and none of them form a burst, the Cycles page names the cutoff that stopped the run. The library rule needs monotonicity above 0.8 for three cycles in a row.
+
+A WinEEG mark that says eyes closed or eyes open cuts that side out of the file. A file with both marks opens both sides. A clock-time mark is kept as a note and does not cut the recording.
 
 ## Screenshots
 

@@ -36,6 +36,7 @@ class CycleFit:
     peaks: list[int] = field(default_factory=list)
     cycles: list[dict] = field(default_factory=list)
     t_offset: float = 0.0
+    burst_note: str = ""
 
 
 def fit_cycles(
@@ -63,8 +64,9 @@ def fit_cycles(
     t_offset = min(max(0.0, float(chosen.t_start)), recording.duration_s)
     recording = clip_recording(recording, chosen)
 
-    # WinEEG files can carry a large linear drift. Welch removes it before the
-    # spectrum fit; bycycle does not, and the drift swallows the alpha cycles.
+    # WinEEG files can carry a large linear drift. The spectrum fit removes the
+    # same straight line before Welch. bycycle needs it gone before the bandpass,
+    # or the ramp swallows the cycles.
     signal = detrend(np.asarray(recording.data[channel_index], dtype=np.float64), type="linear")
     filtered = _bandpass(signal, recording.sfreq, low, high)
     model = Bycycle(
@@ -103,6 +105,8 @@ def fit_cycles(
 
     period = _median("period")
     burst_period = _median("period", burst_mask)
+    n_bursts = int(burst_mask.sum()) if burst_mask.size else 0
+    note = "" if n_bursts else burst_note(frame, chosen.cycle_thresholds())
     return CycleFit(
         channel=recording.ch_names[channel_index],
         channel_index=channel_index,
@@ -110,7 +114,7 @@ def fit_cycles(
         sfreq=float(recording.sfreq),
         filtered=filtered,
         n_cycles=len(spans),
-        n_bursts=int(burst_mask.sum()) if burst_mask.size else 0,
+        n_bursts=n_bursts,
         period_ms=None if period is None else period / recording.sfreq * 1000.0,
         rise_decay=_median("time_rdsym"),
         peak_trough=_median("time_ptsym"),
@@ -123,7 +127,85 @@ def fit_cycles(
         peaks=peaks,
         cycles=cycle_rows,
         t_offset=t_offset,
+        burst_note=note,
     )
+
+
+_BURST_CUTOFFS = (
+    ("amplitude fraction", "amp_fraction", "amp_fraction_threshold"),
+    ("amplitude consistency", "amp_consistency", "amp_consistency_threshold"),
+    ("period consistency", "period_consistency", "period_consistency_threshold"),
+    ("monotonicity", "monotonicity", "monotonicity_threshold"),
+)
+
+
+def burst_note(frame, thresholds: dict) -> str:
+    """Why a fit with cycles still has no bursts. Empty when nothing blocked them."""
+    if frame is None or len(frame) == 0:
+        return ""
+    minimum = int(thresholds.get("min_n_cycles", 3))
+    count = len(frame)
+    if count < 3:
+        return (
+            f"No burst: only {count} cycles. The first and last never count, "
+            f"and a burst needs {minimum} in a row."
+        )
+
+    passed: list[np.ndarray] = []
+    blocked: list[str] = []
+    for label, column, key in _BURST_CUTOFFS:
+        if column not in frame or key not in thresholds:
+            continue
+        values = np.asarray(frame[column], dtype=np.float64)
+        cutoff = float(thresholds[key])
+        ok = np.isfinite(values) & (values > cutoff)
+        passed.append(ok)
+        if not bool(np.any(ok[1:-1])):
+            blocked.append(f"{label} above {_cutoff_text(cutoff)}")
+    if not passed:
+        return "No burst under the current rule."
+
+    together = np.logical_and.reduce(passed)
+    together = np.array(together, dtype=bool, copy=True)
+    together[0] = False
+    together[-1] = False
+    n_pass = int(together.sum())
+    longest = _longest_run(together)
+    if n_pass == 0:
+        if blocked:
+            return f"No burst: no cycle passed {_join(blocked)}."
+        return "No burst: no cycle passed every cutoff at once."
+    if longest < minimum:
+        cycle_word = "cycle" if n_pass == 1 else "cycles"
+        return (
+            f"No burst: {n_pass} {cycle_word} pass every cutoff, "
+            f"but the longest run is {longest} and a burst needs {minimum}."
+        )
+    return "No burst under the current rule."
+
+
+def _longest_run(mask: np.ndarray) -> int:
+    longest = 0
+    current = 0
+    for value in mask:
+        if value:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _join(parts: list[str]) -> str:
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return ", ".join(parts[:-1]) + ", and " + parts[-1]
+
+
+def _cutoff_text(value: float) -> str:
+    return f"{value:g}"
 
 
 def _cycle_rows(frame, sfreq: float) -> list[dict]:

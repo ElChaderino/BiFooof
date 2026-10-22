@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..io.recording import Recording
+from ..io.recording import Mark, Recording
 
 
 @dataclass
@@ -178,6 +178,11 @@ def clip_recording(recording: Recording, settings: FitSettings) -> Recording:
         return recording
     t0 = i0 / recording.sfreq
     t1 = i1 / recording.sfreq
+    kept = [
+        Mark(mark.onset_s - t0, mark.label, mark.duration_s)
+        for mark in recording.marks
+        if t0 - 1e-9 <= mark.onset_s < t1 + 1e-9
+    ]
     return Recording(
         data=recording.data[:, i0:i1],
         ch_names=list(recording.ch_names),
@@ -185,6 +190,7 @@ def clip_recording(recording: Recording, settings: FitSettings) -> Recording:
         source_path=recording.source_path,
         source_format=recording.source_format,
         notes=[*recording.notes, f"Fit window {t0:.1f}–{t1:.1f} s."],
+        marks=kept,
     )
 
 

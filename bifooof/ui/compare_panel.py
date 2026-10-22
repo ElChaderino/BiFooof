@@ -69,11 +69,16 @@ class ComparePanel(QWidget):
         self.cycle_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.cycle_table.setMaximumHeight(148)
         self.cycle_table.setAlternatingRowColors(True)
+        self.cycle_note = QLabel("")
+        self.cycle_note.setObjectName("Muted")
+        self.cycle_note.setWordWrap(True)
+        self.cycle_note.setVisible(False)
 
         root = QVBoxLayout(self)
         root.addWidget(self.caption)
         root.addWidget(self.canvas, 1)
         root.addWidget(self.cycle_table)
+        root.addWidget(self.cycle_note)
         root.addWidget(self.table)
         self._empty("Open both an eyes-closed and an eyes-open file to compare them.")
         self._fill_cycles(None, None)
@@ -282,6 +287,12 @@ class ComparePanel(QWidget):
             self.cycle_table.setItem(row, 0, _item(label))
             self.cycle_table.setItem(row, 1, _item(_num(None if eyes_closed is None else getattr(eyes_closed, field), 3)))
             self.cycle_table.setItem(row, 2, _item(_num(None if eyes_open is None else getattr(eyes_open, field), 3)))
+        notes = []
+        for name, fit in (("Eyes closed", eyes_closed), ("Eyes open", eyes_open)):
+            if fit is not None and fit.burst_note:
+                notes.append(f"{name}: {fit.burst_note}")
+        self.cycle_note.setText(" ".join(notes))
+        self.cycle_note.setVisible(bool(notes))
 
     def _empty(self, message: str) -> None:
         self.canvas.clear()
