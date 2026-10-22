@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# PyInstaller output. The one-file exe is too large for git.
+build/
+dist/
+
+# Local fit results. Recordings stay on this machine.
+runs/
