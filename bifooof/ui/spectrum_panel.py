@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -9,8 +11,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ..analysis.settings import FitSettings
-from ..analysis.specparam_fit import SpectrumFit, fit_spectra
+from ..analysis.compare import alpha_peak
+from ..analysis.prepare import R2_WEAK, peak_at_width_floor
+from ..analysis.settings import FitSettings, matched_settings, reference_phrase
+from ..analysis.specparam_fit import SpectrumFit, epochs_for_peak, fit_spectra
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
 from ..plots import render_spectrum
@@ -18,7 +22,7 @@ from .canvas import MplCanvas
 from .workers import CallWorker, launch, wait_for
 
 _COLUMNS = [
-    "Channel", "Offset", "Exponent", "CF (Hz)", "Power",
+    "Channel", "Offset", "Exponent", "CF (Hz)", "Height",
     "BW (Hz)", "Peaks", "R²", "Error",
 ]
 
@@ -45,8 +49,22 @@ class SpectrumPanel(QWidget):
         self.caption.setObjectName("Muted")
         self.caption.setWordWrap(True)
         self.canvas = MplCanvas(width=8.0, height=6.0)
+        self.canvas.mpl_connect("button_press_event", self._on_click)
+        self._mark_hz: float | None = None
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
+        cf_header = self.table.horizontalHeaderItem(3)
+        if cf_header is not None:
+            cf_header.setToolTip(
+                "Center of the tallest fitted peak in the whole fit range. "
+                "It can sit outside the selected band. The caption names the in-band peak separately."
+            )
+        height_header = self.table.horizontalHeaderItem(4)
+        if height_header is not None:
+            height_header.setToolTip(
+                "Height of the tallest fitted peak above the aperiodic background, in log10 power. "
+                "Not mean Welch power in a band, and not a share of the spectrum."
+            )
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
@@ -76,6 +94,10 @@ class SpectrumPanel(QWidget):
         self.table.setRowCount(0)
         self._empty("Fitting spectra…")
         self._start(condition)
+        if len(self.recordings) > 1:
+            for other in list(self.recordings):
+                if other != condition:
+                    self._start(other)
 
     def show_condition(self, condition: str) -> None:
         """Display a fit that is already running or finished, without starting another."""
@@ -101,6 +123,13 @@ class SpectrumPanel(QWidget):
         for condition in list(self.recordings):
             self._start(condition)
 
+    def set_band(self, low: float, high: float) -> None:
+        """The band changes the in-band peak without refitting specparam."""
+        self.settings = replace(self.settings, alpha_low=float(low), alpha_high=float(high))
+        if self.fit is not None:
+            self._fill_table()
+            self._describe()
+
     def set_selected(self, index: int) -> None:
         if self.fit is None or not 0 <= index < len(self.fit.channels):
             self._selected = index
@@ -122,7 +151,9 @@ class SpectrumPanel(QWidget):
         generation = self._generations[condition]
         label = "eyes closed" if condition == "ec" else "eyes open"
         self.status.emit(f"Fitting {label} spectra…")
-        worker = CallWorker(generation, fit_spectra, (recording, self.settings))
+        others = [item for key, item in self.recordings.items() if key != condition]
+        settings = matched_settings(self.settings, recording, others)
+        worker = CallWorker(generation, fit_spectra, (recording, settings))
         worker.succeeded.connect(lambda gen, result, cond=condition: self._fitted(cond, gen, result))
         worker.failed.connect(lambda gen, message, cond=condition: self._failed(cond, gen, message))
         self._workers[condition] = worker
@@ -158,13 +189,18 @@ class SpectrumPanel(QWidget):
         for row, item in enumerate(self.fit.channels):
             peak = item.dominant_peak
             centers = ", ".join(f"{cf:.1f}" for cf, _pw, _bw in item.peaks) if item.peaks else "—"
+            bandwidth = "—"
+            if peak:
+                bandwidth = f"{peak[2]:.2f}"
+                if peak_at_width_floor(peak[2], self.settings.peak_width_low):
+                    bandwidth = f"{bandwidth} floor"
             values = [
                 item.name,
                 _num(item.offset, 3),
                 _num(item.exponent, 3),
                 _num(peak[0], 2) if peak else "—",
                 _num(peak[1], 3) if peak else "—",
-                _num(peak[2], 2) if peak else "—",
+                bandwidth,
                 centers if item.usable else (item.reason or "—"),
                 _num(item.r_squared, 3),
                 _num(item.error, 4),
@@ -176,6 +212,14 @@ class SpectrumPanel(QWidget):
         if self.fit.channels:
             self.table.selectRow(min(self._selected, len(self.fit.channels) - 1))
         self.table.blockSignals(False)
+
+    def _on_click(self, event) -> None:
+        if event.inaxes is None or event.xdata is None:
+            return
+        if event.inaxes.get_label() not in {"spectrum", "residual"}:
+            return
+        self._mark_hz = float(event.xdata)
+        self._draw()
 
     def _on_table(self) -> None:
         rows = self.table.selectionModel().selectedRows()
@@ -199,6 +243,7 @@ class SpectrumPanel(QWidget):
         render_spectrum(
             self.canvas.fig, self.fit, self._selected,
             CONDITION_LABELS.get(self.condition, ""),
+            self._mark_hz,
         )
         self._describe()
         self.canvas.draw_idle()
@@ -212,7 +257,14 @@ class SpectrumPanel(QWidget):
         if not item.usable:
             self.caption.setText(f"{label}  ·  {item.name}  ·  {item.reason or 'Not fit'}")
             return
-        peak = "no peak" if item.dominant_peak is None else f"peak {item.dominant_peak[0]:.1f} Hz"
+        band_peak = alpha_peak(item, self.settings.alpha_band())
+        tallest = item.dominant_peak
+        if band_peak is None:
+            peak = "no in-band peak" if tallest is None else f"no in-band peak, tallest {tallest[0]:.1f} Hz"
+        elif tallest is not None and abs(tallest[0] - band_peak[0]) > 0.05:
+            peak = f"in-band {band_peak[0]:.1f} Hz, tallest {tallest[0]:.1f} Hz"
+        else:
+            peak = f"in-band peak {band_peak[0]:.1f} Hz"
         exponent = "—" if item.exponent is None else f"exponent {item.exponent:.2f}"
         r_squared = "—" if item.r_squared is None else f"R² {item.r_squared:.2f}"
         knee = ""
@@ -222,9 +274,44 @@ class SpectrumPanel(QWidget):
                 knee = f"  ·  knee {knee_hz:.1f} Hz"
         window = f"{self.fit.t_start:.0f}–{self.fit.t_end:.0f} s"
         span = f"{self.fit.fmin:g}–{self.fit.fmax:.0f} Hz"
+        notes = []
+        if self.fit.epoch_s and item.n_epochs:
+            count = epochs_for_peak(item, band_peak)
+            if band_peak is not None and count:
+                note = (
+                    f"that in-band peak is in {count} of {item.n_epochs} "
+                    f"epochs of {self.fit.epoch_s:.0f} s"
+                )
+                if count < item.n_epochs:
+                    note += ". Its height is the median of those epochs, not lowered by the epochs that missed it"
+                notes.append(note)
+            else:
+                notes.append(f"no in-band peak in {item.n_epochs} epochs of {self.fit.epoch_s:.0f} s")
+        floor_peak = band_peak or tallest
+        if floor_peak is not None and peak_at_width_floor(floor_peak[2], self.settings.peak_width_low):
+            notes.append("peak width is at the narrowest allowed")
+        if item.r_squared is not None and item.r_squared < R2_WEAK:
+            notes.append("weak fit")
+        if (
+            self.recording is not None
+            and self.settings.t_length is None
+            and self.fit.t_end + 1.0 < self.recording.duration_s
+        ):
+            notes.append(f"matched to the shorter file, {self.fit.t_end:.0f} s")
+        if self.fit.notes:
+            notes.append(self.fit.notes)
+        if self.recording is not None and any("microvolts" in note for note in self.recording.notes):
+            notes.append("check voltage")
+        notes.append(reference_phrase(self.settings.reference))
+        if self._mark_hz is not None and item.freqs is not None and item.spectrum is not None and item.model is not None:
+            nearest = int(np.argmin(np.abs(item.freqs - self._mark_hz)))
+            notes.append(
+                f"residual at {item.freqs[nearest]:.1f} Hz is {item.spectrum[nearest] - item.model[nearest]:+.3f}"
+            )
+        suffix = "" if not notes else "  ·  " + "  ·  ".join(notes)
         self.caption.setText(
             f"{label}  ·  {item.name}  ·  {window}  ·  {span}  ·  "
-            f"{self.fit.aperiodic_mode}{knee}  ·  {exponent}  ·  {peak}  ·  {r_squared}"
+            f"{self.fit.aperiodic_mode}{knee}  ·  {exponent}  ·  {peak}  ·  {r_squared}{suffix}"
         )
 
 

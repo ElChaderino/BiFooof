@@ -5,29 +5,30 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHeaderView, QLabel, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..analysis.compare import ChannelComparison, alpha_peak, compare_spectra
+from ..analysis.compare import BAND_CHANGE, ChannelComparison, alpha_peak, compare_spectra
 from ..analysis.cycles import CycleFit, fit_cycles
-from ..analysis.settings import FitSettings, band_label, band_phrase
+from ..analysis.prepare import R2_WEAK
+from ..analysis.settings import FitSettings, band_label, band_phrase, matched_settings, reference_phrase
 from ..analysis.specparam_fit import ChannelFit, SpectrumFit
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
-from ..plots import mark_spectrum, stamp_figure
+from ..plots import clear_figure, mark_spectrum, stamp_figure
 from .canvas import MplCanvas, finish_figure, style_axes
 from .headmap import draw_head
 from .workers import CallWorker, launch, wait_for
 
 _EC = "#1c4e78"
 _EO = "#c2410c"
-_LEAD = ["Channel", "Offset EC", "Offset EO", "Exp EC", "Exp EO", "EO − EC"]
 
 
 class ComparePanel(QWidget):
     channel_selected = Signal(str)
     status = Signal(str)
+    updated = Signal()
 
     def __init__(self):
         super().__init__()
@@ -48,8 +49,33 @@ class ComparePanel(QWidget):
         )
         self.caption.setObjectName("Muted")
         self.caption.setWordWrap(True)
+        self.mode = QComboBox()
+        self.mode.addItem("Eyes closed / Eyes open", "state")
+        self.mode.addItem("Pre / Post", "pre")
+        self.mode.addItem("Custom", "custom")
+        self.mode.setToolTip(
+            "Eyes closed / Eyes open is the usual pair. Pre / Post labels the same two files "
+            "in the order of the open buttons. A difference between sessions is not a treatment effect."
+        )
+        self.custom_left = QLineEdit("A")
+        self.custom_right = QLineEdit("B")
+        self.custom_left.setFixedWidth(88)
+        self.custom_right.setFixedWidth(88)
+        self.custom_left.setVisible(False)
+        self.custom_right.setVisible(False)
+        self.mode.currentIndexChanged.connect(self._on_mode)
+        self.custom_left.textChanged.connect(self._on_mode)
+        self.custom_right.textChanged.connect(self._on_mode)
+        pair = QHBoxLayout()
+        pair_label = QLabel("Pair")
+        pair_label.setObjectName("Muted")
+        pair.addWidget(pair_label)
+        pair.addWidget(self.mode)
+        pair.addWidget(self.custom_left)
+        pair.addWidget(self.custom_right)
+        pair.addStretch(1)
         self.canvas = MplCanvas(width=8.0, height=6.0)
-        self.table = QTableWidget(0, 12)
+        self.table = QTableWidget(0, 17)
         self._refresh_headers()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -62,12 +88,12 @@ class ComparePanel(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.itemSelectionChanged.connect(self._on_table)
 
-        self.cycle_table = QTableWidget(4, 3)
+        self.cycle_table = QTableWidget(8, 3)
         self.cycle_table.setHorizontalHeaderLabels(["Measure", "Eyes closed", "Eyes open"])
         self.cycle_table.verticalHeader().setVisible(False)
         self.cycle_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.cycle_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.cycle_table.setMaximumHeight(148)
+        self.cycle_table.setMaximumHeight(236)
         self.cycle_table.setAlternatingRowColors(True)
         self.cycle_note = QLabel("")
         self.cycle_note.setObjectName("Muted")
@@ -75,6 +101,7 @@ class ComparePanel(QWidget):
         self.cycle_note.setVisible(False)
 
         root = QVBoxLayout(self)
+        root.addLayout(pair)
         root.addWidget(self.caption)
         root.addWidget(self.canvas, 1)
         root.addWidget(self.cycle_table)
@@ -93,7 +120,9 @@ class ComparePanel(QWidget):
         self._cycle_key = None
         self._refresh_headers()
         if self.ready:
-            self.rows = compare_spectra(self.fits["ec"], self.fits["eo"], self._alpha())
+            self.rows = compare_spectra(
+                self.fits["ec"], self.fits["eo"], self._alpha(), self.settings.peak_width_low,
+            )
             self._fill_table()
             self._draw()
             self._maybe_cycles()
@@ -121,7 +150,7 @@ class ComparePanel(QWidget):
             else:
                 self._empty("Open both an eyes-closed and an eyes-open file to compare them.")
             return
-        self.rows = compare_spectra(fits["ec"], fits["eo"], self._alpha())
+        self.rows = compare_spectra(fits["ec"], fits["eo"], self._alpha(), self.settings.peak_width_low)
         if channel and any(row.name == channel for row in self.rows):
             self.channel = channel
         elif self.rows and self.channel not in {row.name for row in self.rows}:
@@ -133,22 +162,68 @@ class ComparePanel(QWidget):
     def shutdown(self) -> None:
         wait_for(self)
 
+    def _names(self) -> tuple[str, str, str, str]:
+        mode = self.mode.currentData()
+        if mode == "pre":
+            return "Pre", "Post", "Pre", "Post"
+        if mode == "custom":
+            left = self.custom_left.text().strip() or "A"
+            right = self.custom_right.text().strip() or "B"
+            return left, right, left, right
+        return "Eyes closed", "Eyes open", "EC", "EO"
+
+    def _on_mode(self, *_args) -> None:
+        custom = self.mode.currentData() == "custom"
+        self.custom_left.setVisible(custom)
+        self.custom_right.setVisible(custom)
+        self._refresh_headers()
+        if not self.ready:
+            return
+        self._fill_table()
+        self._draw()
+        self._fill_cycles(self.cycle_fits.get("ec"), self.cycle_fits.get("eo"))
+
     def _refresh_headers(self) -> None:
         name = band_label(*self._alpha())
+        left, right, short_left, short_right = self._names()
         self.table.setHorizontalHeaderLabels([
-            *_LEAD,
-            f"{name} EC", f"{name} EO", "Peak Δ", "Band %", "CF EC", "CF EO",
+            "Channel", f"Offset {short_left}", f"Offset {short_right}",
+            f"Exp {short_left}", f"Exp {short_right}", f"{short_right} − {short_left}",
+            f"{name} {short_left}", f"{name} {short_right}", "Peak Δ", "Δ band %",
+            f"CF {short_left}", f"CF {short_right}", "Δf",
+            f"R² {short_left}", f"R² {short_right}",
+            f"Nearest {short_left}", f"Nearest {short_right}",
         ])
+        if hasattr(self, "cycle_table"):
+            self.cycle_table.setHorizontalHeaderLabels(["Measure", left, right])
         header = self.table.horizontalHeaderItem(8)
         if header is not None:
             header.setToolTip(
-                "Eyes-closed fitted peak height minus eyes-open fitted peak height, "
-                "above the aperiodic background. Not percent band power. "
-                "Each side picks its own tallest peak in the band."
+                f"{left} fitted peak height minus {right.lower()} fitted peak height, "
+                "above the aperiodic background, in log10 power. "
+                "Each side picks its own tallest peak in the band. A missing peak stays blank. "
+                "This is not the Welch band change."
             )
+        for index, side in ((6, left), (7, right)):
+            peak_header = self.table.horizontalHeaderItem(index)
+            if peak_header is not None:
+                peak_header.setToolTip(
+                    f"{side} fitted peak height above the aperiodic background, in log10 power. "
+                    "Not mean Welch power in the band."
+                )
         band_header = self.table.horizontalHeaderItem(9)
         if band_header is not None:
-            band_header.setToolTip("Percent change in mean Welch band power, (EC − EO) / EO × 100.")
+            band_header.setToolTip(BAND_CHANGE)
+        for index, tip in (
+            (12, "Absolute difference between the two in-band center frequencies, in Hz."),
+            (13, f"specparam R² for {left.lower()}. Below 0.6 the site is ringed on the head map."),
+            (14, f"specparam R² for {right.lower()}. Below 0.6 the site is ringed on the head map."),
+            (15, f"Closest {left.lower()} peak outside the band, and how far outside it sits. The band difference stays blank."),
+            (16, f"Closest {right.lower()} peak outside the band, and how far outside it sits. The band difference stays blank."),
+        ):
+            header = self.table.horizontalHeaderItem(index)
+            if header is not None:
+                header.setToolTip(tip)
 
     def _fill_table(self) -> None:
         self.table.blockSignals(True)
@@ -170,6 +245,11 @@ class ComparePanel(QWidget):
                 _num(row.band_power_reactivity_percent, 1),
                 _num(row.alpha_cf_ec, 2),
                 _num(row.alpha_cf_eo, 2),
+                _num(row.peak_center_difference_hz, 2),
+                _num(row.r_squared_ec, 2),
+                _num(row.r_squared_eo, 2),
+                _nearest(row.nearest_cf_ec, row.nearest_distance_ec),
+                _nearest(row.nearest_cf_eo, row.nearest_distance_eo),
             ]
             for column, text in enumerate(values):
                 cell = QTableWidgetItem(text)
@@ -195,9 +275,9 @@ class ComparePanel(QWidget):
         if not self.rows:
             return
         fig = self.canvas.fig
-        fig.clear()
+        clear_figure(fig)
         finish_figure(fig)
-        grid = fig.add_gridspec(2, 2, height_ratios=[2.0, 1.45])
+        grid = fig.add_gridspec(3, 2, height_ratios=[2.0, 1.25, 1.05])
         ax = fig.add_subplot(grid[0, :])
         ec_item = _by_name(self.fits.get("ec"), self.channel)
         eo_item = _by_name(self.fits.get("eo"), self.channel)
@@ -206,40 +286,63 @@ class ComparePanel(QWidget):
         mark_spectrum(ax, fmin, fmax)
         alpha = self._alpha()
         shown = band_phrase(*alpha)
-        _plot_condition(ax, ec_item, _EC, "Eyes closed", alpha)
-        _plot_condition(ax, eo_item, _EO, "Eyes open", alpha)
+        left, right, short_left, short_right = self._names()
+        _plot_condition(ax, ec_item, _EC, left, alpha)
+        _plot_condition(ax, eo_item, _EO, right, alpha)
         ax.set_xlabel("")
         ax.set_ylabel("log10 power")
+        pair = "eyes closed vs eyes open" if self.mode.currentData() == "state" else f"{left} vs {right}"
         ax.set_title(
-            f"{self.channel}   ·   eyes closed vs eyes open   ·   {shown}",
+            f"{self.channel}   ·   {pair}   ·   {shown}",
             fontsize=10, loc="left",
         )
         ax.legend(frameon=False, fontsize=8)
         style_axes(ax, grid=True)
 
         names = [row.name for row in self.rows]
+        weak = [_weak(row.r_squared_ec) or _weak(row.r_squared_eo) for row in self.rows]
         draw_head(
             fig.add_subplot(grid[1, 0]), names,
             [row.exponent_delta for row in self.rows],
-            "Exponent  EO − EC", "viridis", self.channel,
+            f"Exponent  {fmin:g}–{fmax:.0f} Hz  {short_right} − {short_left}", "viridis", self.channel, weak,
         )
         draw_head(
             fig.add_subplot(grid[1, 1]), names,
             [row.alpha_reactivity for row in self.rows],
-            f"{shown} peak height  EC − EO", "plasma", self.channel,
+            f"{shown} peak height  {short_left} − {short_right}", "plasma", self.channel,
+            [weak[index] or row.peak_at_floor_ec or row.peak_at_floor_eo for index, row in enumerate(self.rows)],
         )
+        _paired_dots(fig.add_subplot(grid[2, :]), self.rows, left, right)
         stamp_figure(fig)
         self.canvas.draw_idle()
         chosen = next((row for row in self.rows if row.name == self.channel), None)
         reactivity = None if chosen is None else chosen.alpha_reactivity
         percent = None if chosen is None else chosen.band_power_reactivity_percent
-        percent_text = "not available" if percent is None else f"{percent:.1f}%"
+        percent_text = "blank" if percent is None else f"{percent:+.1f}%"
         name = band_label(*alpha)
         kind = name.lower() if name.isalpha() else name
+        gap = ""
+        if chosen is not None and chosen.peak_center_difference_hz is not None:
+            gap = f" Centers are {chosen.peak_center_difference_hz:.2f} Hz apart."
+        nearest = _nearest_sentence(chosen)
+        quality = _quality_sentence(chosen)
+        length = _length_sentence(self.recordings, self.fits, self.settings)
+        if self.mode.currentData() == "pre":
+            prefix = (
+                "Pre is the file opened as eyes closed, and post is the file opened as eyes open. "
+                "A difference between sessions is not a treatment effect. "
+            )
+        elif self.mode.currentData() == "custom":
+            prefix = "A difference between two recordings is not a treatment effect. "
+        else:
+            prefix = ""
         self.caption.setText(
-            f"{self.channel}: {kind} peak height EC−EO {_num(reactivity, 3)} "
+            f"{prefix}{self.channel}: {kind} peak height {short_left}−{short_right} {_num(reactivity, 3)} "
             "(above the aperiodic fit; a missing peak stays missing). "
-            f"Band power reactivity {percent_text}."
+            f"Δ band % {percent_text}: change in mean Welch power, ({short_left} − {short_right}) / {short_right}, "
+            "not a share of the spectrum. "
+            f"Slope fit over {fmin:g}–{fmax:.0f} Hz. {reference_phrase(self.settings.reference).capitalize()}."
+            f"{gap}{nearest}{quality}{_voltage_sentence(self.recordings)}{length}"
         )
 
     def _maybe_cycles(self) -> None:
@@ -261,7 +364,14 @@ class ComparePanel(QWidget):
             index = recording.ch_names.index(self.channel)
             self._generations[condition] = self._generations.get(condition, 0) + 1
             generation = self._generations[condition]
-            worker = CallWorker(generation, fit_cycles, (recording, index, self.band, self.settings))
+            others = [
+                item for key, item in self.recordings.items()
+                if key != condition and item is not None
+            ]
+            worker = CallWorker(
+                generation, fit_cycles,
+                (recording, index, self.band, matched_settings(self.settings, recording, others)),
+            )
             worker.succeeded.connect(
                 lambda gen, result, cond=condition: self._cycle_done(cond, gen, result)
             )
@@ -282,6 +392,7 @@ class ComparePanel(QWidget):
         self._fill_cycles(self.cycle_fits.get("ec"), self.cycle_fits.get("eo"))
         if "ec" in self.cycle_fits and "eo" in self.cycle_fits:
             self.status.emit("Comparison ready.")
+        self.updated.emit()
 
     def _cycle_failed(self, condition: str, generation: int, message: str) -> None:
         if generation != self._generations.get(condition):
@@ -295,13 +406,25 @@ class ComparePanel(QWidget):
             ("Rise–decay", "rise_decay"),
             ("Peak–trough", "peak_trough"),
             ("Voltage (µV)", "volt_amp"),
+            ("Burst cycles", "n_burst_cycles"),
+            ("Burst episodes", "n_burst_episodes"),
+            ("Burst time (s)", "burst_duration_s"),
+            ("In bursts (% of accepted time)", "burst_fraction"),
         ]
+        self.cycle_table.setRowCount(len(measures))
         for row, (label, field) in enumerate(measures):
-            self.cycle_table.setItem(row, 0, _item(label))
-            self.cycle_table.setItem(row, 1, _item(_num(None if eyes_closed is None else getattr(eyes_closed, field), 3)))
-            self.cycle_table.setItem(row, 2, _item(_num(None if eyes_open is None else getattr(eyes_open, field), 3)))
+            label_item = _item(label)
+            if field == "burst_fraction":
+                label_item.setToolTip(
+                    "Percent of accepted recording time that falls inside detected bursts. "
+                    "This is a share of time, not a change between recordings and not a share of spectral power."
+                )
+            self.cycle_table.setItem(row, 0, label_item)
+            self.cycle_table.setItem(row, 1, _item(_cycle_value(eyes_closed, field)))
+            self.cycle_table.setItem(row, 2, _item(_cycle_value(eyes_open, field)))
         notes = []
-        for name, fit in (("Eyes closed", eyes_closed), ("Eyes open", eyes_open)):
+        left, right, _short_left, _short_right = self._names()
+        for name, fit in ((left, eyes_closed), (right, eyes_open)):
             if fit is not None and fit.burst_note:
                 notes.append(f"{name}: {fit.burst_note}")
         self.cycle_note.setText(" ".join(notes))
@@ -313,6 +436,34 @@ class ComparePanel(QWidget):
         ax.axis("off")
         ax.text(0.5, 0.5, message, ha="center", va="center", color="#63748a", fontsize=12)
         self.canvas.draw_idle()
+
+
+def _paired_dots(ax, rows, left: str, right: str) -> None:
+    """One point per side that has an in-band peak. A line needs both sides."""
+    ax.set_xlim(-0.35, 1.35)
+    ax.set_xticks([0, 1], [left, right])
+    drawn = 0
+    for row in rows:
+        pair = []
+        xpos = []
+        if row.alpha_power_ec is not None and np.isfinite(row.alpha_power_ec):
+            pair.append(float(row.alpha_power_ec))
+            xpos.append(0)
+        if row.alpha_power_eo is not None and np.isfinite(row.alpha_power_eo):
+            pair.append(float(row.alpha_power_eo))
+            xpos.append(1)
+        if len(pair) < 2:
+            continue
+        ax.plot(xpos, pair, color="#9aafc4", lw=0.7, zorder=1)
+        ax.scatter([0], [pair[0]], s=16, color=_EC, zorder=2, linewidths=0)
+        ax.scatter([1], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
+        drawn += 1
+    ax.set_ylabel("Peak height")
+    ax.set_title(
+        f"One line per channel present on both sides   ·   {drawn} channels",
+        fontsize=9, loc="left",
+    )
+    style_axes(ax, grid=True)
 
 
 def _by_name(fit: SpectrumFit | None, name: str) -> ChannelFit | None:
@@ -337,10 +488,85 @@ def _plot_condition(ax, item: ChannelFit | None, color: str, label: str,
         ax.plot(peak[0], base + peak[1], "o", color=color, ms=6)
 
 
+def _weak(value: float | None) -> bool:
+    return value is not None and value < R2_WEAK
+
+
+def _nearest(center: float | None, distance: float | None) -> str:
+    if center is None or distance is None:
+        return "—"
+    return f"{center:.2f} (+{distance:.2f})"
+
+
+def _nearest_sentence(row: ChannelComparison | None) -> str:
+    if row is None:
+        return ""
+    parts = []
+    if row.nearest_cf_ec is not None and row.nearest_distance_ec is not None:
+        parts.append(f"eyes closed nearest {row.nearest_cf_ec:.2f} Hz, {row.nearest_distance_ec:.2f} Hz outside")
+    if row.nearest_cf_eo is not None and row.nearest_distance_eo is not None:
+        parts.append(f"eyes open nearest {row.nearest_cf_eo:.2f} Hz, {row.nearest_distance_eo:.2f} Hz outside")
+    if not parts:
+        return ""
+    return " " + "; ".join(parts) + "."
+
+
+def _quality_sentence(row: ChannelComparison | None) -> str:
+    if row is None:
+        return ""
+    notes = []
+    if _weak(row.r_squared_ec) or _weak(row.r_squared_eo):
+        notes.append("a weak fit is ringed")
+    if row.peak_at_floor_ec or row.peak_at_floor_eo:
+        notes.append("a peak is at the narrowest allowed width")
+    if not notes:
+        return ""
+    return " " + "; ".join(notes).capitalize() + "."
+
+
+def _length_sentence(recordings: dict, fits: dict, settings: FitSettings) -> str:
+    if settings.t_length is not None or settings.t_start > 0.05:
+        return ""
+    durations = [recording.duration_s for recording in recordings.values()]
+    if len(durations) < 2 or max(durations) - min(durations) <= 1.0:
+        return ""
+    ends = [fit.t_end - fit.t_start for fit in fits.values()]
+    if not ends:
+        return ""
+    return (
+        f" Files differ in length ({min(durations):.0f} s and {max(durations):.0f} s). "
+        f"This comparison uses the first {min(ends):.0f} s of each."
+    )
+
+
+def _voltage_sentence(recordings: dict) -> str:
+    warned = any(
+        "microvolts" in note
+        for recording in recordings.values()
+        for note in recording.notes
+    )
+    if not warned:
+        return ""
+    return " Check voltage: the scale may not be microvolts, and the samples were not rescaled."
+
+
 def _num(value: float | None, digits: int) -> str:
     if value is None or not np.isfinite(value):
         return "—"
     return f"{value:.{digits}f}"
+
+
+def _cycle_value(fit: CycleFit | None, field: str) -> str:
+    if fit is None:
+        return "—"
+    value = getattr(fit, field)
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if field == "burst_fraction":
+        if value is None or not np.isfinite(value):
+            return "—"
+        return f"{100.0 * float(value):.1f}"
+    return _num(value, 3)
 
 
 def _item(text: str) -> QTableWidgetItem:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from matplotlib.figure import Figure
@@ -13,8 +14,9 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..analysis.compare import compare_spectra
+from ..analysis.settings import FitSettings, matched_settings
 from ..export import (
-    comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
+    burst_episode_rows, comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
     save_figure, spectrum_rows, write_csv, write_json,
 )
 from ..io.condition import CONDITION_LABELS, CONDITIONS, guess_condition
@@ -24,10 +26,12 @@ from ..io.recording import Recording
 from ..io.sniff import FILE_FILTER
 from . import icons
 from .compare_panel import ComparePanel
+from .findings_panel import FindingsPanel
 from .fit_bar import FitBar
 from .cycle_panel import CyclePanel
 from .spectrum_panel import SpectrumPanel, render_spectrum
 from .theme import ACCENT, MUTED
+from .time_panel import TimePanel
 from .trace_panel import TracePanel
 from .workers import CallWorker, launch, wait_for
 
@@ -40,6 +44,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1120, 700)
         self.setWindowIcon(icons.app_icon())
         self.recordings: dict[str, Recording] = {}
+        self.sources: dict[str, Recording] = {}
+        self.continuous: Recording | None = None
         self.recording: Recording | None = None
         self.active = "ec"
         self._selected = 0
@@ -120,28 +126,44 @@ class MainWindow(QMainWindow):
 
         self.trace = TracePanel()
         self.spectrum = SpectrumPanel()
+        self.time = TimePanel()
         self.cycles = CyclePanel()
         self.compare = ComparePanel()
+        self.findings = FindingsPanel()
         self.setStatusBar(QStatusBar())
         self.trace.channel_selected.connect(self._select)
         self.spectrum.channel_selected.connect(self._select)
         self.spectrum.fit_ready.connect(lambda _condition: self._sync_compare())
         self.spectrum.status.connect(self.statusBar().showMessage)
         self.cycles.status.connect(self.statusBar().showMessage)
+        self.cycles.fit_ready.connect(self._sync_findings)
+        self.cycles.fit_ready.connect(self._sync_time_cycles)
+        self.compare.updated.connect(self._sync_findings)
+        self.compare.updated.connect(self._sync_time_pair)
+        self.time.channel_requested.connect(self._select_name)
+        self.compare.mode.currentIndexChanged.connect(self._sync_findings)
+        self.compare.custom_left.textChanged.connect(self._sync_findings)
+        self.compare.custom_right.textChanged.connect(self._sync_findings)
         self.cycles.band.currentIndexChanged.connect(self._on_cycle_band)
         self.cycles.low.valueChanged.connect(self._on_cycle_band)
         self.cycles.high.valueChanged.connect(self._on_cycle_band)
         self.fit_bar.band_changed.connect(self._on_fit_band)
         self.compare.channel_selected.connect(self._select_name)
         self.compare.status.connect(self.statusBar().showMessage)
+        self.time.inspect_at.connect(self._inspect)
+        self.time.window_requested.connect(self._stage_window)
+        self.time.exclusions_changed.connect(self._on_exclusions)
+        self.time.status.connect(self.statusBar().showMessage)
 
         self.tabs = QTabWidget()
         self.tabs.setIconSize(QSize(16, 16))
         for widget, label in (
             (self.trace, "Traces"),
             (self.spectrum, "Spectrum"),
+            (self.time, "Time"),
             (self.cycles, "Cycles"),
             (self.compare, "Compare"),
+            (self.findings, "Findings"),
         ):
             self.tabs.addTab(widget, icons.icon(icons.TAB_ICONS[label], MUTED, 16), "  " + label)
 
@@ -156,6 +178,7 @@ class MainWindow(QMainWindow):
         body.addWidget(self.tabs)
         layout.addLayout(body, 1)
         self.setCentralWidget(central)
+        self._sync_findings()
         self.statusBar().showMessage(
             "Open eyes-closed and eyes-open recordings. Both fits run together, then Compare opens."
         )
@@ -214,8 +237,14 @@ class MainWindow(QMainWindow):
         if widget is self.cycles and self.cycles.fit is None:
             self._tell("The cycle fit is not ready yet.")
             return
+        if widget is self.time and self.recording is None:
+            self._tell("Open a recording before saving an image.")
+            return
         if widget is self.compare and not self.compare.ready:
             self._tell("Open both eyes-closed and eyes-open recordings before saving the comparison.")
+            return
+        if widget is self.findings:
+            self._tell("This page is text. Use Copy on the page, or Save data.")
             return
         path = self._choose_save("Save image", "png", "PNG image (*.png)")
         if not path:
@@ -237,6 +266,7 @@ class MainWindow(QMainWindow):
 
     def save_session(self, folder: str | Path) -> list[Path]:
         """Write the plots and tables that are ready into ``folder``."""
+        self._sync_findings()
         destination = Path(folder)
         destination.mkdir(parents=True, exist_ok=True)
         written: list[Path] = []
@@ -265,7 +295,10 @@ class MainWindow(QMainWindow):
             if recording is not None:
                 written.append(write_json(
                     destination / f"{key}_metadata.json",
-                    fit_metadata(recording, self.spectrum.settings, fit, key),
+                    fit_metadata(
+                        recording, self.spectrum.settings, fit, key,
+                        self.time.control_values() if self.time.recording is not None else None,
+                    ),
                 ))
 
         if self.cycles.fit is not None:
@@ -278,6 +311,11 @@ class MainWindow(QMainWindow):
                 destination / f"{self.active}_cycle_summary.csv",
                 [cycle_summary_row(self.cycles.fit, self.active, self.recording.source_path if self.recording else "")],
             ))
+            episodes = burst_episode_rows(
+                self.cycles.fit, self.active, self.recording.source_path if self.recording else "",
+            )
+            if episodes:
+                written.append(write_csv(destination / f"{self.active}_burst_episodes.csv", episodes))
 
         if self.compare.ready:
             self.compare.canvas.draw()
@@ -287,6 +325,7 @@ class MainWindow(QMainWindow):
                 destination / "comparison.csv",
                 comparison_rows(compare_spectra(
                     self.spectrum.fits["ec"], self.spectrum.fits["eo"], band,
+                    self.spectrum.settings.peak_width_low,
                 ), band),
             ))
             summaries = []
@@ -300,8 +339,21 @@ class MainWindow(QMainWindow):
                     details = cycle_detail_rows(fit, key)
                     if details:
                         written.append(write_csv(destination / f"{key}_compare_cycles.csv", details))
+                    episodes = burst_episode_rows(
+                        fit, key, "" if recording is None else recording.source_path,
+                    )
+                    if episodes:
+                        written.append(write_csv(destination / f"{key}_burst_episodes.csv", episodes))
             if summaries:
                 written.append(write_csv(destination / "cycle_comparison.csv", summaries))
+        if self.findings.plain.strip():
+            path = destination / "findings.txt"
+            path.write_text(self.findings.plain, encoding="utf-8")
+            written.append(path)
+        if self.recording is not None and self.time.rows():
+            self.time.canvas.draw()
+            written.append(save_figure(self.time.canvas.fig, destination / "time.png"))
+            written.append(write_csv(destination / "time.csv", self.time.rows()))
         return written
 
     def _save_session_dialog(self) -> None:
@@ -324,6 +376,10 @@ class MainWindow(QMainWindow):
             return cycle_detail_rows(self.cycles.fit, self.active)
         if widget is self.compare and self.compare.rows:
             return comparison_rows(self.compare.rows, self.compare.settings.alpha_band())
+        if widget is self.findings:
+            return self.findings.rows()
+        if widget is self.time:
+            return self.time.rows()
         if widget is self.trace and self.recording is not None:
             return [
                 {
@@ -359,6 +415,7 @@ class MainWindow(QMainWindow):
     def _present(self, recording: Recording, condition: str) -> None:
         """Open one recording, or both sides when its marks name them."""
         sides = split_marked_conditions(recording)
+        self.continuous = recording if sides else None
         if sides:
             order = [cond for cond in ("ec", "eo") if cond in sides and cond != condition]
             if condition in sides:
@@ -400,21 +457,65 @@ class MainWindow(QMainWindow):
         button = self.open_ec if condition == "ec" else self.open_eo
         button.setEnabled(True)
 
-    def _apply(self, recording: Recording, condition: str) -> None:
+    def _apply(self, recording: Recording, condition: str, *, remember: bool = True, keep_channel: bool = False) -> None:
+        if remember:
+            self.sources[condition] = recording
         self.recordings[condition] = recording
         self.recording = recording
         self.active = condition
-        self._selected = 0
+        if not keep_channel:
+            self._selected = 0
         self._refresh_view_combo()
         self._refresh_label()
         note = "  ".join(recording.notes)
         if note:
             self.statusBar().showMessage(note)
         self.trace.condition_label = CONDITION_LABELS.get(condition, "")
-        self.trace.set_recording(recording)
+        self.trace.set_recording(recording, None if not keep_channel else self._selected)
         self.spectrum.set_recording(recording, condition)
-        self.cycles.set_recording(recording)
+        if keep_channel:
+            self.spectrum._selected = self._selected
+        self.cycles.settings = self._cycle_settings(self.spectrum.settings)
+        self.cycles.set_recording(recording, None if not keep_channel else self._selected)
+        self._show_time()
         self._sync_compare()
+
+    def _show_time(self) -> None:
+        if self.recording is None:
+            return
+        self.time.cycle_fit = self.cycles.fit
+        self.time._selected = self._selected
+        self.time.set_recording(
+            self.recording,
+            self.active,
+            source=self.sources.get(self.active, self.recording),
+            recordings=self.recordings,
+            continuous=self.continuous,
+        )
+
+    def _sync_time_cycles(self) -> None:
+        self.time.set_cycle_fit(self.cycles.fit)
+        self._sync_time_pair()
+
+    def _sync_time_pair(self) -> None:
+        self.time.spectra = dict(self.spectrum.fits)
+        self.time.pair_names = self.compare._names()
+        self.time.set_pair_cycles(dict(self.compare.cycle_fits))
+
+    def _inspect(self, t_center: float, _span: float) -> None:
+        self.trace.show_time(t_center)
+        self.cycles.show_time(t_center)
+
+    def _stage_window(self, start: float, length: float) -> None:
+        self.fit_bar.set_custom_window(start, length)
+        self.statusBar().showMessage(
+            f"Fit window set to {start:.1f}–{start + length:.1f} s. Press Refit to use it."
+        )
+
+    def _on_exclusions(self, recording: object) -> None:
+        if not isinstance(recording, Recording):
+            return
+        self._apply(recording, self.active, remember=False, keep_channel=True)
 
     def _on_view_changed(self, _index: int = 0) -> None:
         key = self.view.currentData()
@@ -431,7 +532,9 @@ class MainWindow(QMainWindow):
         self.trace.set_recording(recording, index)
         self.spectrum._selected = index
         self.spectrum.show_condition(key)
+        self.cycles.settings = self._cycle_settings(self.spectrum.settings)
         self.cycles.set_recording(recording, index)
+        self._show_time()
         self._sync_compare()
 
     def _select(self, index: int) -> None:
@@ -444,6 +547,7 @@ class MainWindow(QMainWindow):
         self.trace.set_selected(index)
         self.spectrum.set_selected(index)
         self.cycles.set_selected(index)
+        self.time.set_selected(index)
         self._sync_compare()
 
     def _select_name(self, name: str) -> None:
@@ -458,8 +562,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(exc))
             return
         self.spectrum.apply_settings(settings)
-        self.cycles.apply_settings(settings)
+        self.cycles.apply_settings(self._cycle_settings(settings))
         self.compare.apply_settings(settings)
+        self.time.apply_settings(settings)
+        self._sync_findings()
         if settings.t_length is None and settings.t_start <= 0:
             window = "the whole recording"
         else:
@@ -471,16 +577,48 @@ class MainWindow(QMainWindow):
 
     def _on_fit_band(self, low: float, high: float) -> None:
         self.cycles.set_band(float(low), float(high), named=self.fit_bar.band.currentData() is not None)
+        self.spectrum.set_band(float(low), float(high))
         self._sync_compare()
 
     def _on_cycle_band(self, *_args) -> None:
         low, high = self.cycles.current_band()
         self.fit_bar.set_band(low, high, named=self.cycles.band.currentData() is not None)
+        self.spectrum.set_band(low, high)
         self._sync_compare()
 
     def _sync_compare(self) -> None:
         band = self.fit_bar.current_band()
         self.compare.set_pair(self.recordings, self.spectrum.fits, self._channel_name(), band)
+        self._sync_findings()
+
+    def _sync_findings(self) -> None:
+        cycles = {}
+        active = self.cycles.fit
+        worker = self.cycles._worker
+        if active is not None and (worker is None or not worker.isRunning()):
+            cycles[self.active] = active
+        for key, fit in self.compare.cycle_fits.items():
+            cycles[key] = fit
+        band = self.fit_bar.current_band()
+        # Reference, epochs, and the amplitude limit stay on the last Refit.
+        # The band is read live, because changing it does not refit specparam.
+        applied = replace(self.spectrum.settings, alpha_low=band[0], alpha_high=band[1])
+        left, right, _short_left, _short_right = self.compare._names()
+        self.findings.update_report(
+            self.recordings,
+            self.spectrum.fits,
+            cycles,
+            band,
+            self._channel_name(),
+            applied,
+            (left, right),
+        )
+
+    def _cycle_settings(self, settings: FitSettings) -> FitSettings:
+        if self.recording is None:
+            return settings
+        others = [item for item in self.recordings.values() if item is not self.recording]
+        return matched_settings(settings, self.recording, others)
 
     def _channel_name(self) -> str:
         if self.recording is None or not self.recording.ch_names:
@@ -511,6 +649,8 @@ class MainWindow(QMainWindow):
             shown = f"{CONDITION_LABELS[key]}: {name}"
             if span:
                 shown = f"{shown} ({span})"
+            if any("microvolts" in note for note in recording.notes):
+                shown = f"{shown} · check voltage"
             parts.append(shown)
             detail = " ".join(recording.notes)
             tips.append(f"{shown}. {detail}".strip())
@@ -537,6 +677,8 @@ class MainWindow(QMainWindow):
             stem = f"{self.active}_spectrum"
         elif widget is self.cycles:
             stem = f"{self.active}_cycles"
+        elif widget is self.time:
+            stem = f"{self.active}_time"
         else:
             stem = f"{self.active}_traces"
         return f"{stem}.{suffix}"
@@ -552,7 +694,19 @@ class MainWindow(QMainWindow):
             "in the selected band (eyes closed minus eyes open). Alpha 8–12 Hz is the default. "
             "Delta, theta, beta, gamma, and a custom range use the same views. "
             "A WinEEG file whose marks name eyes closed and eyes open opens both sides. "
-            "When cycles are found and none form a burst, the cycle page names the cutoff that stopped the run.<br><br>"
+            "When cycles are found and none form a burst, the cycle page names the cutoff that stopped the run. "
+            "It also shows how many cycles cleared each cutoff, and lists each burst episode. "
+            "Samples beyond the amplitude limit stay out of the fit. "
+            "The reference stays as stored unless average or linked ears is selected. "
+            "When both files are open and the window is the whole recording, both are fit to the shorter length. "
+            "A weak fit is ringed on the head map, and a peak just outside the band is shown as the nearest peak. "
+            "Findings restates those measurements in short sentences. It does not assign a diagnosis. "
+            "Time shows the same fit across the recording: a spectrogram, sliding specparam, bursts, "
+            "and the other views on that tab. A click there scrolls the trace. "
+            "Δ band % is the percent change in mean Welch power between the two recordings, "
+            "(EC − EO) / EO, not the band's share of the spectrum. "
+            "With epochs, a peak's height is the median of the epochs that found it. "
+            "Epochs that missed it are not entered as zero, and the count of those epochs is separate from the height.<br><br>"
             "Save image writes the current view. Save data writes the current table. "
             "Save session writes both conditions and the comparison into one folder.",
         )
@@ -560,6 +714,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         wait_for(self)
         self.spectrum.shutdown()
+        self.time.shutdown()
         self.cycles.shutdown()
         self.compare.shutdown()
         event.accept()

@@ -88,25 +88,7 @@ def _clip_span(
         raise ValueError("That mark is past the end of the recording.")
     t0 = i0 / recording.sfreq
     t1 = i1 / recording.sfreq
-    data = recording.data if i0 == 0 and i1 == recording.n_samples else recording.data[:, i0:i1]
-    kept = [
-        Mark(mark.onset_s - t0, mark.label, mark.duration_s)
-        for mark in recording.marks
-        if t0 - 1e-9 <= mark.onset_s < t1 + 1e-9
-    ]
-    valid, spans = recording.slice_exclusions(i0, i1, t0)
     name = CONDITION_LABELS.get(condition, condition)
     shown = label or name
     note = f"{name} mark, {t0:.1f}–{t1:.1f} s ({shown})."
-    return Recording(
-        data=data,
-        ch_names=list(recording.ch_names),
-        sfreq=recording.sfreq,
-        source_path=recording.source_path,
-        source_format=recording.source_format,
-        notes=[*recording.notes, note],
-        marks=kept,
-        valid=valid,
-        bad_channels=list(recording.bad_channels),
-        rejected_spans=spans,
-    )
+    return recording.cropped(i0, i1, note)

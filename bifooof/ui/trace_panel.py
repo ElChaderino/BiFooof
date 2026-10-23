@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..io.recording import Recording
-from ..plots import stamp_figure
+from ..plots import clear_figure, stamp_figure
 from .canvas import MplCanvas, style_axes
 
 _WINDOWS = [("5 s", 5.0), ("10 s", 10.0), ("15 s", 15.0), ("20 s", 20.0), ("30 s", 30.0)]
@@ -127,6 +127,16 @@ class TracePanel(QWidget):
         self.channels.blockSignals(False)
         self._render()
 
+    def show_time(self, t_center: float) -> None:
+        """Scroll so ``t_center`` sits in the page. This does not change the fit window."""
+        if self.recording is None:
+            return
+        duration = self.recording.duration_s
+        max_t0 = max(0.0, duration - self._win_s)
+        self._t0 = min(max(0.0, float(t_center) - self._win_s / 2.0), max_t0)
+        self._configure_scroll()
+        self._render()
+
     def _remember(self) -> None:
         recording = self.recording
         if recording is None:
@@ -216,7 +226,7 @@ class TracePanel(QWidget):
         segment = recording.data[visible, start:stop][:, ::step]
 
         fig = self.canvas.fig
-        fig.clear()
+        clear_figure(fig)
         ax = fig.add_subplot(111)
         separation = 1.0
         scale = separation / (2.0 * self._gain)

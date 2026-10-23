@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..analysis.prepare import voltage_scale_note
 from .channels import clean_channel_name, is_auxiliary, match_standard_19
 from .sniff import sniff
 from .marks import describe_marks
@@ -153,6 +154,12 @@ def finalize(
 
     array = array[kept_rows]
     accepted = accepted[kept_rows]
+    reference_channels: dict[str, np.ndarray] = {}
+    for index, name in enumerate(cleaned):
+        if name in {"A1", "A2", "M1", "M2"} and name not in reference_channels:
+            ear = np.asarray(array[index], dtype=np.float64).copy()
+            ear[~accepted[index]] = np.nan
+            reference_channels[name] = ear
     matched = match_standard_19(cleaned)
     if matched:
         order = [cleaned.index(name) for name in matched]
@@ -183,6 +190,12 @@ def finalize(
         stored_valid: np.ndarray | None = accepted
     else:
         stored_valid = None
+    if reference_channels:
+        kept_ears = ", ".join(name for name in ("A1", "A2", "M1", "M2") if name in reference_channels)
+        notes.append(f"Kept {kept_ears} for a linked-ear reference. They are not part of the fit.")
+    scale_note = voltage_scale_note(array)
+    if scale_note:
+        notes.append(scale_note)
 
     return Recording(
         data=array,
@@ -194,6 +207,7 @@ def finalize(
         valid=stored_valid,
         bad_channels=kept_bad,
         rejected_spans=list(rejected_spans or []),
+        reference_channels=reference_channels,
     )
 
 

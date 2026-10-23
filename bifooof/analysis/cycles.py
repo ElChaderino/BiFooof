@@ -8,12 +8,36 @@ import numpy as np
 from scipy.signal import butter, detrend, sosfiltfilt
 
 from ..io.recording import Recording
-from .segments import accepted_runs, covered_length, episode_count
-from .settings import NAMED_BANDS, FitSettings, clip_recording
+from .segments import accepted_runs, covered_length
+from .prepare import prepare_recording
+from .settings import NAMED_BANDS, FitSettings
 
 BANDS: list[tuple[str, tuple[float, float]]] = [
     (f"{name} {low:g}–{high:g} Hz", (low, high)) for name, low, high in NAMED_BANDS
 ]
+
+
+@dataclass(frozen=True)
+class BurstCutoff:
+    """How one burst rule treated the cycles in a fit."""
+
+    key: str
+    label: str
+    cutoff: float
+    median: float | None
+    n_passed: int
+    n_cycles: int
+
+
+@dataclass(frozen=True)
+class BurstEpisode:
+    """One contiguous run of burst cycles. Times are seconds in the recording."""
+
+    start_s: float
+    end_s: float
+    n_cycles: int
+    period_ms: float | None
+    volt_amp: float | None
 
 
 @dataclass
@@ -39,8 +63,11 @@ class CycleFit:
     spans: list[tuple[int, int, bool]] = field(default_factory=list)
     peaks: list[int] = field(default_factory=list)
     cycles: list[dict] = field(default_factory=list)
+    cutoffs: list[BurstCutoff] = field(default_factory=list)
+    episodes: list[BurstEpisode] = field(default_factory=list)
     t_offset: float = 0.0
     burst_note: str = ""
+    notes: str = ""
 
     @property
     def n_bursts(self) -> int:
@@ -71,7 +98,12 @@ def fit_cycles(
     chosen = settings or FitSettings()
     chosen.validate()
     t_offset = min(max(0.0, float(chosen.t_start)), recording.duration_s)
-    recording = clip_recording(recording, chosen)
+    original_notes = list(recording.notes)
+    recording = prepare_recording(recording, chosen)
+    preparation = " ".join(
+        note for note in recording.notes
+        if note not in original_notes and not note.startswith("Fit window")
+    )
 
     # WinEEG files can carry a large linear drift. Each accepted run is detrended
     # on its own, and a BAD or nonfinite gap is never part of a cycle.
@@ -85,7 +117,7 @@ def fit_cycles(
         return_samples=True,
     )
     frames = []
-    episodes = 0
+    episode_rows: list[BurstEpisode] = []
     minimum = max(int(round(recording.sfreq)), int(round(3.0 * recording.sfreq / low)))
     for start, stop in accepted_runs(mask):
         if stop - start < minimum:
@@ -108,7 +140,7 @@ def fit_cycles(
             if str(column).startswith("sample_"):
                 piece_frame[column] = piece_frame[column] + start
         if "is_burst" in piece_frame:
-            episodes += episode_count(np.asarray(piece_frame["is_burst"], dtype=bool))
+            episode_rows.extend(burst_episodes(piece_frame, recording.sfreq, t_offset))
         frames.append(piece_frame)
     frame = _concat_frames(frames)
     spans: list[tuple[int, int, bool]] = []
@@ -143,7 +175,8 @@ def fit_cycles(
     covered = covered_length(spans)
     accepted = int(mask.sum())
     fraction = None if accepted <= 0 else covered / accepted
-    note = "" if n_burst_cycles else burst_note(frame, chosen.cycle_thresholds())
+    thresholds = chosen.cycle_thresholds()
+    note = "" if n_burst_cycles else burst_note(frame, thresholds)
     return CycleFit(
         channel=recording.ch_names[channel_index],
         channel_index=channel_index,
@@ -152,7 +185,7 @@ def fit_cycles(
         filtered=filtered,
         n_cycles=len(spans),
         n_burst_cycles=n_burst_cycles,
-        n_burst_episodes=episodes,
+        n_burst_episodes=len(episode_rows),
         burst_duration_s=covered / recording.sfreq,
         burst_fraction=fraction,
         period_ms=None if period is None else period / recording.sfreq * 1000.0,
@@ -166,8 +199,11 @@ def fit_cycles(
         spans=spans,
         peaks=peaks,
         cycles=cycle_rows,
+        cutoffs=burst_cutoffs(frame, thresholds),
+        episodes=episode_rows,
         t_offset=t_offset,
         burst_note=note,
+        notes=preparation,
     )
 
 
@@ -177,6 +213,73 @@ _BURST_CUTOFFS = (
     ("period consistency", "period_consistency", "period_consistency_threshold"),
     ("monotonicity", "monotonicity", "monotonicity_threshold"),
 )
+
+
+def burst_cutoffs(frame, thresholds: dict) -> list[BurstCutoff]:
+    """Median and pass count for each burst cutoff. A pass is strictly above the cutoff."""
+    if frame is None or len(frame) == 0:
+        return []
+    rows = []
+    count = len(frame)
+    for label, column, key in _BURST_CUTOFFS:
+        if column not in frame or key not in thresholds:
+            continue
+        values = np.asarray(frame[column], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        cutoff = float(thresholds[key])
+        rows.append(BurstCutoff(
+            key=column,
+            label=label,
+            cutoff=cutoff,
+            median=None if finite.size == 0 else float(np.median(finite)),
+            n_passed=int(np.sum(np.isfinite(values) & (values > cutoff))),
+            n_cycles=count,
+        ))
+    return rows
+
+
+def burst_episodes(frame, sfreq: float, t_offset: float = 0.0) -> list[BurstEpisode]:
+    """Contiguous burst runs in one fitted piece. Adjacent pieces are not joined."""
+    if frame is None or len(frame) == 0 or "is_burst" not in frame or sfreq <= 0:
+        return []
+    mask = np.asarray(frame["is_burst"], dtype=bool)
+    starts = np.asarray(frame["sample_last_trough"], dtype=np.float64)
+    stops = np.asarray(frame["sample_next_trough"], dtype=np.float64)
+    periods = np.asarray(frame["period"], dtype=np.float64) if "period" in frame else None
+    volts = np.asarray(frame["volt_amp"], dtype=np.float64) if "volt_amp" in frame else None
+    found: list[BurstEpisode] = []
+    index = 0
+    count = len(mask)
+    while index < count:
+        if not mask[index]:
+            index += 1
+            continue
+        end = index
+        while end + 1 < count and mask[end + 1]:
+            end += 1
+        chosen = slice(index, end + 1)
+        found.append(BurstEpisode(
+            start_s=t_offset + float(starts[index]) / sfreq,
+            end_s=t_offset + float(stops[end]) / sfreq,
+            n_cycles=end - index + 1,
+            period_ms=_finite_median(None if periods is None else periods[chosen], sfreq),
+            volt_amp=_finite_median(None if volts is None else volts[chosen]),
+        ))
+        index = end + 1
+    return found
+
+
+def _finite_median(values: np.ndarray | None, sfreq: float | None = None) -> float | None:
+    if values is None:
+        return None
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+    median = float(np.median(finite))
+    if sfreq is not None:
+        return median / sfreq * 1000.0
+    return median
 
 
 def burst_note(frame, thresholds: dict) -> str:
@@ -264,13 +367,20 @@ def _cycle_rows(frame, sfreq: float) -> list[dict]:
     rows = []
     for index in range(len(frame)):
         period = float(frame["period"].iloc[index])
-        rows.append({
+        row = {
             "period_ms": period / sfreq * 1000.0,
             "rise_decay": float(frame["time_rdsym"].iloc[index]),
             "peak_trough": float(frame["time_ptsym"].iloc[index]),
             "volt_amp": float(frame["volt_amp"].iloc[index]),
             "is_burst": bool(frame["is_burst"].iloc[index]) if "is_burst" in frame else False,
-        })
+        }
+        for column in ("amp_fraction", "amp_consistency", "period_consistency", "monotonicity"):
+            if column in frame:
+                row[column] = float(frame[column].iloc[index])
+        for column in ("sample_last_trough", "sample_next_trough", "sample_peak"):
+            if column in frame:
+                row[column] = int(frame[column].iloc[index])
+        rows.append(row)
     return rows
 
 

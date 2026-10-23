@@ -21,7 +21,8 @@ HEAD["T6"] = HEAD["P8"]
 
 
 def draw_head(ax, names: list[str], values: list[float | None], title: str,
-              cmap: str, selected: str | None = None) -> None:
+              cmap: str, selected: str | None = None, marked: list[bool] | None = None,
+              limits: tuple[float, float] | None = None) -> None:
     """Draw one parameter on a 10-20 head. Channels outside the montage are skipped."""
     theta = np.linspace(0, 2 * np.pi, 256)
     ax.plot(np.cos(theta), np.sin(theta), color="#16232f", lw=1.0)
@@ -36,14 +37,18 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
                 x, y = HEAD[name]
                 ax.scatter([x], [y], s=160, color="#d5dde6", zorder=2)
                 _ring(ax, name, x, y, selected)
+                _mark(ax, name, x, y, names, marked)
                 ax.annotate(name, (x, y), ha="center", va="center", fontsize=6, color="#16232f")
             continue
         points.append((name, HEAD[name][0], HEAD[name][1], float(value)))
 
     if points:
         vals = np.array([item[3] for item in points], dtype=float)
-        low = float(np.min(vals))
-        high = float(np.max(vals))
+        if limits is not None and np.isfinite(limits[0]) and np.isfinite(limits[1]) and limits[1] > limits[0]:
+            low, high = float(limits[0]), float(limits[1])
+        else:
+            low = float(np.min(vals))
+            high = float(np.max(vals))
         if high - low < 1e-9:
             low -= 0.5
             high += 0.5
@@ -55,6 +60,7 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
         )
         for name, x, y, _value in points:
             _ring(ax, name, x, y, selected)
+            _mark(ax, name, x, y, names, marked)
             weight = "bold" if name == selected else "regular"
             ax.annotate(name, (x, y), ha="center", va="center", fontsize=6,
                         color="#16232f", fontweight=weight, zorder=4)
@@ -68,6 +74,15 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
     ax.axis("off")
     ax.set_xlim(-1.45, 1.45)
     ax.set_ylim(-1.25, 1.4)
+
+
+def _mark(ax, name: str, x: float, y: float, names: list[str], marked: list[bool] | None) -> None:
+    if marked is None or name not in names:
+        return
+    index = names.index(name)
+    if index < len(marked) and marked[index]:
+        ax.scatter([x], [y], s=420, facecolors="none", edgecolors="#9a3412",
+                   linewidths=1.3, zorder=5)
 
 
 def _ring(ax, name: str, x: float, y: float, selected: str | None) -> None:

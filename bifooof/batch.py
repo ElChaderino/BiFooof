@@ -11,7 +11,7 @@ from .analysis.cycles import BANDS, fit_cycles
 from .analysis.settings import FitSettings
 from .analysis.specparam_fit import fit_spectra
 from .export import (
-    comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
+    burst_episode_rows, comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
     save_figure, spectrum_rows, write_csv, write_json,
 )
 from .io.condition import CONDITION_LABELS, guess_condition
@@ -127,6 +127,9 @@ def run_file(path: str | Path, out_dir: str | Path, condition: str | None = None
         details = cycle_detail_rows(cycle_fit, chosen)
         if details:
             written.append(write_csv(destination / "cycles.csv", details))
+        episodes = burst_episode_rows(cycle_fit, chosen, recording.source_path)
+        if episodes:
+            written.append(write_csv(destination / "burst_episodes.csv", episodes))
         if plots:
             fig = Figure(figsize=(10, 3.4), dpi=120, facecolor="white")
             render_cycles(fig, cycle_fit)
@@ -148,7 +151,9 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
     fit_settings = settings or FitSettings()
     closed_fit = fit_spectra(closed, fit_settings)
     opened_fit = fit_spectra(opened, fit_settings)
-    rows = compare_spectra(closed_fit, opened_fit, fit_settings.alpha_band())
+    rows = compare_spectra(
+        closed_fit, opened_fit, fit_settings.alpha_band(), fit_settings.peak_width_low,
+    )
     written = [
         write_csv(destination / "ec_spectrum.csv", spectrum_rows(closed_fit, "ec", closed.source_path)),
         write_csv(destination / "eo_spectrum.csv", spectrum_rows(opened_fit, "eo", opened.source_path)),
@@ -164,7 +169,9 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
             written.append(write_csv(destination / f"{key}_peaks.csv", peaks))
     if plots:
         fig = Figure(figsize=(10, 7), dpi=120, facecolor="white")
-        render_comparison(fig, closed_fit, opened_fit, name, fit_settings.alpha_band())
+        render_comparison(
+            fig, closed_fit, opened_fit, name, fit_settings.alpha_band(), fit_settings.peak_width_low,
+        )
         written.append(save_figure(fig, destination / "comparison.png"))
         closed_index = closed.ch_names.index(name) if name in closed.ch_names else 0
         opened_index = opened.ch_names.index(name) if name in opened.ch_names else 0
@@ -182,6 +189,9 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
             details = cycle_detail_rows(cycle_fit, key)
             if details:
                 written.append(write_csv(destination / f"{key}_cycles.csv", details))
+            episodes = burst_episode_rows(cycle_fit, key, recording.source_path)
+            if episodes:
+                written.append(write_csv(destination / f"{key}_burst_episodes.csv", episodes))
         if summaries:
             written.append(write_csv(destination / "cycle_comparison.csv", summaries))
     return written

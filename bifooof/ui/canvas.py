@@ -19,7 +19,7 @@ class MplCanvas(FigureCanvasQTAgg):
         self.setMinimumHeight(280)
 
     def clear(self) -> None:
-        self.fig.clear()
+        clear_figure(self.fig)
 
 
-from ..plots import finish_figure, style_axes  # noqa: E402  re-export for the panels
+from ..plots import clear_figure, finish_figure, style_axes  # noqa: E402  re-export for the panels

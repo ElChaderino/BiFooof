@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from ..io.recording import Recording
-from .settings import FitSettings, clip_recording, window_bounds
+from .prepare import peak_at_width_floor, prepare_recording
+from .settings import FitSettings, window_bounds
 from .spectra import welch_spectra
 
 
@@ -27,6 +28,11 @@ class ChannelFit:
     spectrum: np.ndarray | None = None
     model: np.ndarray | None = None
     aperiodic: np.ndarray | None = None
+    n_epochs: int = 0
+    n_peak_epochs: int = 0
+    # How many epochs joined each peak in ``peaks``. Empty when the fit is one spectrum.
+    peak_counts: list[int] = field(default_factory=list)
+    peak_at_width_floor: bool = False
 
     @property
     def dominant_peak(self) -> tuple[float, float, float] | None:
@@ -46,6 +52,9 @@ class SpectrumFit:
     aperiodic_mode: str = "fixed"
     welch_nperseg: int = 0
     detrend: str = "linear"
+    epoch_s: float | None = None
+    epoch_count: int = 0
+    notes: str = ""
 
 
 def fit_spectra(
@@ -59,8 +68,12 @@ def fit_spectra(
 
     chosen = settings or FitSettings(fmin=fmin, fmax=fmax)
     chosen.validate()
+    if chosen.epoch_s:
+        return _fit_epochs(recording, chosen)
     t_start, t_end = window_bounds(recording, chosen)
-    recording = clip_recording(recording, chosen)
+    original_notes = list(recording.notes)
+    recording = prepare_recording(recording, chosen)
+    preparation = _preparation_notes(original_notes, recording.notes)
     fmin = float(chosen.fmin)
     fmax = float(chosen.fmax)
     data = np.asarray(recording.data, dtype=np.float64)
@@ -75,7 +88,10 @@ def fit_spectra(
         samples = data[index, mask]
         samples = samples[np.isfinite(samples)]
         if samples.size < 16 or float(np.std(samples)) <= 1e-6:
-            reason = "No accepted samples." if samples.size < 16 else "Flat channel."
+            if samples.size < 16 and name in recording.dropped_by_amplitude:
+                reason = "Amplitude above the limit."
+            else:
+                reason = "No accepted samples." if samples.size < 16 else "Flat channel."
             results.append(ChannelFit(name=name, index=index, usable=False, reason=reason))
             continue
         results.append(ChannelFit(name=name, index=index, usable=True))
@@ -114,6 +130,7 @@ def fit_spectra(
         reasons = [item.reason for item in results if item.reason]
         detail = reasons[-1] if reasons else "no spectrum could be modeled"
         raise ValueError(f"specparam could not fit any channel. {detail}")
+    _mark_fit_quality(results, chosen)
     return SpectrumFit(
         channels=results,
         fmin=fmin,
@@ -123,7 +140,19 @@ def fit_spectra(
         segment_s=float(chosen.segment_s),
         aperiodic_mode=chosen.aperiodic_mode,
         welch_nperseg=int(nperseg),
+        notes=preparation,
     )
+
+
+def log_residual(item: ChannelFit) -> tuple[np.ndarray, np.ndarray] | None:
+    """Observed minus model, both already in log10 power. Empty when either curve is missing."""
+    if item.freqs is None or item.spectrum is None or item.model is None:
+        return None
+    freqs = np.asarray(item.freqs, dtype=np.float64)
+    residual = np.asarray(item.spectrum, dtype=np.float64) - np.asarray(item.model, dtype=np.float64)
+    if residual.shape != freqs.shape:
+        return None
+    return freqs, residual
 
 
 def _fill_from_group(group, results: list[ChannelFit], usable: list[int]) -> None:
@@ -207,3 +236,226 @@ def _peaks_for(table: np.ndarray, slot: int) -> list[tuple[float, float, float]]
         return []
     chosen = table[np.rint(table[:, -1]).astype(int) == int(slot)]
     return [(float(row[0]), float(row[1]), float(row[2])) for row in chosen if np.all(np.isfinite(row[:3]))]
+
+
+def _preparation_notes(before: list[str], after: list[str]) -> str:
+    added = [note for note in after if note not in before and not note.startswith("Fit window")]
+    return " ".join(added)
+
+
+def _mark_fit_quality(results: list[ChannelFit], settings: FitSettings) -> None:
+    low, high = settings.alpha_band()
+    for item in results:
+        item.n_epochs = 1 if item.usable else 0
+        in_band = [peak for peak in item.peaks if low <= peak[0] <= high]
+        item.n_peak_epochs = 1 if in_band else 0
+        chosen = max(in_band, key=lambda peak: peak[1]) if in_band else item.dominant_peak
+        item.peak_at_width_floor = bool(
+            chosen is not None and peak_at_width_floor(chosen[2], settings.peak_width_low)
+        )
+
+
+def _fit_epochs(recording: Recording, settings: FitSettings) -> SpectrumFit:
+    """Fit equal epochs and keep a peak only from the epochs where it is present."""
+    t_start, t_end = window_bounds(recording, settings)
+    prepared = prepare_recording(recording, settings)
+    child = replace(
+        settings,
+        epoch_s=None,
+        t_start=0.0,
+        t_length=None,
+        reference="stored",
+        amplitude_limit_uv=0.0,
+    )
+    width = max(1, int(round(float(settings.epoch_s) * prepared.sfreq)))
+    if prepared.n_samples < width:
+        single = fit_spectra(prepared, child)
+        single.t_start, single.t_end = t_start, t_end
+        single.epoch_s = None
+        single.epoch_count = 0
+        extra = (
+            f"The window is shorter than one {float(settings.epoch_s):.0f} s epoch, "
+            "so it was fit as one spectrum."
+        )
+        preparation = _preparation_notes(list(recording.notes), prepared.notes)
+        single.notes = " ".join(part for part in (preparation, extra) if part)
+        return single
+    pieces = []
+    start = 0
+    while start + width <= prepared.n_samples:
+        pieces.append((start, start + width))
+        start += width
+    fits = []
+    for i0, i1 in pieces:
+        try:
+            fits.append(fit_spectra(prepared.cropped(i0, i1), child))
+        except ValueError:
+            continue
+    if not fits:
+        raise ValueError("No epoch was long enough to fit.")
+    combined = _combine_epochs(fits, settings, t_start, t_end)
+    notes = _preparation_notes(list(recording.notes), prepared.notes)
+    leftover = prepared.n_samples - start
+    if leftover > 0 and prepared.sfreq:
+        seconds = leftover / prepared.sfreq
+        shown = f"{seconds:.0f}" if seconds >= 10 else f"{seconds:.1f}"
+        notes = " ".join(
+            part for part in (
+                notes,
+                f"The last {shown} s was shorter than one {float(settings.epoch_s):.0f} s epoch and was left out.",
+            ) if part
+        )
+    combined.notes = notes
+    return combined
+
+
+def _combine_epochs(fits: list[SpectrumFit], settings: FitSettings, t_start: float, t_end: float) -> SpectrumFit:
+    names = [item.name for item in fits[0].channels]
+    channels = []
+    for name in names:
+        found = [next(item for item in fit.channels if item.name == name) for fit in fits]
+        channels.append(_combine_channel(found, settings))
+    if not any(item.usable for item in channels):
+        raise ValueError("specparam could not fit any channel in these epochs.")
+    return SpectrumFit(
+        channels=channels,
+        fmin=fits[0].fmin,
+        fmax=fits[0].fmax,
+        t_start=t_start,
+        t_end=t_end,
+        segment_s=float(settings.segment_s),
+        aperiodic_mode=settings.aperiodic_mode,
+        welch_nperseg=fits[0].welch_nperseg,
+        epoch_s=float(settings.epoch_s or 0.0),
+        epoch_count=len(fits),
+    )
+
+
+def _combine_channel(items: list[ChannelFit], settings: FitSettings) -> ChannelFit:
+    index = items[0].index if items else 0
+    name = items[0].name if items else ""
+    usable = [
+        item for item in items
+        if item.usable and item.freqs is not None and item.spectrum is not None
+    ]
+    if not usable:
+        reason = next((item.reason for item in items if item.reason), "No accepted samples.")
+        return ChannelFit(name=name, index=index, usable=False, reason=reason)
+    base = usable[0]
+    same = [
+        item for item in usable
+        if item.freqs is not None and item.freqs.shape == base.freqs.shape and np.allclose(item.freqs, base.freqs)
+    ]
+    curves = same or usable
+    low, high = settings.alpha_band()
+    grouped = _group_peaks([item.peaks for item in usable])
+    peaks = [(center, power, width) for center, power, width, _count in grouped]
+    in_band = [peak for peak in grouped if low <= peak[0] <= high]
+    chosen = max(in_band, key=lambda peak: peak[1]) if in_band else None
+    # The count belongs to the reported in-band peak, not to every in-band center in the epoch.
+    n_peak = 0 if chosen is None else int(chosen[3])
+    floor_source = chosen if chosen is not None else (grouped[0] if grouped else None)
+    aperiodics = [item.aperiodic for item in curves if item.aperiodic is not None and item.aperiodic.shape == base.spectrum.shape]
+    models = [item.model for item in curves if item.model is not None and item.model.shape == base.spectrum.shape]
+    return ChannelFit(
+        name=name,
+        index=index,
+        usable=True,
+        offset=_median_value(item.offset for item in usable),
+        knee=_median_value(item.knee for item in usable),
+        exponent=_median_value(item.exponent for item in usable),
+        r_squared=_median_value(item.r_squared for item in usable),
+        error=_median_value(item.error for item in usable),
+        peaks=peaks,
+        peak_counts=[count for _center, _power, _width, count in grouped],
+        freqs=np.asarray(base.freqs, dtype=np.float64).copy(),
+        spectrum=np.mean([item.spectrum for item in curves], axis=0),
+        model=None if not models else np.mean(models, axis=0),
+        aperiodic=None if not aperiodics else np.mean(aperiodics, axis=0),
+        n_epochs=len(usable),
+        n_peak_epochs=n_peak,
+        peak_at_width_floor=bool(
+            floor_source is not None and peak_at_width_floor(floor_source[2], settings.peak_width_low)
+        ),
+    )
+
+
+EPOCH_PEAKS = (
+    "Epochs do not overlap, and each one is fit on its own. "
+    "Peaks whose centers fall within 1 Hz are one group. "
+    "The reported center, height, and width are the medians of the epochs in that group. "
+    "An epoch that missed the peak is left out of the median. It is not entered as a height of zero. "
+    "The number of epochs with an in-band peak is counted separately and does not scale the height. "
+    "Offset, exponent, and R² are medians across epochs that fit. The spectrum curve is their mean."
+)
+
+
+def epochs_for_peak(item: ChannelFit, peak: tuple[float, float, float] | None) -> int | None:
+    """How many epochs contained this peak. None when the fit was one spectrum."""
+    if peak is None or item.n_epochs <= 1:
+        return None
+    if item.peak_counts and len(item.peak_counts) == len(item.peaks):
+        for stored, count in zip(item.peaks, item.peak_counts):
+            if all(abs(float(stored[index]) - float(peak[index])) <= 1e-9 for index in range(3)):
+                return int(count)
+        return 0
+    return item.n_peak_epochs
+
+
+def _median_peaks(epoch_peaks: list[list[tuple[float, float, float]]], tol: float = 1.0) -> list[tuple[float, float, float]]:
+    """Group peaks within 1 Hz and keep the median of each group."""
+    return [(center, power, width) for center, power, width, _count in _group_peaks(epoch_peaks, tol)]
+
+
+def _group_peaks(
+    epoch_peaks: list[list[tuple[float, float, float]]],
+    tol: float = 1.0,
+) -> list[tuple[float, float, float, int]]:
+    """Return ``(center, height, width, n_epochs)`` for each peak group.
+
+    A group takes at most one peak from each epoch, the one closest to the
+    group's current center. An epoch with no peak in the group does not
+    contribute a zero height. The count is how many epochs joined that group.
+    """
+    clusters: list[dict] = []
+    for epoch_index, peaks in enumerate(epoch_peaks):
+        for cf, power, bandwidth in sorted(peaks, key=lambda peak: peak[1], reverse=True):
+            best = None
+            best_distance = None
+            for cluster in clusters:
+                if epoch_index in cluster["epochs"]:
+                    continue
+                distance = abs(float(cf) - float(np.median(cluster["centers"])))
+                if distance <= tol and (best_distance is None or distance < best_distance):
+                    best = cluster
+                    best_distance = distance
+            if best is None:
+                clusters.append({
+                    "centers": [float(cf)],
+                    "powers": [float(power)],
+                    "widths": [float(bandwidth)],
+                    "epochs": {epoch_index},
+                })
+                continue
+            best["centers"].append(float(cf))
+            best["powers"].append(float(power))
+            best["widths"].append(float(bandwidth))
+            best["epochs"].add(epoch_index)
+    combined = [
+        (
+            float(np.median(cluster["centers"])),
+            float(np.median(cluster["powers"])),
+            float(np.median(cluster["widths"])),
+            len(cluster["epochs"]),
+        )
+        for cluster in clusters
+    ]
+    combined.sort(key=lambda peak: peak[1], reverse=True)
+    return combined
+
+
+def _median_value(values) -> float | None:
+    chosen = [float(value) for value in values if value is not None and np.isfinite(value)]
+    if not chosen:
+        return None
+    return float(np.median(np.asarray(chosen, dtype=np.float64)))

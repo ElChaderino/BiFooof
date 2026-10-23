@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 from ..analysis.cycles import BANDS, CycleFit, fit_cycles
 from ..analysis.settings import FitSettings
 from ..io.recording import Recording
-from ..plots import stamp_figure
+from ..plots import clear_figure, stamp_figure
 from .canvas import MplCanvas, style_axes
 from .workers import CallWorker, launch, wait_for
 
@@ -22,6 +22,7 @@ _TRACE = "#16324f"
 
 class CyclePanel(QWidget):
     status = Signal(str)
+    fit_ready = Signal()
 
     def __init__(self):
         super().__init__()
@@ -77,8 +78,29 @@ class CyclePanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setMaximumHeight(170)
+        self.table.setMaximumHeight(150)
         self.table.setAlternatingRowColors(True)
+
+        self.cutoffs = QTableWidget(4, 4)
+        self.cutoffs.setHorizontalHeaderLabels(["Burst cutoff", "Needs above", "Median", "Passed"])
+        self.cutoffs.verticalHeader().setVisible(False)
+        self.cutoffs.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.cutoffs.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.cutoffs.setMaximumHeight(148)
+        self.cutoffs.setAlternatingRowColors(True)
+        self.cutoffs.setToolTip(
+            "A cycle passes when its value is strictly above the cutoff. "
+            "bycycle then drops the first and last cycle, and drops any run shorter than the minimum."
+        )
+
+        self.episodes = QTableWidget(0, 5)
+        self.episodes.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Cycles", "Period (ms)", "Voltage (µV)"])
+        self.episodes.verticalHeader().setVisible(False)
+        self.episodes.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.episodes.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.episodes.setMaximumHeight(132)
+        self.episodes.setAlternatingRowColors(True)
+        self.episodes.setToolTip("Each row is one contiguous burst. A burst cannot cross a rejected stretch.")
 
         root = QVBoxLayout(self)
         root.addLayout(controls)
@@ -86,6 +108,8 @@ class CyclePanel(QWidget):
         root.addWidget(self.canvas, 1)
         root.addWidget(self.scroll)
         root.addWidget(self.table)
+        root.addWidget(self.cutoffs)
+        root.addWidget(self.episodes)
         self._empty("Open a recording, then pick a channel.")
 
     def set_recording(self, recording: Recording, selected: int | None = None) -> None:
@@ -190,15 +214,24 @@ class CyclePanel(QWidget):
         self._configure_scroll()
         self._fill_table()
         self._draw()
+        share = ""
+        if result.burst_fraction is not None:
+            share = (
+                f", {result.burst_duration_s:.2f} s "
+                f"({100.0 * result.burst_fraction:.1f}% of accepted time)"
+            )
         text = (
             f"{result.channel}  ·  {result.band[0]:g}–{result.band[1]:g} Hz  ·  "
             f"{result.n_cycles} cycles, {result.n_burst_cycles} burst cycles "
-            f"in {result.n_burst_episodes} episodes"
+            f"in {result.n_burst_episodes} episodes{share}"
         )
         if result.burst_note:
             text = f"{text}. {result.burst_note}"
+        if result.notes:
+            text = f"{text}. {result.notes}"
         self.caption.setText(text)
         self.status.emit("Cycle fit ready.")
+        self.fit_ready.emit()
 
     def _failed(self, generation: int, message: str) -> None:
         if generation != self._generation:
@@ -226,6 +259,17 @@ class CyclePanel(QWidget):
         self._t0 = value / 10.0
         self._draw()
 
+    def show_time(self, t_file: float) -> None:
+        """Scroll the filtered trace to a time on the recording clock."""
+        if self.fit is None or self.fit.sfreq <= 0:
+            return
+        local = float(t_file) - float(self.fit.t_offset)
+        duration = len(self.fit.filtered) / self.fit.sfreq
+        max_t0 = max(0.0, duration - self._win_s)
+        self._t0 = min(max(0.0, local - self._win_s / 2.0), max_t0)
+        self._configure_scroll()
+        self._draw()
+
     def _fill_table(self) -> None:
         fit = self.fit
         rows = [
@@ -238,6 +282,39 @@ class CyclePanel(QWidget):
             self.table.setItem(row, 0, _cell(label))
             self.table.setItem(row, 1, _cell(_num(all_cycles)))
             self.table.setItem(row, 2, _cell(_num(bursts)))
+        self._fill_cutoffs()
+        self._fill_episodes()
+
+    def _fill_cutoffs(self) -> None:
+        fit = self.fit
+        rows = [] if fit is None else fit.cutoffs
+        self.cutoffs.setRowCount(max(len(rows), 1))
+        if not rows:
+            self.cutoffs.setItem(0, 0, _cell("—"))
+            for column in range(1, 4):
+                self.cutoffs.setItem(0, column, _cell(""))
+            return
+        for row, cutoff in enumerate(rows):
+            self.cutoffs.setItem(row, 0, _cell(cutoff.label.capitalize()))
+            self.cutoffs.setItem(row, 1, _cell(f"{cutoff.cutoff:g}"))
+            self.cutoffs.setItem(row, 2, _cell(_num(cutoff.median)))
+            self.cutoffs.setItem(row, 3, _cell(f"{cutoff.n_passed} / {cutoff.n_cycles}"))
+
+    def _fill_episodes(self) -> None:
+        fit = self.fit
+        rows = [] if fit is None else fit.episodes
+        self.episodes.setRowCount(max(len(rows), 1))
+        if not rows:
+            self.episodes.setItem(0, 0, _cell("No burst episodes"))
+            for column in range(1, 5):
+                self.episodes.setItem(0, column, _cell(""))
+            return
+        for row, episode in enumerate(rows):
+            self.episodes.setItem(row, 0, _cell(f"{episode.start_s:.3f}"))
+            self.episodes.setItem(row, 1, _cell(f"{episode.end_s:.3f}"))
+            self.episodes.setItem(row, 2, _cell(str(episode.n_cycles)))
+            self.episodes.setItem(row, 3, _cell(_num(episode.period_ms)))
+            self.episodes.setItem(row, 4, _cell(_num(episode.volt_amp)))
 
     def _empty(self, message: str) -> None:
         self.canvas.clear()
@@ -262,7 +339,7 @@ class CyclePanel(QWidget):
         view_y = fit.filtered[start:stop][::step]
 
         fig = self.canvas.fig
-        fig.clear()
+        clear_figure(fig)
         ax = fig.add_subplot(111)
         t_end = times[-1]
         for span_start, span_stop, is_burst in fit.spans:

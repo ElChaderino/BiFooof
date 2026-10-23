@@ -20,13 +20,14 @@ matplotlib.use("QtAgg")
 import numpy as np
 from PySide6.QtWidgets import QApplication
 
-from bifooof.analysis.compare import ChannelComparison, alpha_peak, compare_spectra
-from bifooof.analysis.cycles import burst_note, fit_cycles
+from bifooof.analysis.compare import ChannelComparison, alpha_peak, compare_spectra, nearest_outside_peak
+from bifooof.analysis.cycles import burst_cutoffs, burst_episodes, burst_note, fit_cycles
+from bifooof.analysis.prepare import apply_reference, peak_at_width_floor, prepare_recording, voltage_scale_note
 from bifooof.analysis.segments import episode_count
-from bifooof.analysis.settings import FitSettings, band_label, band_phrase
+from bifooof.analysis.settings import FitSettings, band_label, band_phrase, matched_settings
 from bifooof.analysis.specparam_fit import ChannelFit, fit_spectra
 from bifooof.analysis.spectra import welch_spectra
-from bifooof.export import comparison_rows, cycle_summary_row
+from bifooof.export import burst_episode_rows, comparison_rows, cycle_summary_row
 from bifooof.io.channels import clean_channel_name
 from bifooof.io.condition import guess_condition
 from bifooof.io.load import _recording_from_raw, finalize, load_recording, needs_sfreq
@@ -259,6 +260,15 @@ class FitTests(unittest.TestCase):
         else:
             self.assertEqual(cycles.burst_note, "")
         self.assertEqual(cycle_summary_row(cycles, "ec")["burst_note"], cycles.burst_note)
+        self.assertEqual(len(cycles.cutoffs), 4)
+        self.assertEqual(len(cycles.episodes), cycles.n_burst_episodes)
+        self.assertEqual(sum(episode.n_cycles for episode in cycles.episodes), cycles.n_burst_cycles)
+        summary = cycle_summary_row(cycles, "ec")
+        self.assertIn("monotonicity_median", summary)
+        self.assertEqual(summary["monotonicity_n_passed"], next(
+            cutoff.n_passed for cutoff in cycles.cutoffs if cutoff.key == "monotonicity"
+        ))
+        self.assertEqual(len(burst_episode_rows(cycles, "ec")), cycles.n_burst_episodes)
 
     def test_burst_note_names_the_cutoff(self):
         thresholds = FitSettings().cycle_thresholds()
@@ -285,6 +295,337 @@ class FitTests(unittest.TestCase):
         note = burst_note(short, thresholds)
         self.assertIn("longest run is 1", note)
         self.assertIn("needs 3", note)
+
+    def test_burst_cutoffs_count_strict_passes(self):
+        thresholds = FitSettings().cycle_thresholds()
+        frame = _frame({
+            "amp_fraction": [1, 1, 1, 1, 1],
+            "amp_consistency": [1, 1, 1, 1, 1],
+            "period_consistency": [1, 1, 1, 1, 1],
+            "monotonicity": [0.9, 0.8, 0.95, 0.2, 0.9],
+        })
+        rows = {row.key: row for row in burst_cutoffs(frame, thresholds)}
+        self.assertEqual(rows["monotonicity"].n_passed, 3)
+        self.assertEqual(rows["monotonicity"].n_cycles, 5)
+        self.assertEqual(rows["amp_fraction"].n_passed, 5)
+        self.assertAlmostEqual(rows["monotonicity"].median, 0.9)
+
+    def test_burst_episodes_stay_separate(self):
+        frame = _frame({
+            "is_burst": [False, True, True, True, False, True, True, False],
+            "sample_last_trough": [0, 10, 20, 30, 40, 50, 60, 70],
+            "sample_next_trough": [10, 20, 30, 40, 50, 60, 70, 80],
+            "period": [10, 10, 10, 10, 10, 12, 12, 10],
+            "volt_amp": [1, 2, 4, 6, 1, 3, 5, 1],
+        })
+        episodes = burst_episodes(frame, 100.0, t_offset=5.0)
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(episodes[0].n_cycles, 3)
+        self.assertAlmostEqual(episodes[0].start_s, 5.1)
+        self.assertAlmostEqual(episodes[0].end_s, 5.4)
+        self.assertAlmostEqual(episodes[0].volt_amp, 4.0)
+        self.assertEqual(episodes[1].n_cycles, 2)
+        self.assertAlmostEqual(episodes[1].period_ms, 120.0)
+        self.assertEqual(burst_episodes(frame, 0.0), [])
+
+
+class QualityTests(unittest.TestCase):
+    def test_voltage_scale_is_named_and_not_rescaled(self):
+        self.assertIsNone(voltage_scale_note(np.full((1, 40), 25.0)))
+        self.assertIn("microvolts", voltage_scale_note(np.full((1, 40), 1e-5)) or "")
+        self.assertIn("above", voltage_scale_note(np.full((1, 40), 50000.0)) or "")
+        recording = finalize(
+            np.vstack([np.full(64, 1e-5), np.full(64, 2.0), np.full(64, 4.0)]),
+            ["O1", "A1", "A2"], 256.0, "scale.edf", "edf",
+        )
+        self.assertEqual(recording.ch_names, ["O1"])
+        self.assertIn("A1", recording.reference_channels)
+        self.assertIn("A2", recording.reference_channels)
+        self.assertTrue(any("linked-ear" in note for note in recording.notes))
+        self.assertTrue(any("microvolts" in note for note in recording.notes))
+        self.assertAlmostEqual(float(recording.data[0, 0]), 1e-5)
+
+    def test_large_samples_stay_out_of_the_fit(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        signal = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        signal[(times >= 3.0) & (times < 4.0)] = 5000.0
+        recording = Recording(
+            data=signal[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="loud.csv", source_format="csv",
+        )
+        prepared = prepare_recording(recording, FitSettings())
+        self.assertTrue(np.isnan(prepared.data[0, int(3 * sfreq):int(4 * sfreq)]).all())
+        self.assertTrue(np.isfinite(prepared.data[0, : int(2 * sfreq)]).all())
+        self.assertTrue(any("500" in note for note in prepared.notes))
+        fit = fit_spectra(recording)
+        peak = fit.channels[0].dominant_peak
+        self.assertIsNotNone(peak)
+        self.assertGreater(peak[0], 8.0)
+        self.assertLess(peak[0], 12.0)
+        self.assertIn("500", fit.notes)
+        loud = np.full_like(signal, 5000.0)
+        both = Recording(
+            data=np.vstack([signal, loud]), ch_names=["O1", "Fp1"], sfreq=sfreq,
+            source_path="loud.csv", source_format="csv",
+        )
+        both_fit = fit_spectra(both)
+        reasons = {item.name: item.reason for item in both_fit.channels}
+        self.assertEqual(reasons["Fp1"], "Amplitude above the limit.")
+        self.assertTrue(both_fit.channels[0].name == "O1" and both_fit.channels[0].usable)
+
+    def test_a_spike_does_not_enter_the_average(self):
+        values = np.full(16, 10.0)
+        spike = values.copy()
+        spike[4] = 5000.0
+        recording = Recording(
+            data=np.vstack([spike, values]), ch_names=["Fp1", "O1"], sfreq=256.0,
+            source_path="spike.csv", source_format="csv",
+        )
+        prepared = prepare_recording(recording, FitSettings(reference="average"))
+        self.assertTrue(np.isnan(prepared.data[0, 4]))
+        self.assertAlmostEqual(float(prepared.data[1, 4]), 10.0)
+        self.assertAlmostEqual(float(prepared.data[0, 0]), 0.0)
+        self.assertAlmostEqual(float(prepared.data[1, 0]), 0.0)
+
+    def test_a_short_window_is_not_called_an_epoch(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        signal = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        recording = Recording(
+            data=signal[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="short.csv", source_format="csv",
+        )
+        fit = fit_spectra(recording, FitSettings(epoch_s=30.0))
+        self.assertIsNone(fit.epoch_s)
+        self.assertEqual(fit.epoch_count, 0)
+        self.assertIn("shorter than one", fit.notes)
+
+    def test_reference_choices(self):
+        data = np.vstack([np.full(8, 10.0), np.zeros(8)])
+        recording = Recording(
+            data=data, ch_names=["Fp1", "O1"], sfreq=256.0,
+            source_path="ref.csv", source_format="csv",
+            reference_channels={"A1": np.full(8, 10.0), "A2": np.full(8, 20.0)},
+        )
+        averaged = apply_reference(recording, "average")
+        self.assertAlmostEqual(float(averaged.data[0, 0]), 5.0)
+        self.assertAlmostEqual(float(averaged.data[1, 0]), -5.0)
+        linked = apply_reference(recording, "linked")
+        self.assertAlmostEqual(float(linked.data[0, 0]), -5.0)
+        stored = apply_reference(recording, "stored")
+        self.assertIs(stored, recording)
+        missing = apply_reference(
+            Recording(data=data, ch_names=["Fp1", "O1"], sfreq=256.0, source_path="x", source_format="csv"),
+            "linked",
+        )
+        self.assertIn("not in the file", missing.notes[-1])
+        self.assertAlmostEqual(float(missing.data[0, 0]), 10.0)
+
+    def test_nearest_peak_stays_out_of_the_band_number(self):
+        outside = ChannelFit(name="C3", index=0, usable=True, peaks=[(12.4, 0.2, 1.0), (6.5, 0.4, 1.0)])
+        found = nearest_outside_peak(outside, (8.0, 12.0))
+        self.assertIsNotNone(found)
+        self.assertAlmostEqual(found[0], 12.4)
+        self.assertAlmostEqual(found[1], 0.4)
+        inside = ChannelFit(name="O1", index=1, usable=True, peaks=[(10.0, 1.0, 1.0)])
+        self.assertIsNone(nearest_outside_peak(inside, (8.0, 12.0)))
+        self.assertTrue(peak_at_width_floor(0.25, 0.5))
+        self.assertFalse(peak_at_width_floor(1.0, 0.5))
+        rows = compare_spectra(
+            _one_fit(outside),
+            _one_fit(inside),
+        )
+        by_name = {row.name: row for row in rows}
+        self.assertIsNone(by_name["C3"].alpha_reactivity)
+        self.assertAlmostEqual(by_name["C3"].nearest_cf_ec, 12.4)
+        self.assertIsNone(by_name["O1"].nearest_cf_ec)
+
+    def test_whole_file_comparison_uses_the_shorter_length(self):
+        long = Recording(
+            data=np.zeros((1, 2560)), ch_names=["O1"], sfreq=256.0,
+            source_path="long.csv", source_format="csv",
+        )
+        short = Recording(
+            data=np.zeros((1, 1024)), ch_names=["O1"], sfreq=256.0,
+            source_path="short.csv", source_format="csv",
+        )
+        whole = FitSettings()
+        self.assertAlmostEqual(matched_settings(whole, long, [short]).t_length, short.duration_s)
+        self.assertIsNone(matched_settings(whole, short, [long]).t_length)
+        explicit = FitSettings(t_length=2.0)
+        self.assertAlmostEqual(matched_settings(explicit, long, [short]).t_length, 2.0)
+
+    def test_epochs_count_a_peak_only_where_it_is_present(self):
+        sfreq = 256.0
+        times = np.arange(int(16.0 * sfreq)) / sfreq
+        signal = np.where(
+            times < 8.0,
+            20.0 * np.sin(2 * np.pi * 6.0 * times),
+            20.0 * np.sin(2 * np.pi * 10.0 * times),
+        )
+        recording = Recording(
+            data=signal[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="epochs.csv", source_format="csv",
+        )
+        fit = fit_spectra(recording, FitSettings(epoch_s=8.0))
+        item = fit.channels[0]
+        self.assertEqual(fit.epoch_count, 2)
+        self.assertEqual(item.n_epochs, 2)
+        self.assertEqual(item.n_peak_epochs, 1)
+        self.assertTrue(any(8.0 <= peak[0] <= 12.0 for peak in item.peaks))
+
+    def test_a_short_tail_is_left_out_of_the_epochs(self):
+        sfreq = 256.0
+        times = np.arange(int(20.0 * sfreq)) / sfreq
+        signal = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        recording = Recording(
+            data=signal[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="tail.csv", source_format="csv",
+        )
+        fit = fit_spectra(recording, FitSettings(epoch_s=8.0))
+        self.assertEqual(fit.epoch_count, 2)
+        self.assertIn("last 4", fit.notes)
+
+    def test_one_epoch_does_not_merge_its_own_nearby_peaks(self):
+        from bifooof.analysis.specparam_fit import _median_peaks
+
+        grouped = _median_peaks([
+            [(10.0, 1.0, 1.0), (10.4, 0.2, 1.0)],
+            [(10.2, 0.8, 1.0)],
+        ])
+        self.assertEqual(len(grouped), 2)
+        heights = sorted(peak[1] for peak in grouped)
+        self.assertAlmostEqual(heights[0], 0.2)
+        self.assertAlmostEqual(heights[1], 0.9)
+
+    def test_band_change_keeps_each_peaks_epoch_count(self):
+        from bifooof.analysis.specparam_fit import SpectrumFit, epochs_for_peak
+
+        alpha = (10.0, 0.8, 0.25)
+        theta = (6.0, 0.4, 2.0)
+        closed = ChannelFit(
+            name="O1", index=0, usable=True, peaks=[alpha, theta],
+            peak_counts=[1, 2], n_epochs=2, n_peak_epochs=1, peak_at_width_floor=True,
+            exponent=1.0, r_squared=0.9,
+        )
+        opened = ChannelFit(
+            name="O1", index=0, usable=True, peaks=[theta], exponent=1.1, r_squared=0.9,
+        )
+        self.assertEqual(epochs_for_peak(closed, theta), 2)
+        self.assertEqual(epochs_for_peak(closed, alpha), 1)
+        rows = compare_spectra(
+            SpectrumFit(channels=[closed], fmin=1.0, fmax=40.0),
+            SpectrumFit(channels=[opened], fmin=1.0, fmax=40.0),
+            (4.0, 8.0),
+            0.5,
+        )
+        self.assertFalse(rows[0].peak_at_floor_ec)
+        self.assertAlmostEqual(rows[0].alpha_cf_ec, 6.0)
+
+    def test_findings_keep_a_peak_separate_from_the_background(self):
+        from bifooof.analysis.cycles import CycleFit
+        from bifooof.analysis.findings import compile_report, report_text
+        from bifooof.analysis.specparam_fit import SpectrumFit
+
+        def channel(name, index, peaks, exponent, r_squared, level):
+            item = ChannelFit(
+                name=name, index=index, usable=True, exponent=exponent,
+                r_squared=r_squared, peaks=list(peaks),
+            )
+            item.freqs = np.linspace(1.0, 40.0, 40)
+            item.spectrum = np.full(40, level)
+            return item
+
+        closed = SpectrumFit(channels=[
+            channel("O1", 0, [(10.0, 0.80, 1.5)], 1.2, 0.92, 1.0),
+            channel("C3", 1, [(12.4, 0.20, 1.0), (6.0, 0.30, 1.0)], 0.9, 0.40, 1.0),
+        ], fmin=1.0, fmax=40.0, t_start=0.0, t_end=60.0)
+        opened = SpectrumFit(channels=[
+            channel("O1", 0, [(9.0, 0.20, 1.2)], 1.4, 0.88, 0.4),
+            channel("C3", 1, [], 1.0, 0.80, 0.4),
+        ], fmin=1.0, fmax=40.0, t_start=0.0, t_end=60.0)
+        closed.epoch_s = 30.0
+        closed.epoch_count = 2
+        closed.channels[1].n_epochs = 2
+        closed.channels[1].n_peak_epochs = 1
+        cycles = {"ec": CycleFit(
+            channel="C3", channel_index=1, band=(8.0, 12.0), sfreq=256.0,
+            filtered=np.zeros(8), n_cycles=10, n_burst_cycles=6, n_burst_episodes=2,
+            burst_duration_s=1.2, burst_fraction=0.3, period_ms=100.0, rise_decay=0.48,
+            peak_trough=0.51, volt_amp=18.0, burst_period_ms=98.0, burst_rise_decay=0.47,
+            burst_peak_trough=0.52, burst_volt_amp=22.0,
+        )}
+        recording = Recording(
+            data=np.zeros((2, 8)), ch_names=["O1", "C3"], sfreq=256.0,
+            source_path="eyes.eeg", source_format="eeg",
+            notes=["Voltage looks like volts rather than microvolts. Peak height and burst amplitude assume microvolts."],
+        )
+        text = report_text(compile_report(
+            {"ec": recording, "eo": recording},
+            {"ec": closed, "eo": opened},
+            cycles, (8.0, 12.0), "C3", FitSettings(),
+        ))
+        self.assertIn("10.00 Hz", text)
+        self.assertIn("aperiodic background", text)
+        self.assertIn("Exponent 0.90", text)
+        self.assertIn("12.40 Hz", text)
+        self.assertIn("Theta", text)
+        self.assertIn("weak", text.lower())
+        self.assertIn("volts rather than microvolts", text)
+        self.assertIn("higher with eyes closed", text)
+        self.assertIn("no peak difference", text)
+        self.assertIn("separate runs", text)
+        self.assertIn("raw EEG", text)
+        self.assertIn("share of total spectral power", text)
+        self.assertIn("not entered as a height of zero", text)
+        self.assertIn("does not scale the height", text)
+        self.assertIn("Reference: as stored", text)
+        for label in ("ADHD", "hyperarousal", "Alzheimer"):
+            self.assertNotIn(label, text)
+        renamed = report_text(compile_report(
+            {"ec": recording, "eo": recording},
+            {"ec": closed, "eo": opened},
+            cycles, (8.0, 12.0), "C3", FitSettings(),
+            pair=("Pre", "Post"),
+        ))
+        self.assertIn("Pre and Post", renamed)
+        self.assertIn("higher with Pre", renamed)
+        self.assertIn("Post minus Pre", renamed)
+        self.assertIn("(Pre − Post) / Post", renamed)
+        self.assertNotIn("eyes closed", renamed.lower())
+        self.assertNotIn("eyes open", renamed.lower())
+        custom = report_text(compile_report(
+            {"ec": recording, "eo": recording},
+            {"ec": closed, "eo": opened},
+            cycles, (8.0, 12.0), "C3", FitSettings(),
+            pair=("Baseline", "Follow-up"),
+        ))
+        self.assertIn("Baseline and Follow-up", custom)
+        self.assertIn("higher with Baseline", custom)
+        self.assertNotIn("eyes closed", custom.lower())
+
+
+def _one_fit(channel: ChannelFit):
+    from bifooof.analysis.specparam_fit import SpectrumFit
+
+    channel.freqs = np.linspace(1.0, 40.0, 16)
+    channel.spectrum = np.zeros(16)
+    return SpectrumFit(channels=[channel], fmin=1.0, fmax=40.0, t_start=0.0, t_end=8.0)
+
+
+class ExclusionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.recording = _recording()
+
+    @classmethod
+    def tearDownClass(cls):
+        root = getattr(_recording, "root", None)
+        if root is not None:
+            root.cleanup()
+            _recording.root = None
+            _recording.value = None
 
     def test_welch_removes_a_straight_drift(self):
         sfreq = 256.0
@@ -425,10 +766,18 @@ class WindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNotNone(window.cycles.fit)
         self.assertEqual(window.cycles.fit.band, (1.0, 4.0))
+        self.assertIn("accepted time", window.cycles.caption.text())
+        self.assertEqual(window.cycles.cutoffs.item(0, 0).text(), "Amplitude fraction")
+        self.assertIn("/", window.cycles.cutoffs.item(0, 3).text())
         low, high = window.fit_bar.current_band()
         self.assertAlmostEqual(low, 1.0)
         self.assertAlmostEqual(high, 4.0)
         self.assertTrue(window.fit_bar.band.currentText().startswith("Delta"))
+        self.assertIn("Findings", window.tabs.tabText(window.tabs.indexOf(window.findings)))
+        self.assertIn("Eyes closed", window.findings.plain)
+        self.assertIn("raw EEG", window.findings.plain)
+        self.assertNotIn("ADHD", window.findings.plain)
+        self.assertNotIn("hyperarousal", window.findings.plain)
         for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig, window.cycles.canvas.fig):
             self.assertTrue(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
         window.close()

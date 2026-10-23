@@ -55,14 +55,24 @@ _BODIES: dict[str, str] = {
         '<rect x="3.5" y="5" width="7.2" height="14" rx="1.6"/>'
         '<rect x="13.3" y="5" width="7.2" height="14" rx="1.6"/>'
     ),
+    "time": (
+        '<rect x="4" y="4.5" width="16" height="15" rx="1.6"/>'
+        '<path d="M4 9.5h16M4 14h16M9.2 4.5v15M14.4 4.5v15"/>'
+    ),
+    "notes": (
+        '<path d="M8 3.6h6.2L18.2 7.6V20a1.4 1.4 0 0 1-1.4 1.4H8A1.4 1.4 0 0 1 6.6 20V5A1.4 1.4 0 0 1 8 3.6z"/>'
+        '<path d="M14 3.8V8h4.2"/><path d="M9.2 12.2h5.6M9.2 15.4h5.6M9.2 18.4h3.4"/>'
+    ),
     "chevron-down": '<path d="M6 9.5 12 15l6-5.5"/>',
 }
 
 TAB_ICONS = {
     "Traces": "waveform",
     "Spectrum": "activity",
+    "Time": "time",
     "Cycles": "cycles",
     "Compare": "compare",
+    "Findings": "notes",
 }
 
 

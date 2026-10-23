@@ -21,9 +21,10 @@ matplotlib.rcParams.update({
 import numpy as np
 
 from .analysis.compare import alpha_peak, compare_spectra
+from .analysis.prepare import R2_WEAK
 from .analysis.cycles import CycleFit
 from .analysis.settings import band_phrase
-from .analysis.specparam_fit import SpectrumFit
+from .analysis.specparam_fit import SpectrumFit, log_residual
 from .ui.headmap import draw_head
 
 _EC = "#1c4e78"
@@ -73,6 +74,17 @@ def finish_figure(fig) -> None:
             return
 
 
+def clear_figure(fig) -> None:
+    """Remove the axes. A log spectrum axis rejects the limits used while clearing."""
+    for ax in list(fig.axes):
+        try:
+            ax.set_xscale("linear")
+            ax.set_yscale("linear")
+        except (ValueError, RuntimeError):
+            continue
+    fig.clear()
+
+
 def style_axes(ax, grid: bool = False) -> None:
     """Apply the clinical axis chrome used by every plot."""
     ax.set_facecolor("#ffffff")
@@ -89,20 +101,24 @@ def style_axes(ax, grid: bool = False) -> None:
         ax.set_axisbelow(True)
 
 
-def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "") -> None:
-    """Draw one condition's spectrum, model, and head maps onto ``fig``."""
+def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "", mark_hz: float | None = None) -> None:
+    """Draw one condition's spectrum, the residual, and the head maps onto ``fig``."""
     if not fit.channels:
         return
     chosen = min(max(index, 0), len(fit.channels) - 1)
     item = fit.channels[chosen]
-    fig.clear()
+    clear_figure(fig)
     finish_figure(fig)
-    grid = fig.add_gridspec(2, 2, height_ratios=[2.0, 1.45])
+    grid = fig.add_gridspec(3, 2, height_ratios=[2.0, 0.72, 1.35])
     spectrum = fig.add_subplot(grid[0, :])
+    spectrum.set_label("spectrum")
+    residual = fig.add_subplot(grid[1, :], sharex=spectrum)
+    residual.set_label("residual")
     if item.freqs is None or item.spectrum is None:
         spectrum.axis("off")
         spectrum.text(0.5, 0.5, item.reason or "No fit for this channel.",
                       ha="center", va="center", color="#63748a")
+        residual.axis("off")
     else:
         mark_spectrum(spectrum, fit.fmin, fit.fmax)
         spectrum.plot(item.freqs, item.spectrum, color="#16324f", lw=1.7, label="Spectrum", zorder=2)
@@ -122,20 +138,41 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "") -> None:
         spectrum.set_title(title, fontsize=10, loc="left")
         spectrum.legend(frameon=False, fontsize=8)
         style_axes(spectrum, grid=True)
+        _draw_residual(residual, item, mark_hz)
+        if mark_hz is not None:
+            spectrum.axvline(mark_hz, color="#63748a", lw=0.7, ls="--", zorder=1)
 
     exponents = [channel.exponent for channel in fit.channels]
     centers = [channel.dominant_peak[0] if channel.dominant_peak else None for channel in fit.channels]
     names = [channel.name for channel in fit.channels]
-    draw_head(fig.add_subplot(grid[1, 0]), names, exponents, "Exponent", "viridis", item.name)
-    draw_head(fig.add_subplot(grid[1, 1]), names, centers, "Peak frequency (Hz)", "plasma", item.name)
+    weak = [channel.r_squared is not None and channel.r_squared < R2_WEAK for channel in fit.channels]
+    floors = [weak[index] or channel.peak_at_width_floor for index, channel in enumerate(fit.channels)]
+    draw_head(fig.add_subplot(grid[2, 0]), names, exponents, f"Exponent  {fit.fmin:g}–{fit.fmax:.0f} Hz", "viridis", item.name, weak)
+    draw_head(fig.add_subplot(grid[2, 1]), names, centers, "Peak frequency (Hz)", "plasma", item.name, floors)
     stamp_figure(fig)
 
 
+def _draw_residual(ax, item, mark_hz: float | None) -> None:
+    curves = log_residual(item)
+    if curves is None:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No model residual.", ha="center", va="center", color="#63748a", fontsize=8)
+        return
+    freqs, values = curves
+    ax.axhline(0.0, color="#d2dbe6", lw=0.8, zorder=1)
+    ax.plot(freqs, values, color="#16324f", lw=1.05, zorder=2)
+    if mark_hz is not None:
+        ax.axvline(mark_hz, color="#63748a", lw=0.7, ls="--", zorder=1)
+    ax.set_ylabel("log10 residual")
+    ax.tick_params(labelbottom=False)
+    style_axes(ax, grid=True)
+
+
 def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, channel: str,
-                      alpha: tuple[float, float] = (8.0, 12.0)):
+                      alpha: tuple[float, float] = (8.0, 12.0), peak_width_low: float | None = None):
     """Overlay eyes-closed and eyes-open spectra. Returns the comparison rows."""
-    rows = compare_spectra(eyes_closed, eyes_open, alpha)
-    fig.clear()
+    rows = compare_spectra(eyes_closed, eyes_open, alpha, peak_width_low)
+    clear_figure(fig)
     finish_figure(fig)
     grid = fig.add_gridspec(2, 2, height_ratios=[2.0, 1.45])
     ax = fig.add_subplot(grid[0, :])
@@ -154,12 +191,17 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     draw_head(
         fig.add_subplot(grid[1, 0]), names,
         [row.exponent_delta for row in rows],
-        "Exponent  EO − EC", "viridis", channel,
+        f"Exponent  {fmin:g}–{fmax:.0f} Hz  EO − EC", "viridis", channel,
+        [_weak_fit(row.r_squared_ec) or _weak_fit(row.r_squared_eo) for row in rows],
     )
     draw_head(
         fig.add_subplot(grid[1, 1]), names,
         [row.alpha_reactivity for row in rows],
         f"{shown} peak height  EC − EO", "plasma", channel,
+        [
+            _weak_fit(row.r_squared_ec) or _weak_fit(row.r_squared_eo) or row.peak_at_floor_ec or row.peak_at_floor_eo
+            for row in rows
+        ],
     )
     stamp_figure(fig)
     return rows
@@ -167,7 +209,7 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
 
 def render_cycles(fig, fit: CycleFit, seconds: float = 10.0) -> None:
     """Draw the first page of a bycycle fit."""
-    fig.clear()
+    clear_figure(fig)
     ax = fig.add_subplot(111)
     if fit.filtered.size == 0:
         ax.axis("off")
@@ -193,12 +235,17 @@ def render_cycles(fig, fit: CycleFit, seconds: float = 10.0) -> None:
     ax.set_title(
         f"{fit.channel} filtered {fit.band[0]:g}–{fit.band[1]:g} Hz"
         f"    ·    {fit.n_cycles} cycles, {fit.n_burst_cycles} burst cycles "
-        f"in {fit.n_burst_episodes} episodes",
+        f"in {fit.n_burst_episodes} episodes"
+        + (f"    ·    {fit.burst_duration_s:.2f} s" if fit.n_burst_episodes else ""),
         fontsize=9, loc="left",
     )
     style_axes(ax)
     fig.tight_layout()
     stamp_figure(fig)
+
+
+def _weak_fit(value: float | None) -> bool:
+    return value is not None and value < R2_WEAK
 
 
 def _by_name(fit: SpectrumFit, name: str):

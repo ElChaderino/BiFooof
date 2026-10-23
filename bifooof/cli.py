@@ -158,6 +158,12 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
                         help="Band used for alpha reactivity.")
     parser.add_argument("--bursts", choices=("library", "resting", "paper"), default="library",
                         help="Burst rule: library, resting alpha, or the paper alpha thresholds.")
+    parser.add_argument("--reference", choices=("stored", "average", "linked"), default="stored",
+                        help="stored keeps the file reference. average or linked ears are explicit.")
+    parser.add_argument("--epoch", type=float, default=None,
+                        help="Fit non-overlapping epochs of this many seconds. Peak height is the median of epochs that found the peak, not lowered by epochs that missed it.")
+    parser.add_argument("--amplitude-limit", type=float, default=500.0,
+                        help="Drop samples beyond this many microvolts. 0 keeps every sample.")
 
 
 def _settings(args: argparse.Namespace) -> FitSettings:
@@ -184,6 +190,9 @@ def _settings(args: argparse.Namespace) -> FitSettings:
         period_consistency=float(period_c),
         monotonicity=float(mono),
         min_n_cycles=int(min_cycles),
+        amplitude_limit_uv=float(args.amplitude_limit),
+        reference=str(args.reference),
+        epoch_s=None if args.epoch is None else float(args.epoch),
     )
 
 

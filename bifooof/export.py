@@ -68,6 +68,9 @@ def spectrum_rows(fit: SpectrumFit, condition: str, source: str = "") -> list[di
             "peaks_hz": ", ".join(f"{cf:.2f}" for cf, _pw, _bw in item.peaks),
             "r_squared": item.r_squared,
             "error": item.error,
+            "n_epochs": item.n_epochs,
+            "n_peak_epochs": item.n_peak_epochs,
+            "peak_at_width_floor": item.peak_at_width_floor,
             "note": item.reason,
         })
     return rows
@@ -122,12 +125,20 @@ def comparison_rows(
             "band_power_eo": row.band_power_eo,
             "band_power_reactivity_percent": row.band_power_reactivity_percent,
             "band_power_definition": "mean Welch power in the band, (EC - EO) / EO * 100",
+            "r_squared_ec": row.r_squared_ec,
+            "r_squared_eo": row.r_squared_eo,
+            "nearest_cf_ec": row.nearest_cf_ec,
+            "nearest_distance_ec_hz": row.nearest_distance_ec,
+            "nearest_cf_eo": row.nearest_cf_eo,
+            "nearest_distance_eo_hz": row.nearest_distance_eo,
+            "peak_at_width_floor_ec": row.peak_at_floor_ec,
+            "peak_at_width_floor_eo": row.peak_at_floor_eo,
         })
     return exported
 
 
 def cycle_summary_row(fit: CycleFit, condition: str, source: str = "") -> dict:
-    return {
+    row = {
         "condition": CONDITION_LABELS.get(condition, condition),
         "source": source,
         "channel": fit.channel,
@@ -148,6 +159,33 @@ def cycle_summary_row(fit: CycleFit, condition: str, source: str = "") -> dict:
         "burst_peak_trough": fit.burst_peak_trough,
         "burst_volt_amp": fit.burst_volt_amp,
     }
+    for cutoff in fit.cutoffs:
+        row[f"{cutoff.key}_cutoff"] = cutoff.cutoff
+        row[f"{cutoff.key}_median"] = cutoff.median
+        row[f"{cutoff.key}_n_passed"] = cutoff.n_passed
+    return row
+
+
+def burst_episode_rows(fit: CycleFit, condition: str, source: str = "") -> list[dict]:
+    """One row per burst episode: when it started, how long it ran, and its median cycle."""
+    label = CONDITION_LABELS.get(condition, condition)
+    return [
+        {
+            "condition": label,
+            "source": source,
+            "channel": fit.channel,
+            "band_low_hz": fit.band[0],
+            "band_high_hz": fit.band[1],
+            "episode": index + 1,
+            "start_s": episode.start_s,
+            "end_s": episode.end_s,
+            "duration_s": episode.end_s - episode.start_s,
+            "n_cycles": episode.n_cycles,
+            "period_ms": episode.period_ms,
+            "volt_amp": episode.volt_amp,
+        }
+        for index, episode in enumerate(fit.episodes)
+    ]
 
 
 def cycle_detail_rows(fit: CycleFit, condition: str) -> list[dict]:
@@ -172,6 +210,7 @@ def fit_metadata(
     settings: FitSettings,
     fit: SpectrumFit | None = None,
     condition: str = "",
+    extras: dict | None = None,
 ) -> dict:
     """Settings and exclusions behind one fit, so a table can be read later."""
     invalid = 0 if recording.valid is None else int((~recording.valid).sum())
@@ -201,6 +240,9 @@ def fit_metadata(
         "min_peak_height": settings.min_peak_height,
         "peak_threshold_sd": settings.peak_threshold,
         "band_hz": [settings.alpha_low, settings.alpha_high],
+        "reference": settings.reference,
+        "amplitude_limit_uv": settings.amplitude_limit_uv,
+        "epoch_s": settings.epoch_s,
         "burst_thresholds": settings.cycle_thresholds(),
         "bad_channels": list(recording.bad_channels),
         "rejected_spans_s": [
@@ -214,14 +256,28 @@ def fit_metadata(
             "Each condition picks its own tallest peak in the band. A missing peak stays missing."
         ),
         "band_power_definition": (
-            "Mean linear Welch power in the band. Reactivity percent is (EC - EO) / EO * 100."
+            "Mean linear Welch power in the band, in microvolts squared per Hz. "
+            "The percent is the change between recordings, (EC - EO) / EO * 100. "
+            "It is not the band's share of total spectral power. "
+            "It is blank when eyes-open power is missing or not positive."
+        ),
+        "epoch_peak_definition": (
+            "When epochs are used, each epoch is fit alone. "
+            "Peaks within 1 Hz are grouped. Center, height, and width are medians of the epochs in the group. "
+            "An epoch that missed the peak is omitted, not entered as height zero. "
+            "n_peak_epochs counts epochs with an in-band peak and does not scale the height."
         ),
         "burst_definition": (
             "n_burst_cycles counts cycles labelled as part of a burst. "
             "n_burst_episodes counts contiguous runs of those cycles. "
-            "A run cannot cross a rejected interval."
+            "A run cannot cross a rejected interval. "
+            "A cycle clears a cutoff only when its value is strictly above it. "
+            "The first and last cycle of a fitted run are never bursts, "
+            "and a run shorter than min_n_cycles is dropped."
         ),
     }
+    if extras:
+        payload.update(extras)
     return payload
 
 

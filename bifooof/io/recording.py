@@ -36,6 +36,9 @@ class Recording:
     valid: np.ndarray | None = None
     bad_channels: list[str] = field(default_factory=list)
     rejected_spans: list[tuple[float, float]] = field(default_factory=list)
+    # Ear or mastoid channels kept for a linked-ear reference. They are not fitted.
+    reference_channels: dict[str, np.ndarray] = field(default_factory=dict)
+    dropped_by_amplitude: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.data = np.ascontiguousarray(self.data, dtype=np.float64)
@@ -51,6 +54,53 @@ class Recording:
             self.valid = np.ascontiguousarray(self.valid, dtype=bool)
             if self.valid.shape != self.data.shape:
                 raise ValueError("The validity mask must have the same shape as the data.")
+        cleaned_refs: dict[str, np.ndarray] = {}
+        for name, values in self.reference_channels.items():
+            row = np.ascontiguousarray(values, dtype=np.float64).ravel()
+            if row.size != self.n_samples:
+                raise ValueError(f"Reference channel {name} does not match the recording length.")
+            cleaned_refs[str(name)] = row
+        self.reference_channels = cleaned_refs
+
+    def cropped(self, i0: int, i1: int, note: str = "") -> Recording:
+        """Samples ``i0:i1``, including ear references. A full span with no note returns this object."""
+        i0 = min(max(int(i0), 0), self.n_samples)
+        i1 = min(max(int(i1), i0), self.n_samples)
+        if i1 <= i0:
+            raise ValueError("That time window is past the end of the recording.")
+        if i0 == 0 and i1 == self.n_samples and not note:
+            return self
+        t0 = i0 / self.sfreq
+        t1 = i1 / self.sfreq
+        kept = [
+            Mark(mark.onset_s - t0, mark.label, mark.duration_s)
+            for mark in self.marks
+            if t0 - 1e-9 <= mark.onset_s < t1 + 1e-9
+        ]
+        valid, spans = self.slice_exclusions(i0, i1, t0)
+        refs = {
+            name: np.ascontiguousarray(values[i0:i1], dtype=np.float64)
+            for name, values in self.reference_channels.items()
+        }
+        notes = list(self.notes)
+        if note:
+            notes.append(note)
+        else:
+            notes.append(f"Fit window {t0:.1f}–{t1:.1f} s.")
+        return Recording(
+            data=self.data[:, i0:i1],
+            ch_names=list(self.ch_names),
+            sfreq=self.sfreq,
+            source_path=self.source_path,
+            source_format=self.source_format,
+            notes=notes,
+            marks=kept,
+            valid=valid,
+            bad_channels=list(self.bad_channels),
+            rejected_spans=spans,
+            reference_channels=refs,
+            dropped_by_amplitude=list(self.dropped_by_amplitude),
+        )
 
     def mask(self, index: int) -> np.ndarray:
         """True for samples that may enter a fit on this channel."""

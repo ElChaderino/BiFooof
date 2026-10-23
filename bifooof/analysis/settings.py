@@ -8,9 +8,9 @@ and eyes-open/eyes-closed papers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from ..io.recording import Mark, Recording
+from ..io.recording import Recording
 
 
 @dataclass
@@ -36,6 +36,12 @@ class FitSettings:
     period_consistency: float = 0.5
     monotonicity: float = 0.8
     min_n_cycles: int = 3
+    # 0 keeps every sample. The default drops samples outside a normal EEG range.
+    amplitude_limit_uv: float = 500.0
+    # stored keeps the file reference. average and linked are explicit choices.
+    reference: str = "stored"
+    # None fits the window as one spectrum. A value splits it into equal epochs.
+    epoch_s: float | None = None
 
     def validate(self) -> None:
         if self.t_start < 0:
@@ -58,6 +64,12 @@ class FitSettings:
             raise ValueError("The peak threshold must be above 0.")
         if self.min_n_cycles < 1:
             raise ValueError("A burst needs at least one cycle.")
+        if self.amplitude_limit_uv < 0:
+            raise ValueError("The amplitude limit cannot be negative. Use 0 to keep every sample.")
+        if self.reference not in {"stored", "average", "linked"}:
+            raise ValueError("The reference is stored, average, or linked ears.")
+        if self.epoch_s is not None and float(self.epoch_s) < 8.0:
+            raise ValueError("An epoch must be at least 8 s.")
 
     def model_kwargs(self) -> dict:
         return {
@@ -103,6 +115,9 @@ class FitSettings:
             round(self.period_consistency, 3),
             round(self.monotonicity, 3),
             int(self.min_n_cycles),
+            round(self.amplitude_limit_uv, 3),
+            self.reference,
+            None if self.epoch_s is None else round(float(self.epoch_s), 3),
         )
 
 
@@ -154,6 +169,15 @@ def band_label(low: float, high: float) -> str:
     return f"{float(low):g}–{float(high):g} Hz"
 
 
+def reference_phrase(reference: str) -> str:
+    """Short label for the reference used in a fit."""
+    if reference == "average":
+        return "average reference"
+    if reference == "linked":
+        return "linked-ear reference"
+    return "reference as stored"
+
+
 def band_phrase(low: float, high: float) -> str:
     """Label with the range, such as Alpha 8–12 Hz or 7–13 Hz."""
     name = band_label(low, high)
@@ -172,30 +196,25 @@ def clip_recording(recording: Recording, settings: FitSettings) -> Recording:
         i1 = i0 + max(1, int(round(float(settings.t_length) * recording.sfreq)))
     i0 = min(max(i0, 0), recording.n_samples)
     i1 = min(max(i1, i0), recording.n_samples)
-    if i1 <= i0:
-        raise ValueError("That time window is past the end of the recording.")
-    if i0 == 0 and i1 == recording.n_samples:
-        return recording
-    t0 = i0 / recording.sfreq
-    t1 = i1 / recording.sfreq
-    kept = [
-        Mark(mark.onset_s - t0, mark.label, mark.duration_s)
-        for mark in recording.marks
-        if t0 - 1e-9 <= mark.onset_s < t1 + 1e-9
-    ]
-    valid, spans = recording.slice_exclusions(i0, i1, t0)
-    return Recording(
-        data=recording.data[:, i0:i1],
-        ch_names=list(recording.ch_names),
-        sfreq=recording.sfreq,
-        source_path=recording.source_path,
-        source_format=recording.source_format,
-        notes=[*recording.notes, f"Fit window {t0:.1f}–{t1:.1f} s."],
-        marks=kept,
-        valid=valid,
-        bad_channels=list(recording.bad_channels),
-        rejected_spans=spans,
-    )
+    return recording.cropped(i0, i1)
+
+
+def matched_settings(
+    settings: FitSettings,
+    recording: Recording,
+    others: list[Recording],
+) -> FitSettings:
+    """When the window is the whole file, fit every open recording to the shorter length.
+
+    An explicit start or length is left as the user set it. A single open file is unchanged.
+    """
+    if settings.t_length is not None or settings.t_start > 0.05 or not others:
+        return settings
+    durations = [recording.duration_s, *[item.duration_s for item in others]]
+    shorter = min(durations)
+    if max(durations) - shorter <= 1.0 or recording.duration_s <= shorter + 1.0:
+        return settings
+    return replace(settings, t_length=shorter)
 
 
 def window_bounds(recording: Recording, settings: FitSettings) -> tuple[float, float]:
