@@ -108,7 +108,7 @@ def draw_trajectory_with_maps(
 ) -> None:
     """Series on the left, one head map on the right, and the clicked window below."""
     _open(fig)
-    grid = fig.add_gridspec(4, 2, height_ratios=[1.0, 1.0, 1.0, 1.2], width_ratios=[2.4, 1.0], hspace=0.35, wspace=0.05)
+    grid = fig.add_gridspec(4, 2, height_ratios=[1.0, 1.0, 1.0, 1.15], width_ratios=[1.45, 1.0], hspace=0.28, wspace=0.08)
     axes = []
     for row in range(3):
         axes.append(fig.add_subplot(grid[row, 0], sharex=axes[0] if axes else None))

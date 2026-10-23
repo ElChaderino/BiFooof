@@ -1,52 +1,148 @@
 # BiFooof
 
-Windows app for specparam (FOOOF) and bycycle on EEG.
+**EEG spectral and cycle analysis using specparam (FOOOF) and bycycle.**
 
-Open an EDF, WinEEG `.eeg`, BrainVision, EEGLAB, FIF, CNT, CSV, or JSON file. The `.eeg` reader is part of the app. BXS files need `bxs2edf.exe` on the machine. Open an eyes-closed recording and an eyes-open recording together and the comparison view puts the two spectra side by side.
+A Windows app for getting a better look at what's actually going on in the EEG without lumping everything into broad frequency bands.
 
-## Fit bar
+Specparam separates rhythmic peaks from the aperiodic background, while bycycle looks at the oscillations themselves, their amplitude, timing, shape and how they group into bursts. The idea is to get a more useful picture of the signal rather than relying on consolidated band-power values alone.
 
-specparam fits a stretch of the recording and reports the aperiodic slope and the peaks. The default is the whole file, 1–40 Hz, a 4 second Welch segment (0.25 Hz bins), and a fixed slope.
+Supports EDF, WinEEG `.eeg`, BrainVision, EEGLAB, FIF, CNT, CSV and JSON. The WinEEG reader is built in. BXS needs `bxs2edf.exe` installed locally.
 
-The fit bar can switch that to the published 2–40 Hz eyes-open / eyes-closed range, a narrower 3–30 or 2–20 Hz band, a 2 or 8 second segment, and a knee instead of a fixed slope. Peak width, count, height, and the 2 SD peak threshold are on that bar too.
+You can load eyes-closed (EC) and eyes-open (EO) recordings together and compare their spectra, peaks, background slopes and alpha reactivity.
 
-**Refit** runs specparam and bycycle on the time window you set. The scrollbars on the trace and cycle pages only move the picture.
+## Spectral fitting
 
-## Band
+The fit controls let you decide what part of the recording to analyze and how specparam handles it.
 
-Alpha, 8–12 Hz, is the default. The same control is delta 1–4, theta 4–8, beta 13–30, gamma 30–45, or any range you type. The Cycles page and the eyes-closed versus eyes-open reactivity both follow it. Changing the band does not refit the spectrum.
+By default it uses the full recording, 1–40 Hz, a 4-second Welch segment giving 0.25 Hz frequency bins, and a fixed aperiodic slope.
 
-Burst detection can stay on the library rule, or use the resting-alpha and paper-alpha amplitude rules. Those rules still apply to whichever band is selected.
+You can change the fit range to 2–40 Hz for EO/EC comparisons, narrow it to 3–30 or 2–20 Hz, or change the Welch segment to 2 or 8 seconds.
 
-## Drift, bursts, and marks
+Fixed and knee models are available, along with controls for peak width, number of peaks, minimum height and the 2 SD peak threshold.
 
-The spectrum fit removes a straight drift line from each channel before the Welch estimate. The cycle fit does the same before its bandpass.
+**Refit** runs specparam and bycycle again using the selected time window and settings. Scrolling through the traces or cycles only changes what's displayed, not the underlying fit.
 
-When cycles are found and none of them form a burst, the Cycles page names the cutoff that stopped the run. The library rule needs monotonicity above 0.8 for three cycles in a row.
+## Frequency bands
 
-A WinEEG mark that says eyes closed or eyes open cuts that side out of the file. A file with both marks opens both sides. A clock-time mark is kept as a note and does not cut the recording. Two separate files still open exactly as before.
+Alpha 8–12 Hz is the default, but you can switch to delta 1–4, theta 4–8, beta 13–30, gamma 30–45 Hz, or enter your own range.
 
-Samples marked `BAD` in an MNE file, bad channels, and nonfinite samples stay out of the spectrum and the cycle fit. They are not replaced with zeros, and a cycle cannot cross a rejected gap.
+The selected band carries through to the Cycles page and EO/EC reactivity calculations. Changing it doesn't automatically refit the spectrum.
 
-The comparison has two different numbers. Peak Δ is eyes-closed fitted peak height minus eyes-open fitted peak height, above the aperiodic background, in log10 power. Each side picks its own peak, and a missing peak stays missing. Δ band % is the percent change between the two recordings in mean Welch power inside that band, `(EC − EO) / EO × 100`. It is not the band's share of total spectral power. It stays blank when eyes-open power is missing or not positive. The spectrum table's Height column is that same fitted peak height, not Welch band power.
+Burst detection can use the standard bycycle library rules or the resting-alpha and paper-alpha amplitude rules. Whichever rule you choose applies to the selected frequency range.
 
-Epochs, 30 s or 60 s, are non-overlapping and each one is fit on its own. Peaks whose centers fall within 1 Hz are one group. The reported center, height, and width are the medians of the epochs in that group. An epoch that missed the peak is left out of the median. It is not entered as a height of zero, so a peak that appears less often does not look shorter. The caption counts how many epochs contained an in-band peak, and that count does not scale the height. Offset, exponent, and R² are medians across epochs that fit. The spectrum curve is their mean. Press Refit after changing epochs, the reference, or the amplitude limit.
+## Drift, artifacts and burst detection
 
-A weak fit, R² below 0.6, is ringed on the head map. A peak at the narrowest allowed width is marked. A file whose voltage looks like volts, or far above a normal EEG range, is labelled on the file name and is not rescaled. The reference in use is named on the spectrum and comparison captions. The default is the reference stored in the file.
+Both spectral and cycle analysis remove a straight-line drift from each channel before processing. Welch uses the detrended signal for its power estimate, while bycycle detrends before bandpass filtering.
 
-A burst count is split in two. Burst cycles are cycles that passed the burst rule. Burst episodes are the separate runs of those cycles. Save session writes `metadata.json` and a one-row-per-peak table beside the spectrum CSV.
+Rejected samples stay rejected. BAD annotations, marked bad channels and nonfinite samples are excluded rather than replaced with zeros. Cycles aren't allowed to cross rejected gaps.
 
-## Time
+If cycles are detected but don't form a qualifying burst, the Cycles page shows which threshold stopped them. The library rule requires monotonicity above 0.8 across three consecutive cycles.
 
-The Time tab uses the same fit window, reference, and rejected samples as the spectrum. Spectrogram is the default: power across the recording, with burst episodes drawn on it when the cycle fit has them. Click a time and the trace scrolls there. Set fit window writes that stretch into the fit bar; Refit still has to be pressed.
+Burst counts are separated into two measurements:
 
-The other views on that tab are the sliding specparam fit, burst episodes, burst lengths, cycle shape, amplitude against cycle frequency, band power around eye marks when a file actually has them, coherence, phase–amplitude coupling, and a quality timeline. Two separate files are not given an invented transition. Coupling is off the ordinary refit and says when the recording is too short.
+- **Burst cycles:** Individual cycles meeting the burst criteria.
+- **Burst episodes:** Separate continuous runs of qualifying cycles.
 
-What each page and control does, and what is not in the window yet, is in [docs/running.md](docs/running.md). That file is the one to change when the window changes.
+That way you can distinguish a rhythm producing plenty of individual cycles from one that actually holds together for sustained periods.
+
+## EO/EC states and comparison
+
+WinEEG files containing eyes-open or eyes-closed marks can be split into their respective states. If both are present, both can be loaded from the same recording.
+
+Clock-time marks are preserved as notes rather than treated as state boundaries. Separate EO and EC files still work normally.
+
+The comparison keeps two measurements separate.
+
+**Peak Δ** is the EC fitted peak height minus the EO fitted peak height, measured above the aperiodic background in log10 power. Each state uses its own detected peak. If a peak isn't present, the value stays missing.
+
+**Δ band %** compares mean Welch power within the selected band:
+
+`(EC − EO) / EO × 100`
+
+That's the percentage change between recordings, not the percentage of total spectral power occupied by the band. If EO power is missing or nonpositive, the result stays blank.
+
+The Spectrum page's Height column reports fitted peak height, not total Welch band power.
+
+This lets you check whether alpha attenuation during EO, or an increase during EC, is coming from a more prominent oscillatory peak or a broader change in spectral power.
+
+## Epoch analysis
+
+You can analyze the whole selected window or break it into non-overlapping 30- or 60-second epochs.
+
+Each epoch gets its own spectral fit.
+
+Peaks with centers within 1 Hz are grouped, and their reported frequency, height and width are calculated from the median of the epochs containing that peak.
+
+If an epoch doesn't contain the peak, it isn't counted as zero. This keeps an intermittent rhythm from appearing artificially weaker simply because it wasn't present throughout the recording.
+
+The caption tells you how many epochs actually contained an in-band peak.
+
+Offset, exponent and R² are calculated from the medians of successfully fitted epochs, while the displayed spectrum is their mean.
+
+Changes to epochs, reference or amplitude limits require **Refit**.
+
+## Fit quality and signal checks
+
+The app also flags measurements that need a closer look.
+
+Fits with R² below 0.6 are ringed on the head map. Peaks sitting against the minimum allowed width are marked.
+
+Recordings with suspicious voltage scales are flagged beside the filename rather than silently rescaled.
+
+The active reference is shown in the Spectrum and Compare captions. By default, the app uses the reference stored in the recording.
+
+These checks matter because a clean-looking graph doesn't necessarily mean the fit or the original signal is reliable.
+
+## Time analysis
+
+The Time tab uses the same recording window, reference and accepted samples as the spectral analysis.
+
+The default view is a spectrogram showing how power changes across frequency and time, with detected burst episodes overlaid when available.
+
+Clicking a point in time moves the trace display to that location. **Set fit window** sends the selected interval to the fit controls, but you still need to press Refit to recalculate the analysis.
+
+Other views include:
+
+- Sliding-window specparam fits to track exponent and peaks over time.
+- Burst timelines, episode lengths and cycle morphology.
+- Cycle amplitude against frequency.
+- Band-power changes around actual EO/EC event marks.
+- Coherence and phase–amplitude coupling.
+- Signal-quality and rejected-sample timelines.
+
+Separate EO and EC recordings aren't treated as though a real-time transition occurred between them.
+
+Coupling analysis runs separately from the normal refit and warns when there isn't enough usable recording time.
+
+## Saving and exporting
+
+Session exports include `metadata.json`, the spectrum CSV and a separate table containing one row per fitted peak.
+
+This keeps the measurements alongside the settings used to generate them, making it easier to compare recordings or check results later.
+
+## What it's useful for
+
+Mainly looking at amplitude and frequency distributions in more detail without bunching all the activity into one band value.
+
+You can see where rhythmic peaks sit against the background slope, how stable those peaks are, and whether the underlying oscillations are sustained or only appearing in short bursts.
+
+It could be useful for checking EO/EC alpha reactivity, looking at differences between sites, investigating unusual band-power distributions or seeing what actually changed between recordings and training sessions.
+
+It's an analysis tool, not an automatic diagnosis or protocol generator. The measurements still need to be checked against the raw EEG, recording conditions, artifacts and clinical context.
+
+## Documentation
+
+The controls and calculations are documented in [docs/running.md](docs/running.md).
+
+That document should be updated whenever the interface or processing changes.
 
 ## Screenshots
 
-These are a 60 second section of an eyes-closed and eyes-open EDF, from 120 s to 180 s. The names in the title bar are placeholders. The trace page is 158–173 s, where the occipital 10 Hz rhythm is strongest. The Time page is the spectrogram of that same window. Findings is the reading of this fit. Nothing identifying was left in the window.
+The screenshots use a 60-second section of EO and EC EDF recordings, from 120–180 seconds.
+
+The trace view shows 158–173 seconds, where the occipital 10 Hz rhythm is most prominent. The Time page shows the spectrogram for the selected window, and Findings contains the interpretation of that fit.
+
+The filenames shown are placeholders, with identifying information excluded from the interface.
 
 ![Traces](docs/screenshots/traces.png)
 

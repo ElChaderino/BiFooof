@@ -109,10 +109,12 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "", mark_hz:
     item = fit.channels[chosen]
     clear_figure(fig)
     finish_figure(fig)
-    grid = fig.add_gridspec(3, 2, height_ratios=[2.0, 0.72, 1.35])
-    spectrum = fig.add_subplot(grid[0, :])
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.12, 1.0], wspace=0.06)
+    curves = outer[0, 0].subgridspec(4, 1, height_ratios=[1.25, 1.2, 1.1, 0.72], hspace=0.06)
+    heads = outer[0, 1].subgridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.14)
+    spectrum = fig.add_subplot(curves[:3, 0])
     spectrum.set_label("spectrum")
-    residual = fig.add_subplot(grid[1, :], sharex=spectrum)
+    residual = fig.add_subplot(curves[3, 0], sharex=spectrum)
     residual.set_label("residual")
     if item.freqs is None or item.spectrum is None:
         spectrum.axis("off")
@@ -147,8 +149,8 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "", mark_hz:
     names = [channel.name for channel in fit.channels]
     weak = [channel.r_squared is not None and channel.r_squared < R2_WEAK for channel in fit.channels]
     floors = [weak[index] or channel.peak_at_width_floor for index, channel in enumerate(fit.channels)]
-    draw_head(fig.add_subplot(grid[2, 0]), names, exponents, f"Exponent  {fit.fmin:g}–{fit.fmax:.0f} Hz", "viridis", item.name, weak)
-    draw_head(fig.add_subplot(grid[2, 1]), names, centers, "Peak frequency (Hz)", "plasma", item.name, floors)
+    draw_head(fig.add_subplot(heads[0, 0]), names, exponents, f"Exponent  {fit.fmin:g}–{fit.fmax:.0f} Hz", "viridis", item.name, weak)
+    draw_head(fig.add_subplot(heads[1, 0]), names, centers, "Peak frequency (Hz)", "plasma", item.name, floors)
     stamp_figure(fig)
 
 
@@ -174,8 +176,10 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     rows = compare_spectra(eyes_closed, eyes_open, alpha, peak_width_low)
     clear_figure(fig)
     finish_figure(fig)
-    grid = fig.add_gridspec(2, 2, height_ratios=[2.0, 1.45])
-    ax = fig.add_subplot(grid[0, :])
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.12, 1.0], wspace=0.06)
+    curves = outer[0, 0].subgridspec(4, 1, height_ratios=[1.25, 1.2, 1.1, 0.72], hspace=0.06)
+    maps = outer[0, 1].subgridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.14)
+    ax = fig.add_subplot(curves[:3, 0])
     fmin = min(eyes_closed.fmin, eyes_open.fmin)
     fmax = max(eyes_closed.fmax, eyes_open.fmax)
     mark_spectrum(ax, fmin, fmax)
@@ -189,13 +193,13 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     style_axes(ax, grid=True)
     names = [row.name for row in rows]
     draw_head(
-        fig.add_subplot(grid[1, 0]), names,
+        fig.add_subplot(maps[0, 0]), names,
         [row.exponent_delta for row in rows],
         f"Exponent  {fmin:g}–{fmax:.0f} Hz  EO − EC", "viridis", channel,
         [_weak_fit(row.r_squared_ec) or _weak_fit(row.r_squared_eo) for row in rows],
     )
     draw_head(
-        fig.add_subplot(grid[1, 1]), names,
+        fig.add_subplot(maps[1, 0]), names,
         [row.alpha_reactivity for row in rows],
         f"{shown} peak height  EC − EO", "plasma", channel,
         [
@@ -203,8 +207,39 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
             for row in rows
         ],
     )
+    _peak_lines(fig.add_subplot(curves[3, 0]), rows)
     stamp_figure(fig)
     return rows
+
+
+def _peak_lines(ax, rows) -> None:
+    """Saved comparison uses the same slopegraph as the Compare page."""
+    ax.set_xlim(-0.35, 1.35)
+    ax.set_xticks([0, 1], ["Eyes closed", "Eyes open"])
+    drawn = 0
+    for row in rows:
+        pair = []
+        xpos = []
+        if row.alpha_power_ec is not None and np.isfinite(row.alpha_power_ec):
+            pair.append(float(row.alpha_power_ec))
+            xpos.append(0)
+        if row.alpha_power_eo is not None and np.isfinite(row.alpha_power_eo):
+            pair.append(float(row.alpha_power_eo))
+            xpos.append(1)
+        if not pair:
+            continue
+        if len(pair) == 2:
+            ax.plot(xpos, pair, color="#9aafc4", lw=0.7, zorder=1)
+            drawn += 1
+        ax.scatter([xpos[0]], [pair[0]], s=16, color=_EC if xpos[0] == 0 else _EO, zorder=2, linewidths=0)
+        if len(pair) == 2:
+            ax.scatter([1], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
+    ax.set_ylabel("Peak height")
+    ax.set_title(
+        f"One line per channel   ·   {drawn} with both peaks   ·   a missing peak is a dot",
+        fontsize=9, loc="left",
+    )
+    style_axes(ax, grid=True)
 
 
 def render_cycles(fig, fit: CycleFit, seconds: float = 10.0) -> None:

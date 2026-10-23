@@ -71,8 +71,8 @@ class SpectrumPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setMinimumWidth(520)
-        self.table.setMaximumWidth(680)
+        self.table.setMinimumWidth(460)
+        self.table.setMaximumWidth(560)
         self.table.setAlternatingRowColors(True)
         self.table.itemSelectionChanged.connect(self._on_table)
 

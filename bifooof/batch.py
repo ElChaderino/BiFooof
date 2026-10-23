@@ -168,7 +168,7 @@ def compare_files(eyes_closed: str | Path, eyes_open: str | Path, out_dir: str |
         if peaks:
             written.append(write_csv(destination / f"{key}_peaks.csv", peaks))
     if plots:
-        fig = Figure(figsize=(10, 7), dpi=120, facecolor="white")
+        fig = Figure(figsize=(10, 8.4), dpi=120, facecolor="white")
         render_comparison(
             fig, closed_fit, opened_fit, name, fit_settings.alpha_band(), fit_settings.peak_width_low,
         )

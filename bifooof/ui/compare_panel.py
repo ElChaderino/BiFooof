@@ -74,7 +74,8 @@ class ComparePanel(QWidget):
         pair.addWidget(self.custom_left)
         pair.addWidget(self.custom_right)
         pair.addStretch(1)
-        self.canvas = MplCanvas(width=8.0, height=6.0)
+        self.canvas = MplCanvas(width=8.0, height=6.4)
+        self.canvas.setMinimumHeight(340)
         self.table = QTableWidget(0, 17)
         self._refresh_headers()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -83,7 +84,8 @@ class ComparePanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setMaximumHeight(188)
+        self.table.setMinimumWidth(480)
+        self.table.setMaximumWidth(620)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.setAlternatingRowColors(True)
         self.table.itemSelectionChanged.connect(self._on_table)
@@ -93,20 +95,29 @@ class ComparePanel(QWidget):
         self.cycle_table.verticalHeader().setVisible(False)
         self.cycle_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.cycle_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.cycle_table.setMaximumHeight(236)
+        self.cycle_table.setMaximumHeight(268)
+        self.cycle_table.setMinimumWidth(480)
+        self.cycle_table.setMaximumWidth(620)
         self.cycle_table.setAlternatingRowColors(True)
         self.cycle_note = QLabel("")
         self.cycle_note.setObjectName("Muted")
         self.cycle_note.setWordWrap(True)
         self.cycle_note.setVisible(False)
 
-        root = QVBoxLayout(self)
-        root.addLayout(pair)
-        root.addWidget(self.caption)
-        root.addWidget(self.canvas, 1)
-        root.addWidget(self.cycle_table)
-        root.addWidget(self.cycle_note)
-        root.addWidget(self.table)
+        plots = QVBoxLayout()
+        plots.setSpacing(6)
+        plots.addLayout(pair)
+        plots.addWidget(self.caption)
+        plots.addWidget(self.canvas, 1)
+        side = QVBoxLayout()
+        side.setSpacing(6)
+        side.addWidget(self.cycle_table)
+        side.addWidget(self.cycle_note)
+        side.addWidget(self.table, 1)
+        root = QHBoxLayout(self)
+        root.setSpacing(10)
+        root.addLayout(plots, 1)
+        root.addLayout(side)
         self._empty("Open both an eyes-closed and an eyes-open file to compare them.")
         self._fill_cycles(None, None)
 
@@ -277,8 +288,10 @@ class ComparePanel(QWidget):
         fig = self.canvas.fig
         clear_figure(fig)
         finish_figure(fig)
-        grid = fig.add_gridspec(3, 2, height_ratios=[2.0, 1.25, 1.05])
-        ax = fig.add_subplot(grid[0, :])
+        outer = fig.add_gridspec(1, 2, width_ratios=[1.12, 1.0], wspace=0.06)
+        curves = outer[0, 0].subgridspec(4, 1, height_ratios=[1.25, 1.2, 1.1, 0.72], hspace=0.06)
+        maps = outer[0, 1].subgridspec(2, 1, height_ratios=[1.0, 1.0], hspace=0.14)
+        ax = fig.add_subplot(curves[:3, 0])
         ec_item = _by_name(self.fits.get("ec"), self.channel)
         eo_item = _by_name(self.fits.get("eo"), self.channel)
         fmin = min(item.fmin for item in self.fits.values())
@@ -286,12 +299,12 @@ class ComparePanel(QWidget):
         mark_spectrum(ax, fmin, fmax)
         alpha = self._alpha()
         shown = band_phrase(*alpha)
-        left, right, short_left, short_right = self._names()
-        _plot_condition(ax, ec_item, _EC, left, alpha)
-        _plot_condition(ax, eo_item, _EO, right, alpha)
+        side_left, side_right, short_left, short_right = self._names()
+        _plot_condition(ax, ec_item, _EC, side_left, alpha)
+        _plot_condition(ax, eo_item, _EO, side_right, alpha)
         ax.set_xlabel("")
         ax.set_ylabel("log10 power")
-        pair = "eyes closed vs eyes open" if self.mode.currentData() == "state" else f"{left} vs {right}"
+        pair = "eyes closed vs eyes open" if self.mode.currentData() == "state" else f"{side_left} vs {side_right}"
         ax.set_title(
             f"{self.channel}   ·   {pair}   ·   {shown}",
             fontsize=10, loc="left",
@@ -302,17 +315,17 @@ class ComparePanel(QWidget):
         names = [row.name for row in self.rows]
         weak = [_weak(row.r_squared_ec) or _weak(row.r_squared_eo) for row in self.rows]
         draw_head(
-            fig.add_subplot(grid[1, 0]), names,
+            fig.add_subplot(maps[0, 0]), names,
             [row.exponent_delta for row in self.rows],
             f"Exponent  {fmin:g}–{fmax:.0f} Hz  {short_right} − {short_left}", "viridis", self.channel, weak,
         )
         draw_head(
-            fig.add_subplot(grid[1, 1]), names,
+            fig.add_subplot(maps[1, 0]), names,
             [row.alpha_reactivity for row in self.rows],
             f"{shown} peak height  {short_left} − {short_right}", "plasma", self.channel,
             [weak[index] or row.peak_at_floor_ec or row.peak_at_floor_eo for index, row in enumerate(self.rows)],
         )
-        _paired_dots(fig.add_subplot(grid[2, :]), self.rows, left, right)
+        _paired_dots(fig.add_subplot(curves[3, 0]), self.rows, side_left, side_right)
         stamp_figure(fig)
         self.canvas.draw_idle()
         chosen = next((row for row in self.rows if row.name == self.channel), None)
@@ -452,15 +465,18 @@ def _paired_dots(ax, rows, left: str, right: str) -> None:
         if row.alpha_power_eo is not None and np.isfinite(row.alpha_power_eo):
             pair.append(float(row.alpha_power_eo))
             xpos.append(1)
-        if len(pair) < 2:
+        if not pair:
             continue
-        ax.plot(xpos, pair, color="#9aafc4", lw=0.7, zorder=1)
-        ax.scatter([0], [pair[0]], s=16, color=_EC, zorder=2, linewidths=0)
-        ax.scatter([1], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
-        drawn += 1
+        if len(pair) == 2:
+            ax.plot(xpos, pair, color="#9aafc4", lw=0.7, zorder=1)
+            drawn += 1
+        color = _EC if xpos[0] == 0 else _EO
+        ax.scatter([xpos[0]], [pair[0]], s=16, color=color, zorder=2, linewidths=0)
+        if len(pair) == 2:
+            ax.scatter([xpos[1]], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
     ax.set_ylabel("Peak height")
     ax.set_title(
-        f"One line per channel present on both sides   ·   {drawn} channels",
+        f"One line per channel   ·   {drawn} with both peaks   ·   a missing peak is a dot",
         fontsize=9, loc="left",
     )
     style_axes(ax, grid=True)

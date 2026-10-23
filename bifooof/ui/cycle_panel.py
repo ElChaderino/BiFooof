@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QScrollBar,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..analysis.cycles import BANDS, CycleFit, fit_cycles
@@ -78,7 +78,7 @@ class CyclePanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setMaximumHeight(150)
+        self.table.setMinimumHeight(88)
         self.table.setAlternatingRowColors(True)
 
         self.cutoffs = QTableWidget(4, 4)
@@ -86,7 +86,7 @@ class CyclePanel(QWidget):
         self.cutoffs.verticalHeader().setVisible(False)
         self.cutoffs.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.cutoffs.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.cutoffs.setMaximumHeight(148)
+        self.cutoffs.setMinimumHeight(88)
         self.cutoffs.setAlternatingRowColors(True)
         self.cutoffs.setToolTip(
             "A cycle passes when its value is strictly above the cutoff. "
@@ -98,19 +98,48 @@ class CyclePanel(QWidget):
         self.episodes.verticalHeader().setVisible(False)
         self.episodes.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.episodes.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.episodes.setMaximumHeight(132)
+        self.episodes.setMinimumHeight(72)
         self.episodes.setAlternatingRowColors(True)
         self.episodes.setToolTip("Each row is one contiguous burst. A burst cannot cross a rejected stretch.")
 
+        plot = QWidget()
+        plot_layout = QVBoxLayout(plot)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(4)
+        plot_layout.addWidget(self.canvas, 1)
+        plot_layout.addWidget(self.scroll)
+        tables = QWidget()
+        table_layout = QVBoxLayout(tables)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(6)
+        table_layout.addWidget(self.table, 4)
+        table_layout.addWidget(self.cutoffs, 4)
+        table_layout.addWidget(self.episodes, 3)
+        self._split = QSplitter(Qt.Vertical)
+        self._split.setChildrenCollapsible(False)
+        self._split.addWidget(plot)
+        self._split.addWidget(tables)
+        self._split.setStretchFactor(0, 3)
+        self._split.setStretchFactor(1, 2)
+        self._split_ready = False
+        self.canvas.setMinimumHeight(220)
         root = QVBoxLayout(self)
         root.addLayout(controls)
         root.addWidget(self.caption)
-        root.addWidget(self.canvas, 1)
-        root.addWidget(self.scroll)
-        root.addWidget(self.table)
-        root.addWidget(self.cutoffs)
-        root.addWidget(self.episodes)
+        root.addWidget(self._split, 1)
         self._empty("Open a recording, then pick a channel.")
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._split_ready:
+            QTimer.singleShot(0, self._give_plot_the_room)
+
+    def _give_plot_the_room(self) -> None:
+        height = self._split.height()
+        if height < 240:
+            return
+        self._split_ready = True
+        self._split.setSizes([int(height * 0.58), int(height * 0.42)])
 
     def set_recording(self, recording: Recording, selected: int | None = None) -> None:
         self.recording = recording

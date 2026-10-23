@@ -40,8 +40,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"BiFooof  —  spectral studio  v{__version__}")
-        self.resize(1360, 880)
-        self.setMinimumSize(1120, 700)
+        self.resize(1560, 1020)
+        self.setMinimumSize(1180, 780)
         self.setWindowIcon(icons.app_icon())
         self.recordings: dict[str, Recording] = {}
         self.sources: dict[str, Recording] = {}

@@ -20,7 +20,7 @@ The raw recording, in microvolts, for the page length and gain on that page. A c
 
 specparam on the fit-bar window. The curve is the Welch spectrum, the model, and the aperiodic part, in log10 power. Under it is the residual, spectrum minus model, on the same frequency axis. Click either axes and the caption reports the residual at the nearest bin.
 
-The head maps are the exponent and the in-band peak frequency. A weak fit, R² below 0.6, is ringed. A peak at the narrowest allowed width is marked. A site with no fit is empty.
+The head maps sit to the right of the spectrum, exponent above peak frequency, large enough to read every site. A weak fit, R² below 0.6, is ringed. A peak at the narrowest allowed width is marked. A site with no fit is empty.
 
 Epochs, 30 s or 60 s, still collapse to one spectrum. Peaks within 1 Hz are grouped. Center, height, and width are medians of the epochs that found the peak. An epoch that missed it is left out of the median. The Time tab does not use that collapse. Each sliding window stays its own fit.
 
@@ -40,7 +40,7 @@ The pair menu only changes words:
 - **Pre / Post.** Pre is the file opened as eyes closed. Post is the file opened as eyes open. The caption says a difference between sessions is not a treatment effect.
 - **Custom.** Two names you type. The same sentence, for any two recordings.
 
-Peak Δ is left-hand fitted peak height minus right-hand fitted peak height, in log10 power. Each side keeps its own tallest peak in the band. Δ band % is `(left − right) / right × 100` for mean Welch power in the band. It stays blank when the right-hand power is missing or not positive. The plot is the two spectra, the head maps of the exponent difference and the peak-height difference, and one line per channel between the two in-band peak heights. A side with no peak is a dot by itself. A missing peak is not drawn as zero.
+Peak Δ is left-hand fitted peak height minus right-hand fitted peak height, in log10 power. Each side keeps its own tallest peak in the band. Δ band % is `(left − right) / right × 100` for mean Welch power in the band. It stays blank when the right-hand power is missing or not positive. The figure matches Spectrum: the two spectra are on the left, with one line per channel of in-band peak height underneath, and the head maps of the exponent difference and the peak-height difference are on the right. The cycle measures and the channel table sit beside the figure, not under it. A side with no peak is a dot by itself. A missing peak is not drawn as zero.
 
 Findings uses those same names. The default is eyes closed and eyes open. Pre / Post and a custom pair are written with the names on Compare. It restates measurements. It does not assign a diagnosis.
 
