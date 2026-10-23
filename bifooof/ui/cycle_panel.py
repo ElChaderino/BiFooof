@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel, QScrollBar,
-    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QScrollArea,
+    QScrollBar, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..analysis.cycles import BANDS, CycleFit, fit_cycles
@@ -78,7 +78,8 @@ class CyclePanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setMinimumHeight(88)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
         self.table.setAlternatingRowColors(True)
 
         self.cutoffs = QTableWidget(4, 4)
@@ -86,7 +87,8 @@ class CyclePanel(QWidget):
         self.cutoffs.verticalHeader().setVisible(False)
         self.cutoffs.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.cutoffs.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.cutoffs.setMinimumHeight(88)
+        self.cutoffs.setWordWrap(False)
+        self.cutoffs.verticalHeader().setDefaultSectionSize(28)
         self.cutoffs.setAlternatingRowColors(True)
         self.cutoffs.setToolTip(
             "A cycle passes when its value is strictly above the cutoff. "
@@ -98,7 +100,8 @@ class CyclePanel(QWidget):
         self.episodes.verticalHeader().setVisible(False)
         self.episodes.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.episodes.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.episodes.setMinimumHeight(72)
+        self.episodes.setWordWrap(False)
+        self.episodes.verticalHeader().setDefaultSectionSize(28)
         self.episodes.setAlternatingRowColors(True)
         self.episodes.setToolTip("Each row is one contiguous burst. A burst cannot cross a rejected stretch.")
 
@@ -112,13 +115,21 @@ class CyclePanel(QWidget):
         table_layout = QVBoxLayout(tables)
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.setSpacing(6)
-        table_layout.addWidget(self.table, 4)
-        table_layout.addWidget(self.cutoffs, 4)
-        table_layout.addWidget(self.episodes, 3)
+        table_layout.addWidget(self.table)
+        table_layout.addWidget(self.cutoffs)
+        table_layout.addWidget(self.episodes)
+        table_layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(tables)
+        self._fit_table(self.table, 8)
+        self._fit_table(self.cutoffs, 8)
+        self._fit_table(self.episodes, 6)
         self._split = QSplitter(Qt.Vertical)
         self._split.setChildrenCollapsible(False)
         self._split.addWidget(plot)
-        self._split.addWidget(tables)
+        self._split.addWidget(scroll)
         self._split.setStretchFactor(0, 3)
         self._split.setStretchFactor(1, 2)
         self._split_ready = False
@@ -139,7 +150,7 @@ class CyclePanel(QWidget):
         if height < 240:
             return
         self._split_ready = True
-        self._split.setSizes([int(height * 0.58), int(height * 0.42)])
+        self._split.setSizes([int(height * 0.52), int(height * 0.48)])
 
     def set_recording(self, recording: Recording, selected: int | None = None) -> None:
         self.recording = recording
@@ -299,6 +310,18 @@ class CyclePanel(QWidget):
         self._configure_scroll()
         self._draw()
 
+    def _fit_table(self, table: QTableWidget, max_rows: int) -> None:
+        """Give the table the height of its rows so the next table cannot draw over it."""
+        table.resizeRowsToContents()
+        shown = min(table.rowCount(), max_rows)
+        height = table.horizontalHeader().sizeHint().height() + table.frameWidth() * 2 + 8
+        if shown <= 0:
+            height += 32
+        else:
+            height += sum(max(table.rowHeight(index), 26) for index in range(shown))
+        table.setFixedHeight(height)
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
     def _fill_table(self) -> None:
         fit = self.fit
         rows = [
@@ -311,6 +334,7 @@ class CyclePanel(QWidget):
             self.table.setItem(row, 0, _cell(label))
             self.table.setItem(row, 1, _cell(_num(all_cycles)))
             self.table.setItem(row, 2, _cell(_num(bursts)))
+        self._fit_table(self.table, 8)
         self._fill_cutoffs()
         self._fill_episodes()
 
@@ -322,12 +346,14 @@ class CyclePanel(QWidget):
             self.cutoffs.setItem(0, 0, _cell("—"))
             for column in range(1, 4):
                 self.cutoffs.setItem(0, column, _cell(""))
+            self._fit_table(self.cutoffs, 8)
             return
         for row, cutoff in enumerate(rows):
             self.cutoffs.setItem(row, 0, _cell(cutoff.label.capitalize()))
             self.cutoffs.setItem(row, 1, _cell(f"{cutoff.cutoff:g}"))
             self.cutoffs.setItem(row, 2, _cell(_num(cutoff.median)))
             self.cutoffs.setItem(row, 3, _cell(f"{cutoff.n_passed} / {cutoff.n_cycles}"))
+        self._fit_table(self.cutoffs, 8)
 
     def _fill_episodes(self) -> None:
         fit = self.fit
@@ -337,6 +363,7 @@ class CyclePanel(QWidget):
             self.episodes.setItem(0, 0, _cell("No burst episodes"))
             for column in range(1, 5):
                 self.episodes.setItem(0, column, _cell(""))
+            self._fit_table(self.episodes, 6)
             return
         for row, episode in enumerate(rows):
             self.episodes.setItem(row, 0, _cell(f"{episode.start_s:.3f}"))
@@ -344,6 +371,7 @@ class CyclePanel(QWidget):
             self.episodes.setItem(row, 2, _cell(str(episode.n_cycles)))
             self.episodes.setItem(row, 3, _cell(_num(episode.period_ms)))
             self.episodes.setItem(row, 4, _cell(_num(episode.volt_amp)))
+        self._fit_table(self.episodes, 6)
 
     def _empty(self, message: str) -> None:
         self.canvas.clear()

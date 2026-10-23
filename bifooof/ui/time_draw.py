@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 
 from ..analysis.coherence import CoherenceResult, zero_lag_mask
 from ..analysis.cycles import CycleFit
@@ -137,22 +139,55 @@ def draw_raster(fig, fits: list[CycleFit], inspection) -> None:
         return
     yticks = []
     labels = []
+    placed = []
     for row, fit in enumerate(fits):
         y = len(fits) - 1 - row
         yticks.append(y)
         labels.append(fit.channel)
+        ax.axhspan(y - 0.5, y + 0.5, color="#f4f7fb" if row % 2 == 0 else "#ffffff", zorder=0)
         for episode in fit.episodes:
-            ax.barh(
-                y, episode.end_s - episode.start_s, left=episode.start_s, height=0.45,
-                color=_TEAL, align="center", zorder=2,
-            )
+            placed.append((y, episode))
+    amps = np.array([
+        episode.volt_amp if episode.volt_amp is not None else np.nan
+        for _y, episode in placed
+    ], dtype=np.float64)
+    finite = amps[np.isfinite(amps)]
+    mapper = None
+    if finite.size:
+        low, high = np.percentile(finite, [5, 95])
+        if high <= low:
+            high = low + 1.0
+        mapper = ScalarMappable(norm=Normalize(vmin=float(low), vmax=float(high)), cmap="viridis")
+        mapper.set_array([])
+    for y, episode in placed:
+        width = max(episode.end_s - episode.start_s, 1e-3)
+        if mapper is not None and episode.volt_amp is not None and np.isfinite(episode.volt_amp):
+            color = mapper.to_rgba(episode.volt_amp)
+        else:
+            color = _TEAL
+        ax.barh(y, width, left=episode.start_s, height=0.62, color=color, align="center", zorder=2)
+    if mapper is not None:
+        bar = fig.colorbar(mapper, ax=ax, pad=0.01, fraction=0.03)
+        bar.set_label("Amplitude (µV)", fontsize=8, color=_TRACE)
+        bar.ax.tick_params(labelsize=7, colors=_MUTED)
+        bar.outline.set_edgecolor("#d2dbe6")
+    starts = [episode.start_s for _y, episode in placed]
+    ends = [episode.end_s for _y, episode in placed]
+    if starts:
+        span = max(ends) - min(starts)
+        pad = max(0.4, span * 0.04)
+        ax.set_xlim(min(starts) - pad, max(ends) + pad)
     ax.set_yticks(yticks)
     ax.set_yticklabels(labels)
     ax.set_xlabel("Time (s)")
-    ax.set_ylim(-0.8, len(fits) - 0.2)
+    ax.set_ylim(-0.7, max(len(fits) - 0.3, 0.7))
     _cursor(ax, inspection)
-    ax.set_title("Burst episodes. Shared timing is not connectivity.", fontsize=9, loc="left")
-    style_axes(ax)
+    count = len(placed)
+    ax.set_title(
+        f"{count} burst episodes   ·   color is amplitude   ·   shared timing is not connectivity",
+        fontsize=9, loc="left",
+    )
+    style_axes(ax, grid=True)
     stamp_figure(fig)
 
 
@@ -176,17 +211,30 @@ def draw_durations(fig, groups: list[tuple[str, np.ndarray]]) -> None:
     colors = (_BLUE, _ORANGE, _TEAL)
     for index, (label, values) in enumerate(present):
         color = colors[index % len(colors)]
-        hist.hist(values, bins=edges, histtype="step", color=color, lw=1.6, label=label)
+        hist.hist(
+            values, bins=edges, color=color, alpha=0.72, edgecolor="white", lw=0.6, label=label,
+        )
         ordered = np.sort(values[np.isfinite(values)])
         if ordered.size:
-            curve.plot(ordered, np.arange(1, ordered.size + 1) / ordered.size, color=color, lw=1.4, label=label)
+            median = float(np.median(ordered))
+            hist.axvline(median, color=color, lw=1.1, ls=":", zorder=3)
+            curve.plot(
+                ordered, np.arange(1, ordered.size + 1) / ordered.size,
+                color=color, lw=1.8, label=label,
+            )
+            curve.scatter([median], [0.5], s=28, color=color, zorder=4)
     hist.set_ylabel("Episodes")
     hist.legend(frameon=False, fontsize=8)
-    curve.set_ylabel("Cumulative")
+    curve.set_ylabel("Share of episodes")
     curve.set_xlabel("Burst duration (s)")
     curve.set_ylim(-0.02, 1.05)
+    curve.axhline(0.5, color="#d2dbe6", lw=0.8, zorder=1)
     title = present[0][0] if len(present) == 1 else "Same bins, both recordings"
-    hist.set_title(f"{title}   ·   {pooled.size} episodes", fontsize=9, loc="left")
+    median = float(np.median(pooled[np.isfinite(pooled)]))
+    hist.set_title(
+        f"{title}   ·   {pooled.size} episodes   ·   median {median:.2f} s",
+        fontsize=9, loc="left",
+    )
     for ax in (hist, curve):
         style_axes(ax, grid=True)
     stamp_figure(fig)
@@ -241,22 +289,38 @@ def draw_scatter(fig, groups: list[tuple[str, CycleFit, str]], bursts_only: bool
         if len(groups) == 1:
             other = ~bursts
             if np.any(other):
-                ax.scatter(freqs[other], amps[other], s=12, color="#9aafc4", linewidths=0, label="Cycle", zorder=2)
+                ax.scatter(
+                    freqs[other], amps[other], s=28, color="#9aafc4", alpha=0.75,
+                    linewidths=0.4, edgecolors="white", label="Cycle", zorder=2,
+                )
             if np.any(bursts):
-                ax.scatter(freqs[bursts], amps[bursts], s=14, color=_TEAL, linewidths=0, label="Burst cycle", zorder=3)
+                ax.scatter(
+                    freqs[bursts], amps[bursts], s=36, color=_TEAL, alpha=0.9,
+                    linewidths=0.4, edgecolors="white", label="Burst cycle", zorder=3,
+                )
         else:
-            ax.scatter(freqs, amps, s=14, color=color, linewidths=0, label=label, zorder=3)
+            ax.scatter(
+                freqs, amps, s=32, color=color, alpha=0.8,
+                linewidths=0.4, edgecolors="white", label=label, zorder=3,
+            )
         drawn_x.append(freqs)
         drawn_y.append(amps)
     if not any_points:
         _blank(ax, "No cycles to plot.")
         stamp_figure(fig)
         return
-    _describe_cloud(ax, np.concatenate(drawn_x), np.concatenate(drawn_y))
+    cloud_x = np.concatenate(drawn_x)
+    cloud_y = np.concatenate(drawn_y)
+    _describe_cloud(ax, cloud_x, cloud_y)
+    _frame_cloud(ax, cloud_x, cloud_y)
     ax.set_xlabel("Cycle frequency (Hz)")
     ax.set_ylabel("Amplitude (µV)")
     title = groups[0][1].channel if len(groups) == 1 else "Colored by recording"
-    ax.set_title(f"{title}   ·   one point per cycle", fontsize=9, loc="left")
+    count = int(np.isfinite(cloud_x).sum())
+    ax.set_title(
+        f"{title}   ·   {count} cycles   ·   frame is the central spread",
+        fontsize=9, loc="left",
+    )
     ax.legend(frameon=False, fontsize=8)
     style_axes(ax, grid=True)
     stamp_figure(fig)
@@ -583,7 +647,11 @@ def _shape_histograms(fig, layout, fit: CycleFit, bursts_only: bool) -> None:
             ax.axis("off")
             ax.set_title(label, fontsize=8, loc="left")
             continue
-        ax.hist(values, bins=min(12, max(4, int(np.sqrt(values.size)))), color="#d6e4f0", edgecolor=_BLUE, lw=0.6)
+        ax.hist(
+            values, bins=min(12, max(4, int(np.sqrt(values.size)))),
+            color="#d6e4f0", edgecolor=_BLUE, lw=0.6,
+        )
+        ax.axvline(float(np.median(values)), color=_TRACE, lw=1.0, ls=":")
         ax.set_title(label, fontsize=8, loc="left")
         style_axes(ax)
 
@@ -600,7 +668,25 @@ def _describe_cloud(ax, freqs, amps) -> None:
     residual = amps[order] - line
     low, high = np.percentile(residual, [10, 90])
     ax.fill_between(freqs[order], line + low, line + high, color="#d5dde6", alpha=0.7, lw=0, zorder=1)
-    ax.plot(freqs[order], line, color=_TRACE, lw=1.1, zorder=2, label="Line through these points")
+    ax.plot(freqs[order], line, color=_TRACE, lw=1.2, zorder=4, label="Line through every point")
+
+
+def _frame_cloud(ax, freqs, amps) -> None:
+    """Keep one extreme cycle from flattening the cloud. The line still uses every point."""
+    finite = np.isfinite(freqs) & np.isfinite(amps)
+    freqs = np.asarray(freqs, dtype=np.float64)[finite]
+    amps = np.asarray(amps, dtype=np.float64)[finite]
+    if freqs.size < 5:
+        return
+    x_low, x_high = np.percentile(freqs, [2, 98])
+    y_low, y_high = np.percentile(amps, [2, 98])
+    x_pad = max((x_high - x_low) * 0.08, 0.15)
+    y_pad = max((y_high - y_low) * 0.08, 0.5)
+    floor = float(y_low - y_pad)
+    if y_low >= 0:
+        floor = max(0.0, floor)
+    ax.set_xlim(float(x_low - x_pad), float(x_high + x_pad))
+    ax.set_ylim(floor, float(y_high + y_pad))
 
 
 def _track_sizes(heights) -> np.ndarray:

@@ -186,6 +186,14 @@ class TimePanel(QWidget):
         view.setObjectName("Muted")
         controls.addWidget(view)
         controls.addWidget(self.mode)
+        channel_label = QLabel("Channel")
+        channel_label.setObjectName("Muted")
+        self.channel = QComboBox()
+        self.channel.setMinimumWidth(92)
+        self.channel.setToolTip("Channel for every view on this page. Traces, Spectrum, Cycles, and Compare follow it.")
+        self.channel.currentIndexChanged.connect(self._on_channel)
+        controls.addWidget(channel_label)
+        controls.addWidget(self.channel)
         controls.addWidget(self.spec_window)
         controls.addWidget(self.spec_overlap)
         controls.addWidget(self.slide_window)
@@ -262,6 +270,7 @@ class TimePanel(QWidget):
                 self._cache.clear()
             self.sources[condition] = source
             self._source_id[condition] = id(source)
+        self._fill_channel()
         self._fill_other()
         self._fill_picks()
         self._fill_amp()
@@ -285,9 +294,11 @@ class TimePanel(QWidget):
             self._draw()
 
     def set_selected(self, index: int) -> None:
-        if index == self._selected:
-            return
+        changed = index != self._selected
         self._selected = index
+        self._fill_channel()
+        if not changed:
+            return
         self._fill_other()
         self._fill_picks()
         self._fill_amp()
@@ -1105,6 +1116,26 @@ class TimePanel(QWidget):
             item.setCheckState(Qt.Checked if index == self._index() else Qt.Unchecked)
             self.picks.addItem(item)
         self.picks.blockSignals(False)
+
+    def _fill_channel(self) -> None:
+        recording = self.recording
+        if recording is None or not hasattr(self, "channel"):
+            return
+        self.channel.blockSignals(True)
+        self.channel.clear()
+        for index, name in enumerate(recording.ch_names):
+            self.channel.addItem(name, index)
+        found = self.channel.findData(self._selected)
+        if found >= 0:
+            self.channel.setCurrentIndex(found)
+        self.channel.blockSignals(False)
+
+    def _on_channel(self) -> None:
+        name = self.channel.currentText()
+        data = self.channel.currentData()
+        if not name or data is None or int(data) == self._selected:
+            return
+        self.channel_requested.emit(name)
 
     def _fill_react_channel(self) -> None:
         recording = self.recording
