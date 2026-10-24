@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from ..jobs import checkpoint
 from scipy.signal import butter, detrend, sosfiltfilt
 
 from ..io.recording import Recording
@@ -68,6 +69,7 @@ class CycleFit:
     t_offset: float = 0.0
     burst_note: str = ""
     notes: str = ""
+    failures: list[dict] = field(default_factory=list)
 
     @property
     def n_bursts(self) -> int:
@@ -86,6 +88,7 @@ def fit_cycles(
 
     if not 0 <= channel_index < recording.n_channels:
         raise IndexError("Channel index is outside the recording.")
+    recording.require_analysis_channel(channel_index)
     low, high = float(band[0]), float(band[1])
     nyquist = recording.sfreq / 2.0
     if low <= 0 or high <= low:
@@ -119,7 +122,10 @@ def fit_cycles(
     frames = []
     episode_rows: list[BurstEpisode] = []
     minimum = max(int(round(recording.sfreq)), int(round(3.0 * recording.sfreq / low)))
-    for start, stop in accepted_runs(mask):
+    failures = []
+    runs = list(accepted_runs(mask))
+    for position, (start, stop) in enumerate(runs):
+        checkpoint(position, len(runs), f"Cycle run {position + 1} of {len(runs)}")
         if stop - start < minimum:
             continue
         piece = signal[start:stop]
@@ -129,7 +135,8 @@ def fit_cycles(
         try:
             filtered[start:stop] = _bandpass(piece, recording.sfreq, low, high)
             model.fit(piece, recording.sfreq, (low, high))
-        except Exception:
+        except Exception as exc:
+            failures.append({"start_s": t_offset + start / recording.sfreq, "end_s": t_offset + stop / recording.sfreq, "reason": str(exc)})
             filtered[start:stop] = np.nan
             continue
         piece_frame = model.df_features
@@ -204,6 +211,7 @@ def fit_cycles(
         t_offset=t_offset,
         burst_note=note,
         notes=preparation,
+        failures=failures,
     )
 
 

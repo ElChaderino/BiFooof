@@ -36,6 +36,9 @@ def _stylesheet(chevron: str) -> str:
         border-radius: 6px; font-size: 12px;
     }}
     QFrame#Header {{ background: {PANEL}; border: none; border-bottom: 1px solid {LINE}; }}
+    QLabel, QCheckBox, QWidget#ControlGroup {{ background: transparent; }}
+    QLabel#PendingSettings {{ color: {ACCENT}; font-size: 12px; }}
+    QLabel#ValidationError {{ color: {WARN}; font-size: 12px; }}
     QLabel#Brand {{ font-size: 20px; font-weight: 700; color: {ACCENT}; letter-spacing: 0.3px; }}
     QLabel#BrandSub {{ font-size: 11px; color: {MUTED}; letter-spacing: 1.4px; }}
     QLabel#H2 {{ font-size: 11px; font-weight: 700; color: {MUTED}; letter-spacing: 1.1px; }}
@@ -52,6 +55,7 @@ def _stylesheet(chevron: str) -> str:
         background: {PANEL}; color: {ACCENT}; border: 1px solid {LINE_STRONG};
     }}
     QPushButton#Secondary:hover {{ background: {ACCENT_SOFT}; border-color: {ACCENT}; }}
+    QPushButton#Secondary:checked, QPushButton#Secondary:focus {{ background: {ACCENT_SOFT}; border-color: {ACCENT}; }}
     QPushButton#Secondary:disabled {{ background: {PANEL}; color: #b3c0cd; border-color: {LINE}; }}
     QPushButton#Ghost {{
         background: transparent; color: {INK}; border: none; border-radius: 8px;
@@ -64,6 +68,9 @@ def _stylesheet(chevron: str) -> str:
         selection-background-color: {ACCENT_SOFT}; selection-color: {INK};
     }}
     QComboBox:hover, QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {ACCENT}; }}
+    QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+        background: {CARD}; color: {FAINT}; border-color: {LINE};
+    }}
     QComboBox::drop-down {{
         subcontrol-origin: padding; subcontrol-position: center right;
         width: 26px; border: none;
@@ -104,6 +111,8 @@ def _stylesheet(chevron: str) -> str:
     }}
     QStatusBar {{ background: {PANEL}; color: {MUTED}; border-top: 1px solid {LINE}; }}
     QStatusBar::item {{ border: none; }}
+    QProgressBar {{ background: {ACCENT_SOFT}; border: none; border-radius: 3px; max-height: 6px; }}
+    QProgressBar::chunk {{ background: {TEAL}; border-radius: 3px; }}
     QScrollBar:vertical {{ background: transparent; width: 12px; margin: 2px; }}
     QScrollBar::handle:vertical {{ background: #c3ccd7; border-radius: 5px; min-height: 30px; }}
     QScrollBar::handle:vertical:hover {{ background: {MUTED}; }}

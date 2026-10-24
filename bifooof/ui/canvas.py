@@ -16,7 +16,14 @@ class MplCanvas(FigureCanvasQTAgg):
     def __init__(self, width: float = 8.0, height: float = 4.8, dpi: int = 100):
         self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor="white")
         super().__init__(self.fig)
-        self.setMinimumHeight(280)
+        self.setMinimumHeight(200)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        engine = self.fig.get_layout_engine()
+        if engine is None or engine.__class__.__name__ != "ConstrainedLayoutEngine":
+            self.fig.set_layout_engine("tight")
+        self.draw_idle()
 
     def clear(self) -> None:
         clear_figure(self.fig)

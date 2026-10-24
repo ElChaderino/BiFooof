@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from ..jobs import checkpoint
 from scipy.signal import hilbert
 
 from ..io.recording import Recording
@@ -36,6 +37,8 @@ class PacResult:
     accepted_s: float = 0.0
     n_cells: int = 0
     warnings: list[str] = field(default_factory=list)
+    phase_channel: str = ""
+    amplitude_channel: str = ""
 
 
 def modulation_index(phase: np.ndarray, amplitude: np.ndarray, n_bins: int = 18) -> tuple[float, np.ndarray, np.ndarray]:
@@ -88,6 +91,8 @@ def phase_amplitude(
     amplitude_index = channel_index if amp_index is None else int(amp_index)
     if not 0 <= amplitude_index < recording.n_channels:
         raise IndexError("Channel index is outside the recording.")
+    recording.require_analysis_channel(channel_index)
+    recording.require_analysis_channel(amplitude_index)
     _check_band(phase_band, "phase")
     _check_band(amp_band, "amplitude")
     chosen = settings
@@ -153,12 +158,17 @@ def phase_amplitude(
             "A purely periodic envelope does not rise above them, because a shift only moves which phase bin is tall."
         ),
         warnings=warnings,
+        phase_channel=prepared.ch_names[channel_index],
+        amplitude_channel=prepared.ch_names[amplitude_index],
     )
     if comodulogram_grid is not None:
         phase_centers, amp_centers = comodulogram_grid
         result.phase_centers = np.asarray(phase_centers, dtype=np.float64)
         result.amp_centers = np.asarray(amp_centers, dtype=np.float64)
-        result.comodulogram = _grid(phase_signal[start:stop], prepared.sfreq, phase_centers, amp_centers)
+        result.comodulogram = _grid(
+            phase_signal[start:stop], amp_signal[start:stop], prepared.sfreq,
+            result.phase_centers, result.amp_centers, nonsinusoidal,
+        )
         result.n_cells = int(result.comodulogram.size)
         finite = int(np.isfinite(result.comodulogram).sum())
         if finite == result.n_cells:
@@ -198,39 +208,29 @@ def _surrogates(phase, amplitude, count, sfreq, phase_low, seed) -> np.ndarray:
         return np.zeros(0)
     found = np.empty(count, dtype=np.float64)
     for index in range(count):
+        checkpoint(index, count, f"PAC surrogate {index + 1} of {count}")
         shift = int(generator.integers(minimum, amplitude.size - minimum))
         found[index] = modulation_index(phase, np.roll(amplitude, shift))[0]
     return found
 
 
-def _grid(signal, sfreq, phase_centers, amp_centers) -> np.ndarray:
+def _grid(phase_signal, amp_signal, sfreq, phase_centers, amp_centers, nonsinusoidal=False) -> np.ndarray:
     matrix = np.full((amp_centers.size, phase_centers.size), np.nan, dtype=np.float64)
-    phase_signals = []
-    for center in phase_centers:
-        low, high = float(center) - 1.0, float(center) + 1.0
-        if low <= 0 or high >= sfreq / 2.0:
-            phase_signals.append(None)
-            continue
-        try:
-            phase_signals.append(np.angle(hilbert(_bandpass(signal, sfreq, low, high))))
-        except ValueError:
-            phase_signals.append(None)
-    amp_signals = []
-    for center in amp_centers:
-        width = max(2.0, float(center) * 0.15)
-        low, high = float(center) - width, float(center) + width
-        if low <= 0 or high >= sfreq / 2.0:
-            amp_signals.append(None)
-            continue
-        try:
-            amp_signals.append(np.abs(hilbert(_bandpass(signal, sfreq, low, high))))
-        except ValueError:
-            amp_signals.append(None)
-    for row, amplitude in enumerate(amp_signals):
-        if amplitude is None:
-            continue
-        for column, phase in enumerate(phase_signals):
-            if phase is None:
+    for row, amp_center in enumerate(amp_centers):
+        checkpoint(row, len(amp_centers), f"Coupling map row {row + 1} of {len(amp_centers)}")
+        width = max(2.0, float(amp_center) * 0.15)
+        amp_band = (float(amp_center) - width, float(amp_center) + width)
+        for column, phase_center in enumerate(phase_centers):
+            phase_band = (float(phase_center) - 1.0, float(phase_center) + 1.0)
+            if phase_band[0] <= 0 or amp_band[0] <= 0:
+                continue
+            if nonsinusoidal and _harmonic_reason(phase_band, amp_band):
+                continue
+            try:
+                phase, amplitude = _phase_and_amplitude(
+                    phase_signal, amp_signal, sfreq, phase_band, amp_band,
+                )
+            except ValueError:
                 continue
             matrix[row, column] = modulation_index(phase, amplitude)[0]
     return matrix

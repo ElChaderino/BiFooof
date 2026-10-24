@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+from ..jobs import ResultCache
+from ..events import event_table
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView, QLabel,
@@ -16,7 +18,7 @@ from ..analysis.compare import alpha_peak, compare_pair
 from ..analysis.coherence import coherence_pair
 from ..analysis.cycles import CycleFit, fit_cycles
 from ..analysis.pac import phase_amplitude
-from ..analysis.quality import QualitySpan, mask_spans, quality_spans
+from ..analysis.quality import QualitySpan, mask_spans, project_exclusions, quality_spans
 from ..analysis.settings import FitSettings, band_phrase, matched_settings
 from ..analysis.shape import burst_stats
 from ..analysis.timefreq import (
@@ -26,6 +28,7 @@ from ..analysis.timefreq import (
 from ..io.condition import condition_in_text
 from ..io.recording import Recording
 from .canvas import MplCanvas
+from .layouts import FlowLayout, control_group
 from .time_draw import (
     draw_coherence, draw_durations, draw_pac, draw_quality, draw_raster,
     draw_reactivity, draw_scatter, draw_shape, draw_spectrogram, draw_trajectory,
@@ -67,8 +70,9 @@ class TimePanel(QWidget):
         self.cycle_fit: CycleFit | None = None
         self._selected = 0
         self._generation = 0
+        self._request_key: tuple | None = None
         self._worker: CallWorker | None = None
-        self._cache: dict = {}
+        self._cache = ResultCache()
         self._source_id: dict[str, int] = {}
         self._mode = "spectrogram"
         self._result = None
@@ -132,6 +136,9 @@ class TimePanel(QWidget):
         self.react_channel = QComboBox()
         self.react_channel.setToolTip("Channel for this view. A posterior channel is chosen when the file has one.")
         self.react_channel.currentIndexChanged.connect(self._react_changed)
+        self.review_events = {}
+        self.event_direction = _choice((("EC → EO", "ec_to_eo"), ("EO → EC", "eo_to_ec")), 0)
+        self.event_direction.currentIndexChanged.connect(self._kick)
         self.amp_channel = QComboBox()
         self.amp_channel.setToolTip("Amplitude channel. Phase stays on the channel selected in the rest of the window.")
         self.amp_channel.currentIndexChanged.connect(self._kick)
@@ -194,34 +201,31 @@ class TimePanel(QWidget):
         self.channel.currentIndexChanged.connect(self._on_channel)
         controls.addWidget(channel_label)
         controls.addWidget(self.channel)
-        controls.addWidget(self.spec_window)
-        controls.addWidget(self.spec_overlap)
-        controls.addWidget(self.slide_window)
-        controls.addWidget(self.slide_overlap)
-        controls.addWidget(self.lock_color)
-        controls.addWidget(self.color_low)
-        controls.addWidget(self.color_high)
-        controls.addWidget(self.top_trace)
-        controls.addWidget(self.map_which)
-        controls.addWidget(self.picks)
-        controls.addWidget(self.react_pre)
-        controls.addWidget(self.react_post)
-        controls.addWidget(self.react_channel)
-        controls.addWidget(self.bursts)
-        controls.addWidget(self.every)
-        controls.addWidget(self.align)
-        controls.addWidget(self.normalized)
-        controls.addWidget(self.other)
-        controls.addWidget(self.amp_channel)
-        controls.addWidget(self.phase_low)
-        controls.addWidget(self.phase_high)
-        controls.addWidget(self.amp_low)
-        controls.addWidget(self.amp_high)
-        controls.addWidget(self.comod)
-        controls.addWidget(self.leave)
-        controls.addWidget(self.restore)
         controls.addStretch(1)
         controls.addWidget(self.stage)
+
+        options = QWidget()
+        options.setObjectName("ControlGroup")
+        flow = FlowLayout(options, 12)
+        self._option_groups = []
+        for label, widgets in (
+            ("WINDOW", (self.spec_window,)), ("OVERLAP", (self.spec_overlap,)),
+            ("WINDOW", (self.slide_window,)), ("OVERLAP", (self.slide_overlap,)),
+            ("", (self.lock_color,)), ("COLOR dB", (self.color_low, self.color_high)),
+            ("TRACE", (self.top_trace,)), ("MAP", (self.map_which,)),
+            ("CHANNELS", (self.picks,)), ("BEFORE", (self.react_pre,)),
+            ("AFTER", (self.react_post,)), ("CHANNEL", (self.react_channel,)),
+            ("TRANSITION", (self.event_direction,)),
+            ("", (self.bursts,)), ("", (self.every,)), ("ALIGN", (self.align,)),
+            ("", (self.normalized,)), ("WITH", (self.other,)),
+            ("AMPLITUDE CHANNEL", (self.amp_channel,)),
+            ("PHASE Hz", (self.phase_low, self.phase_high)),
+            ("AMPLITUDE Hz", (self.amp_low, self.amp_high)), ("", (self.comod,)),
+            ("", (self.leave, self.restore)),
+        ):
+            group = control_group(label, *widgets)
+            flow.addWidget(group)
+            self._option_groups.append((group, widgets))
 
         self.caption = QLabel("Open a recording. This page uses the same fit window, reference, and rejected samples as the spectrum.")
         self.caption.setObjectName("Muted")
@@ -244,6 +248,7 @@ class TimePanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.addLayout(controls)
+        root.addWidget(options)
         root.addWidget(self.caption)
         root.addWidget(self.canvas, 1)
         root.addWidget(self.table)
@@ -286,6 +291,9 @@ class TimePanel(QWidget):
 
     def set_cycle_fit(self, fit: CycleFit | None) -> None:
         self.cycle_fit = fit
+        if self._mode == "coupling":
+            self._kick()
+            return
         if self._mode == "spectrogram" and not isinstance(self._result, Spectrogram):
             return
         if self._mode in {"spectrogram", "shape", "durations", "scatter"} or (
@@ -294,30 +302,65 @@ class TimePanel(QWidget):
             self._draw()
 
     def set_selected(self, index: int) -> None:
-        changed = index != self._selected
+        previous = self._selected
+        changed = index != previous
         self._selected = index
         self._fill_channel()
         if not changed:
             return
         self._fill_other()
         self._fill_picks()
+        self._follow_single_pick(previous)
         self._fill_amp()
         self._fill_react_channel()
         self._kick()
 
     def apply_settings(self, settings: FitSettings) -> None:
-        self.settings = settings
+        self.settings = replace(settings)
         self._cache.clear()
         self._sliding = None
         self._sliding_id = None
         self._slidings.clear()
         self._kick()
 
+    def set_band(self, low: float, high: float) -> None:
+        if self.settings.alpha_band() == (low, high):
+            return
+        self.settings = replace(self.settings, alpha_low=low, alpha_high=high)
+        self._kick()
+
     def shutdown(self) -> None:
         wait_for(self)
 
+    @property
+    def image_ready(self) -> bool:
+        if self.recording is None:
+            return False
+        if self._local_mode():
+            return self.cycle_fit is not None and self.cycle_fit.channel == self._channel_name()
+        return self._result is not None
+
+    @property
+    def data_ready(self) -> bool:
+        """Check export availability without materializing a spectrogram CSV."""
+        if not self.image_ready:
+            return False
+        if isinstance(self._result, (Spectrogram, SlidingFit)):
+            return True
+        if self._mode == "quality":
+            return bool(self._quality_rows)
+        if self._mode == "raster":
+            return any(fit.episodes for fit in self._raster_fits())
+        if self._mode in {"shape", "scatter"}:
+            return bool(self.cycle_fit.cycles)
+        if self._mode == "durations":
+            return True
+        return isinstance(self._result, dict) and self._result.get("kind") == "single"
+
     def rows(self) -> list[dict]:
         result = self._result
+        if result is None and not self._local_mode():
+            return []
         channel = self._channel_name()
         if isinstance(result, Spectrogram):
             rows = []
@@ -409,6 +452,14 @@ class TimePanel(QWidget):
                 }
                 for span in self._quality_rows
             ]
+        if isinstance(result, dict) and result.get("kind") == "events":
+            return [{"settings_key": self._settings_key(), "channel": result["channel"], "event_onset_source_s": event + result["source_start_s"],
+                "direction": result.get("direction", ""), "relative_s": float(moment), "mean_band_psd_uv2_hz": _cell(level),
+                "baseline_start_s": result["baseline"][0], "baseline_end_s": result["baseline"][1],
+                "response_start_s": result["response"][0], "response_end_s": result["response"][1],
+                "supports_change": bool(result["supports_change"][index])}
+                for index, (event, curve) in enumerate(zip(result["events"], result["curves"]))
+                for moment, level in zip(result["grid"], curve)]
         if isinstance(result, dict) and result.get("kind") == "single":
             times, power = result.get("single", (np.zeros(0), np.zeros(0)))
             return [
@@ -417,7 +468,17 @@ class TimePanel(QWidget):
             ]
         return []
 
+    def export_snapshot(self):
+        return {"result": self._result, "rate": 0 if self.recording is None else self.recording.sfreq,
+            "key": self._settings_key(), "channel": self._channel_name(), "band": self.settings.alpha_band(),
+            "rows": [] if isinstance(self._result, (Spectrogram, SlidingFit)) else self.rows()}
+
     def _kick(self, *_args) -> None:
+        # Cache hits and locally rendered views must invalidate old jobs too.
+        self._generation += 1
+        generation = self._generation
+        self._request_key = None
+        self._result = None
         self._mode = str(self.mode.currentData() or "spectrogram")
         self._apply_visibility()
         if self.recording is None:
@@ -440,32 +501,34 @@ class TimePanel(QWidget):
                 self._slidings[self.condition] = cached
             self._draw()
             return
-        self._generation += 1
-        generation = self._generation
+        self._request_key = key
         self.caption.setText(self._waiting())
+        self._empty(self.caption.text())
+        self.table.setRowCount(0)
         self.status.emit(self.caption.text())
         worker = CallWorker(
             generation, _job,
             (
-                self._mode, self.recording, self._fit_settings(),
+                self._mode, self.recording, replace(self._fit_settings()),
                 self._react_index() if self._mode == "reactivity" else self._index(),
                 self._options(),
             ),
         )
-        worker.succeeded.connect(self._done)
+        worker.succeeded.connect(lambda gen, result, submitted=key: self._done(gen, result, submitted))
         worker.failed.connect(self._failed)
         self._worker = worker
         launch(self, worker)
 
-    def _done(self, generation: int, result: object) -> None:
-        if generation != self._generation:
+    def _done(self, generation: int, result: object, request_key: tuple | None = None) -> None:
+        submitted = self._request_key if request_key is None else request_key
+        if generation != self._generation or submitted is None or submitted != self._cache_key():
             return
         result = self._accept(result)
-        self._cache[self._cache_key()] = self._stored(result)
+        self._cache[submitted] = self._stored(result)
         self._result = result
         if self._mode == "trajectory" and isinstance(result, SlidingFit):
             self._sliding = result
-            self._sliding_id = self._cache_key()
+            self._sliding_id = submitted
             self._slidings[self.condition] = result
         self._draw()
         self.status.emit("Ready.")
@@ -473,6 +536,8 @@ class TimePanel(QWidget):
     def _failed(self, generation: int, message: str) -> None:
         if generation != self._generation:
             return
+        self._result = None
+        self._request_key = None
         detail = message.strip().splitlines()[-1] if message.strip() else "That view failed."
         self.caption.setText(detail)
         self._empty(detail)
@@ -926,11 +991,13 @@ class TimePanel(QWidget):
             "amp": (float(self.amp_low.value()), float(self.amp_high.value())),
             "map": self.comod.isChecked(),
             "continuous": self.continuous,
-            "pair": self.recordings,
+            "pair": dict(self.recordings),
             "partner": self._partner_recording(),
             "partner_label": self._partner_label(),
             "pre_s": float(self.react_pre.value()),
             "post_s": float(self.react_post.value()),
+            "event_direction": self.event_direction.currentData(),
+            "review_events": dict(self.review_events),
             "indexes": self._picked_indexes(),
             "amp_index": self._amp_index(),
             "nonsinusoidal": self._nonsinusoidal(),
@@ -989,6 +1056,8 @@ class TimePanel(QWidget):
             self._react_index(),
             self._amp_index(),
             self._nonsinusoidal(),
+            self.event_direction.currentData(),
+            repr(self.review_events),
         )
 
     def _index(self) -> int:
@@ -1055,6 +1124,7 @@ class TimePanel(QWidget):
         self.react_pre.setVisible(react)
         self.react_post.setVisible(react)
         self.react_channel.setVisible(react)
+        self.event_direction.setVisible(react)
         for widget in (self.phase_low, self.phase_high, self.amp_low, self.amp_high, self.comod):
             widget.setVisible(mode == "coupling")
         quality = mode == "quality"
@@ -1062,6 +1132,9 @@ class TimePanel(QWidget):
         self.restore.setVisible(quality)
         self.table.setVisible(quality)
         self.stage.setVisible(mode in {"spectrogram", "trajectory", "raster", "quality", "reactivity"})
+        self.stage.setEnabled(self.recording is not None)
+        for group, widgets in self._option_groups:
+            group.setVisible(any(not widget.isHidden() for widget in widgets))
 
     def _waiting(self) -> str:
         name = self._channel_name() or "the channel"
@@ -1116,6 +1189,41 @@ class TimePanel(QWidget):
             item.setCheckState(Qt.Checked if index == self._index() else Qt.Unchecked)
             self.picks.addItem(item)
         self.picks.blockSignals(False)
+        self._reveal_single_check()
+
+    def _follow_single_pick(self, previous: int) -> None:
+        """Move a one-channel burst list when the channel menu changes.
+
+        A list with several checks is a choice the user made, so it stays.
+        """
+        if self.picks.count() == 0:
+            return
+        checked = [
+            row for row in range(self.picks.count())
+            if self.picks.item(row) is not None and self.picks.item(row).checkState() == Qt.Checked
+        ]
+        target = self._index()
+        if checked != [previous] or target == previous:
+            return
+        self.picks.blockSignals(True)
+        for row in range(self.picks.count()):
+            item = self.picks.item(row)
+            if item is not None:
+                item.setCheckState(Qt.Checked if row == target else Qt.Unchecked)
+        self.picks.blockSignals(False)
+        self._reveal_single_check()
+
+    def _reveal_single_check(self) -> None:
+        """Bring the one checked burst row into view. A longer list stays where the user left it."""
+        checked = [
+            row for row in range(self.picks.count())
+            if self.picks.item(row) is not None and self.picks.item(row).checkState() == Qt.Checked
+        ]
+        if len(checked) != 1:
+            return
+        item = self.picks.item(checked[0])
+        if item is not None:
+            self.picks.scrollToItem(item)
 
     def _fill_channel(self) -> None:
         recording = self.recording
@@ -1523,7 +1631,10 @@ def _job(mode, recording, settings, index, options):
         other = options.get("partner") if options["every"] else None
         if other is not None:
             try:
-                partner = sliding_spectra(other, settings, options["window_s"], options["overlap"], None)
+                partner = sliding_spectra(
+                    other, matched_settings(settings, other, [recording]),
+                    options["window_s"], options["overlap"], None,
+                )
             except ValueError:
                 partner = None
         return primary, partner
@@ -1565,7 +1676,16 @@ def _reactivity(recording, settings, index, options) -> dict:
     name = options.get("channel") or recording.ch_names[index]
     continuous = options.get("continuous")
     if continuous is not None and name in continuous.ch_names:
-        events = [mark.onset_s for mark in continuous.marks if condition_in_text(mark.label)]
+        candidates = list((options.get("pair") or {}).values())
+        continuous = project_exclusions(continuous, [*candidates, recording])
+        direction = options.get("event_direction")
+        reviewed = (options.get("review_events") or {}).get(continuous.source_path)
+        table = event_table(continuous, reviewed)
+        events = [item["onset"] - continuous.source_start_s for item in table if
+                  (item["direction"] == direction if direction else bool(item["state"])) and
+                  0 <= item["onset"] - continuous.source_start_s < continuous.duration_s]
+        if not events and direction:
+            raise ValueError(f"No {direction.replace('_to_', ' → ').upper()} transitions in the reviewed continuous source.")
         if events:
             full = replace(settings, t_start=0.0, t_length=None)
             times, power = block_band_power(
@@ -1574,7 +1694,9 @@ def _reactivity(recording, settings, index, options) -> dict:
             pre = float(options.get("pre_s", 10.0))
             post = float(options.get("post_s", 20.0))
             grid, curves = align_to_events(times, power, events, pre, post)
-            change = _event_change(grid, curves)
+            supported = np.isfinite(curves[:, grid < -.5]).any(axis=1) & np.isfinite(curves[:, (grid >= .5) & (grid <= 5)]).any(axis=1)
+            change = _event_change(grid, curves[supported] if direction else curves)
+            count_note = f"{int(supported.sum())}/{len(events)} events support both baseline and response; {int((~supported).sum())} excluded from the change estimate. " if direction else f"{int(supported.sum())}/{len(events)} events support both baseline and response. "
             extras = []
             short = ""
             if pre + post < 8.0:
@@ -1591,19 +1713,22 @@ def _reactivity(recording, settings, index, options) -> dict:
                 "curves": curves,
                 "extras": extras,
                 "events": events,
-                "title": f"{name} around {len(events)} eye mark{'s' if len(events) != 1 else ''}",
+                "channel": name, "source_start_s": continuous.source_start_s, "direction": direction or "",
+                "supports_change": supported, "baseline": (-pre, -.5), "response": (.5, min(5., post)),
+                "title": f"{name} · {direction or 'eye marks'} · {len(events)} events",
                 "note": (
                     f"{name}, {band_phrase(*band)}, {pre:.0f} s before and {post:.0f} s after "
                     f"eye marks on the original file. "
-                    f"{change} The split sides do not contain the crossing.{short}"
+                    f"Baseline −{pre:g} to −0.5 s; response 0.5 to {min(5., post):g} s. "
+                    f"{count_note}{change} The split sides do not contain the crossing.{short}"
                 ),
             }
     pair = options.get("pair") or {}
     if "ec" in pair and "eo" in pair:
         return {
             "kind": "separate",
-            "left": _one_power(pair["ec"], settings, name, band),
-            "right": _one_power(pair["eo"], settings, name, band),
+            "left": _one_power(pair["ec"], matched_settings(settings, pair["ec"], [pair["eo"]]), name, band),
+            "right": _one_power(pair["eo"], matched_settings(settings, pair["eo"], [pair["ec"]]), name, band),
             "left_label": options.get("left_label") or "Eyes closed",
             "right_label": options.get("right_label") or "Eyes open",
             "note": (
@@ -1633,7 +1758,8 @@ def _partner_coherence(recording, settings, index, options):
         return None
     try:
         return coherence_pair(
-            partner, settings, partner.ch_names.index(left), partner.ch_names.index(right),
+            partner, matched_settings(settings, partner, [recording]),
+            partner.ch_names.index(left), partner.ch_names.index(right),
         )
     except ValueError:
         return None

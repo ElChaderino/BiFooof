@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import traceback
 
 from matplotlib.figure import Figure
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
-    QMessageBox, QPushButton, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
+    QMessageBox, QProgressBar, QPushButton, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
@@ -24,16 +26,18 @@ from ..io.marks import span_text, split_marked_conditions
 from ..io.load import load_recording, needs_sfreq
 from ..io.recording import Recording
 from ..io.sniff import FILE_FILTER
+from ..session_export import save_bundle
 from . import icons
 from .compare_panel import ComparePanel
 from .findings_panel import FindingsPanel
 from .fit_bar import FitBar
+from .layouts import ElidedLabel
 from .cycle_panel import CyclePanel
 from .spectrum_panel import SpectrumPanel, render_spectrum
 from .theme import ACCENT, MUTED
 from .time_panel import TimePanel
 from .trace_panel import TracePanel
-from .workers import CallWorker, launch, wait_for
+from .workers import CallWorker, launch
 
 
 class MainWindow(QMainWindow):
@@ -52,6 +56,7 @@ class MainWindow(QMainWindow):
         self._directory = str(Path.home())
         self._load_generations: dict[str, int] = {}
         self._load_workers: dict[str, CallWorker] = {}
+        self._closing = False
 
         header = QFrame()
         header.setObjectName("Header")
@@ -72,7 +77,7 @@ class MainWindow(QMainWindow):
         self.view.currentIndexChanged.connect(self._on_view_changed)
         viewing = QLabel("VIEWING")
         viewing.setObjectName("H2")
-        self.file_label = QLabel("No recording open")
+        self.file_label = ElidedLabel("No recording open")
         self.file_label.setObjectName("Muted")
 
         self.open_ec = self._button(
@@ -131,9 +136,17 @@ class MainWindow(QMainWindow):
         self.compare = ComparePanel()
         self.findings = FindingsPanel()
         self.setStatusBar(QStatusBar())
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedWidth(100)
+        self.progress.setAccessibleName("Background analysis in progress")
+        self.progress.hide()
+        self.statusBar().addPermanentWidget(self.progress)
         self.trace.channel_selected.connect(self._select)
         self.spectrum.channel_selected.connect(self._select)
         self.spectrum.fit_ready.connect(lambda _condition: self._sync_compare())
+        self.spectrum.fit_invalidated.connect(lambda _condition: self._sync_compare())
         self.spectrum.status.connect(self.statusBar().showMessage)
         self.cycles.status.connect(self.statusBar().showMessage)
         self.cycles.fit_ready.connect(self._sync_findings)
@@ -178,10 +191,36 @@ class MainWindow(QMainWindow):
         body.addWidget(self.tabs)
         layout.addLayout(body, 1)
         self.setCentralWidget(central)
+        self.tabs.currentChanged.connect(self._refresh_actions)
+        self._shortcuts = []
+        for keys, slot in (
+            ("Ctrl+O", self.open_ec.click),
+            ("Ctrl+Shift+O", self.open_eo.click),
+            ("Ctrl+S", self.save_session_button.click),
+            ("Ctrl+Shift+S", self.save_image_button.click),
+            ("Ctrl+E", self.save_data_button.click),
+            ("Ctrl+R", self.fit_bar.apply.click),
+        ):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.activated.connect(slot)
+            self._shortcuts.append(shortcut)
+        for button, keys in (
+            (self.open_ec, "Ctrl+O"), (self.open_eo, "Ctrl+Shift+O"),
+            (self.save_session_button, "Ctrl+S"), (self.save_image_button, "Ctrl+Shift+S"),
+            (self.save_data_button, "Ctrl+E"), (self.fit_bar.apply, "Ctrl+R"),
+        ):
+            button.setToolTip(f"{button.toolTip()} ({keys})")
+        self._state_timer = QTimer(self)
+        self._state_timer.setInterval(200)
+        self._state_timer.timeout.connect(self._refresh_actions)
+        self._state_timer.start()
+        self._refresh_actions()
         self._sync_findings()
         self.statusBar().showMessage(
             "Open eyes-closed and eyes-open recordings. Both fits run together, then Compare opens."
         )
+        from .workspace import WorkspaceController
+        self.workspace = WorkspaceController(self)
 
     def _button(self, label: str, condition: str, tip: str) -> QPushButton:
         button = QPushButton(f"  {label}")
@@ -203,6 +242,8 @@ class MainWindow(QMainWindow):
         return button
 
     def open_recording(self, condition: str) -> None:
+        if self._closing:
+            return
         path, _selected = QFileDialog.getOpenFileName(
             self, f"Open {CONDITION_LABELS[condition]}", self._directory, FILE_FILTER,
         )
@@ -210,7 +251,12 @@ class MainWindow(QMainWindow):
             return
         self._directory = str(Path(path).parent)
         sfreq = None
-        if needs_sfreq(path):
+        try:
+            ask_rate = needs_sfreq(path)
+        except Exception:
+            self._show_error("Could not open recording", traceback.format_exc())
+            return
+        if ask_rate:
             value, accepted = QInputDialog.getDouble(
                 self, "Sampling rate",
                 "This file has no time column or sampling rate. Enter Hz:",
@@ -249,11 +295,18 @@ class MainWindow(QMainWindow):
         path = self._choose_save("Save image", "png", "PNG image (*.png)")
         if not path:
             return
-        widget.canvas.draw()
-        destination = save_figure(widget.canvas.fig, path)
+        try:
+            widget.canvas.draw()
+            destination = save_figure(widget.canvas.fig, path)
+        except Exception:
+            self._show_error("Could not save image", traceback.format_exc())
+            return
         self.statusBar().showMessage(f"Saved {destination.name}")
 
     def save_data(self) -> None:
+        if hasattr(self, "workspace") and self.tabs.currentWidget() is self.time:
+            self.workspace.dispatch("export_time_data")
+            return
         rows = self._current_rows()
         if not rows:
             self._tell("There is no table to save for this view yet.")
@@ -261,11 +314,18 @@ class MainWindow(QMainWindow):
         path = self._choose_save("Save data", "csv", "CSV table (*.csv)")
         if not path:
             return
-        destination = write_csv(path, rows)
+        try:
+            destination = write_csv(path, rows)
+        except Exception:
+            self._show_error("Could not save data", traceback.format_exc())
+            return
         self.statusBar().showMessage(f"Saved {destination.name}")
 
     def save_session(self, folder: str | Path) -> list[Path]:
         """Write the plots and tables that are ready into ``folder``."""
+        return save_bundle(folder, self._write_session)
+
+    def _write_session(self, folder: str | Path) -> list[Path]:
         self._sync_findings()
         destination = Path(folder)
         destination.mkdir(parents=True, exist_ok=True)
@@ -350,21 +410,37 @@ class MainWindow(QMainWindow):
             path = destination / "findings.txt"
             path.write_text(self.findings.plain, encoding="utf-8")
             written.append(path)
-        if self.recording is not None and self.time.rows():
+        if self.recording is not None and self.time.data_ready and not getattr(self, "_skip_time_export", False):
             self.time.canvas.draw()
             written.append(save_figure(self.time.canvas.fig, destination / "time.png"))
-            written.append(write_csv(destination / "time.csv", self.time.rows()))
+            from ..export import write_csv_stream
+            from ..time_export import time_rows
+            written.append(write_csv_stream(destination / "time.csv", time_rows(self.time.export_snapshot())))
+        if hasattr(self, "workspace"):
+            self.workspace.flush_notes()
+            self.workspace.refresh()
+            written.extend(self.workspace.write_review_outputs(destination))
         return written
 
     def _save_session_dialog(self) -> None:
         if not self.recordings:
             self._tell("Open a recording before saving a session.")
             return
+        if hasattr(self, "workspace") and self._running_workers(*self.workspace.owners()):
+            self._tell("Wait for the current jobs to finish, or cancel them, before exporting completed results.")
+            return
         folder = QFileDialog.getExistingDirectory(self, "Save session", self._directory)
         if not folder:
             return
         self._directory = folder
-        written = self.save_session(folder)
+        try:
+            if hasattr(self, "workspace") and self.time.data_ready:
+                self.workspace.export_session_async(folder)
+                return
+            written = self.save_session(folder)
+        except Exception:
+            self._show_error("Could not save session", traceback.format_exc())
+            return
         self.statusBar().showMessage(f"Saved {len(written)} files to {folder}")
 
     def _current_rows(self) -> list[dict]:
@@ -392,23 +468,31 @@ class MainWindow(QMainWindow):
                 }
                 for name in self.recording.ch_names
             ]
+        if hasattr(self, "workspace") and widget in (self.workspace.review, self.workspace.study):
+            return widget.rows()
         return []
 
     def _queue_load(self, path: str, sfreq: float | None, condition: str) -> None:
+        if hasattr(self, "workspace"):
+            self.workspace._project_generation += 1
+            for pending in getattr(self.workspace, "_live_workers", []):
+                if pending.scope == "project":
+                    pending.cancel()
         self._load_generations[condition] = self._load_generations.get(condition, 0) + 1
         generation = self._load_generations[condition]
         button = self.open_ec if condition == "ec" else self.open_eo
         button.setEnabled(False)
         self.statusBar().showMessage(f"Reading {CONDITION_LABELS[condition].lower()}…")
-        worker = CallWorker(generation, load_recording, (path, sfreq))
+        from ..project import load_verified_source
+        worker = CallWorker(generation, load_verified_source, (path, sfreq, self.workspace.import_policy))
         worker.succeeded.connect(lambda gen, recording, cond=condition: self._loaded(cond, gen, recording))
         worker.failed.connect(lambda gen, message, cond=condition: self._load_failed(cond, gen, message))
         self._load_workers[condition] = worker
-        launch(self, worker)
+        launch(self, worker, key=condition)
 
     def _loaded(self, condition: str, generation: int, recording: object) -> None:
         self._enable_open(condition)
-        if generation != self._load_generations.get(condition) or not isinstance(recording, Recording):
+        if self._closing or generation != self._load_generations.get(condition) or not isinstance(recording, Recording):
             return
         self._present(recording, condition)
 
@@ -441,14 +525,21 @@ class MainWindow(QMainWindow):
 
     def _load_failed(self, condition: str, generation: int, message: str) -> None:
         self._enable_open(condition)
-        if generation != self._load_generations.get(condition):
+        if self._closing or generation != self._load_generations.get(condition):
             return
+        if message.startswith("Cancelled"):
+            self.statusBar().showMessage(message)
+            return
+        self._show_error("Could not open recording", message)
+
+    def _show_error(self, title: str, message: str) -> None:
         detail = message.strip().splitlines()
-        summary = detail[-1] if detail else "Could not open that file."
+        summary = detail[-1] if detail else title
         self.statusBar().showMessage(summary)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle("Could not open recording")
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.PlainText)
         box.setText(summary)
         box.setDetailedText(message)
         box.exec()
@@ -479,12 +570,15 @@ class MainWindow(QMainWindow):
         self.cycles.set_recording(recording, None if not keep_channel else self._selected)
         self._show_time()
         self._sync_compare()
+        self._refresh_actions()
+        if hasattr(self, "workspace"):
+            self.workspace.recording_changed()
 
     def _show_time(self) -> None:
         if self.recording is None:
             return
         self.time.cycle_fit = self.cycles.fit
-        self.time._selected = self._selected
+        self.time.set_selected(self._selected)
         self.time.set_recording(
             self.recording,
             self.active,
@@ -515,6 +609,11 @@ class MainWindow(QMainWindow):
     def _on_exclusions(self, recording: object) -> None:
         if not isinstance(recording, Recording):
             return
+        if hasattr(self, "workspace"):
+            self.workspace.record_exclusions()
+            source = self.sources.get(self.active)
+            if source is not None:
+                recording = self.workspace.state.apply(source, self.active)
         self._apply(recording, self.active, remember=False, keep_channel=True)
 
     def _on_view_changed(self, _index: int = 0) -> None:
@@ -565,6 +664,10 @@ class MainWindow(QMainWindow):
         self.cycles.apply_settings(self._cycle_settings(settings))
         self.compare.apply_settings(settings)
         self.time.apply_settings(settings)
+        self.fit_bar.mark_applied(settings)
+        if hasattr(self, "workspace"):
+            self.workspace.changed()
+        self._refresh_actions()
         self._sync_findings()
         if settings.t_length is None and settings.t_start <= 0:
             window = "the whole recording"
@@ -578,17 +681,22 @@ class MainWindow(QMainWindow):
     def _on_fit_band(self, low: float, high: float) -> None:
         self.cycles.set_band(float(low), float(high), named=self.fit_bar.band.currentData() is not None)
         self.spectrum.set_band(float(low), float(high))
+        self.time.set_band(float(low), float(high))
         self._sync_compare()
+        self._refresh_actions()
 
     def _on_cycle_band(self, *_args) -> None:
         low, high = self.cycles.current_band()
         self.fit_bar.set_band(low, high, named=self.cycles.band.currentData() is not None)
         self.spectrum.set_band(low, high)
+        self.time.set_band(low, high)
         self._sync_compare()
+        self._refresh_actions()
 
     def _sync_compare(self) -> None:
         band = self.fit_bar.current_band()
         self.compare.set_pair(self.recordings, self.spectrum.fits, self._channel_name(), band)
+        self._sync_time_pair()
         self._sync_findings()
 
     def _sync_findings(self) -> None:
@@ -613,6 +721,8 @@ class MainWindow(QMainWindow):
             applied,
             (left, right),
         )
+        if hasattr(self, "workspace"):
+            self.workspace._refresh_timer.start(100)
 
     def _cycle_settings(self, settings: FitSettings) -> FitSettings:
         if self.recording is None:
@@ -708,13 +818,66 @@ class MainWindow(QMainWindow):
             "With epochs, a peak's height is the median of the epochs that found it. "
             "Epochs that missed it are not entered as zero, and the count of those epochs is separate from the height.<br><br>"
             "Save image writes the current view. Save data writes the current table. "
-            "Save session writes both conditions and the comparison into one folder.",
+            "Export results writes both conditions, review sidecars, and the comparison into one folder. Save project restores the workspace.<br><br>"
+            "Shortcuts: Ctrl+O opens eyes closed; Ctrl+Shift+O opens eyes open; "
+            "Ctrl+R refits; Ctrl+S saves a project; Ctrl+Shift+E exports results; Ctrl+Shift+S saves an image; Ctrl+E saves data.",
         )
 
+    def _running_workers(self, *owners) -> list:
+        return [worker for owner in owners for worker in getattr(owner, "_live_workers", ()) if worker.isRunning() or getattr(worker, "pending", False) is True]
+
+    def _refresh_actions(self, *_args) -> None:
+        if hasattr(self, "workspace"):
+            self.workspace.check_changes()
+        analysis_busy = bool(self._running_workers(self.spectrum, self.cycles, self.compare))
+        owners = self.workspace.owners() if hasattr(self, "workspace") else (self, self.time)
+        running = self._running_workers(*owners)
+        busy = analysis_busy or bool(running)
+        if running:
+            done, total, description = running[-1].token.progress if hasattr(running[-1], "token") else (0, 0, "Working…")
+            self.progress.setRange(0, total)
+            self.progress.setValue(done)
+            self.progress.setToolTip(description)
+        self.progress.setVisible(busy)
+        self.view.setEnabled(bool(self.recordings))
+        self.fit_bar.set_context(bool(self.recordings), analysis_busy)
+        widget = self.tabs.currentWidget()
+        image = data = False
+        if widget is self.trace:
+            image = data = self.recording is not None
+        elif widget is self.spectrum:
+            image = data = self.spectrum.fit is not None
+        elif widget is self.cycles:
+            image = self.cycles.fit is not None
+            data = image and bool(self.cycles.fit.cycles)
+        elif widget is self.compare:
+            image = self.compare.ready
+            data = bool(self.compare.rows)
+        elif widget is self.time:
+            image, data = self.time.image_ready, self.time.data_ready
+        elif widget is self.findings:
+            data = bool(self.recordings and self.spectrum.fits)
+        elif hasattr(self, "workspace") and widget in (self.workspace.review, self.workspace.study):
+            data = bool(widget.rows())
+            image = widget is self.workspace.study and data
+        self.save_image_button.setEnabled(image)
+        self.save_data_button.setEnabled(data)
+        self.save_session_button.setEnabled(bool(self.recordings) and not busy)
+        if self._closing:
+            if busy:
+                self.statusBar().showMessage("Finishing background analysis before closing…")
+            else:
+                self.close()
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        wait_for(self)
-        self.spectrum.shutdown()
-        self.time.shutdown()
-        self.cycles.shutdown()
-        self.compare.shutdown()
+        if hasattr(self, "workspace"):
+            self.workspace.prepare_close()
+        owners = self.workspace.owners() if hasattr(self, "workspace") else (self, self.spectrum, self.time, self.cycles, self.compare)
+        if self._running_workers(*owners):
+            self._closing = True
+            self.centralWidget().setEnabled(False)
+            self.statusBar().showMessage("Finishing background analysis before closing…")
+            event.ignore()
+            return
+        self._state_timer.stop()
         event.accept()

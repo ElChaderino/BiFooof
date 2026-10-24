@@ -52,11 +52,11 @@ def quality_spans(recording: Recording, limit_uv: float = 500.0) -> list[Quality
     return _merge(found)
 
 
-def mask_spans(recording: Recording, spans: list[QualitySpan]) -> Recording:
+def mask_spans(recording: Recording, spans: list[QualitySpan], *, copy_data=True) -> Recording:
     """Return a copy with these spans left out of later fits. The file is unchanged."""
     if not spans:
         return recording
-    data = np.array(recording.data, dtype=np.float64, copy=True)
+    data = np.array(recording.data, dtype=np.float64, copy=True) if copy_data else recording.data
     valid = np.ones(data.shape, dtype=bool) if recording.valid is None else np.array(recording.valid, copy=True)
     rejected = list(recording.rejected_spans)
     for span in spans:
@@ -68,12 +68,15 @@ def mask_spans(recording: Recording, spans: list[QualitySpan]) -> Recording:
             if span.channel not in ("", "*"):
                 continue
             valid[:, i0:i1] = False
-            data[:, i0:i1] = np.nan
+            if copy_data:
+                data[:, i0:i1] = np.nan
         else:
             index = recording.ch_names.index(span.channel)
             valid[index, i0:i1] = False
-            data[index, i0:i1] = np.nan
-        rejected.append((float(span.start_s), float(span.end_s)))
+            if copy_data:
+                data[index, i0:i1] = np.nan
+        if span.channel in ("", "*"):
+            rejected.append((float(span.start_s), float(span.end_s)))
     return Recording(
         data=data,
         ch_names=list(recording.ch_names),
@@ -85,9 +88,32 @@ def mask_spans(recording: Recording, spans: list[QualitySpan]) -> Recording:
         valid=valid,
         bad_channels=list(recording.bad_channels),
         rejected_spans=rejected,
-        reference_channels={name: np.array(values, copy=True) for name, values in recording.reference_channels.items()},
+        reference_channels={name: np.array(values, copy=True) if copy_data else values for name, values in recording.reference_channels.items()},
         dropped_by_amplitude=list(recording.dropped_by_amplitude),
+        source_start_s=recording.source_start_s,
+        reference_applied=recording.reference_applied,
+        import_info=dict(recording.import_info),
     )
+
+
+def project_exclusions(source: Recording, recordings: list[Recording]) -> Recording:
+    """Project masks from cropped condition copies onto their continuous source."""
+    spans = []
+    for recording in recordings:
+        if recording.source_path != source.source_path or recording.sfreq != source.sfreq:
+            continue
+        offset = recording.source_start_s - source.source_start_s
+        for index, name in enumerate(recording.ch_names):
+            if name not in source.ch_names:
+                continue
+            mask = recording.mask(index) & np.isfinite(recording.data[index])
+            for start, stop in accepted_runs(~mask):
+                spans.append(QualitySpan(
+                    name, max(0.0, offset + start / source.sfreq),
+                    min(source.duration_s, offset + stop / source.sfreq),
+                    "session", "confirmed", "Projected from the condition recording.",
+                ))
+    return mask_spans(source, spans)
 
 
 def _flat(name: str, signal: np.ndarray, sfreq: float) -> list[QualitySpan]:

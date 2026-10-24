@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 import numpy as np
+from ..jobs import checkpoint, current_job
 
 from ..io.recording import Recording
-from .prepare import peak_at_width_floor, prepare_recording
+from .prepare import peak_at_width_floor, prepare_recording, sample_provenance
+from .segments import accepted_runs
 from .settings import FitSettings, window_bounds
 from .spectra import welch_spectra
 
@@ -55,6 +57,9 @@ class SpectrumFit:
     epoch_s: float | None = None
     epoch_count: int = 0
     notes: str = ""
+    settings: FitSettings | None = None
+    provenance: dict = field(default_factory=dict)
+    epochs: list = field(default_factory=list)
 
 
 def fit_spectra(
@@ -65,8 +70,9 @@ def fit_spectra(
 ) -> SpectrumFit:
     """Fit a :class:`specparam.SpectralGroupModel` to every usable channel."""
     from specparam import SpectralGroupModel, SpectralModel
+    checkpoint(message="Preparing spectral fit")
 
-    chosen = settings or FitSettings(fmin=fmin, fmax=fmax)
+    chosen = replace(settings) if settings is not None else FitSettings(fmin=fmin, fmax=fmax)
     chosen.validate()
     if chosen.epoch_s:
         return _fit_epochs(recording, chosen)
@@ -81,6 +87,9 @@ def fit_spectra(
     results = []
     candidates: list[int] = []
     for index, name in enumerate(recording.ch_names):
+        if not recording.analysis_channel(name):
+            results.append(ChannelFit(name=name, index=index, usable=False, reason="Auxiliary/reference channel; trace review only."))
+            continue
         if name in bad:
             results.append(ChannelFit(name=name, index=index, usable=False, reason="Bad channel."))
             continue
@@ -120,8 +129,11 @@ def fit_spectra(
     kwargs = chosen.model_kwargs()
     group = SpectralGroupModel(**kwargs)
     try:
-        group.fit(freqs, power, n_jobs=1, progress=None)
-        _fill_from_group(group, results, usable)
+        if current_job.get() is None:
+            group.fit(freqs, power, n_jobs=1, progress=None)
+            _fill_from_group(group, results, usable)
+        else:
+            _fill_one_by_one(SpectralModel, results, usable, freqs, power, kwargs)
     except Exception:
         _fill_one_by_one(SpectralModel, results, usable, freqs, power, kwargs)
 
@@ -131,6 +143,14 @@ def fit_spectra(
         detail = reasons[-1] if reasons else "no spectrum could be modeled"
         raise ValueError(f"specparam could not fit any channel. {detail}")
     _mark_fit_quality(results, chosen)
+    used = {
+        item.name: [
+            (start, stop) for start, stop in accepted_runs(
+                recording.mask(item.index) & np.isfinite(data[item.index])
+            ) if stop - start >= nperseg
+        ]
+        for item in fitted
+    }
     return SpectrumFit(
         channels=results,
         fmin=fmin,
@@ -141,6 +161,8 @@ def fit_spectra(
         aperiodic_mode=chosen.aperiodic_mode,
         welch_nperseg=int(nperseg),
         notes=preparation,
+        settings=replace(chosen),
+        provenance=sample_provenance(recording, used),
     )
 
 
@@ -157,7 +179,6 @@ def log_residual(item: ChannelFit) -> tuple[np.ndarray, np.ndarray] | None:
 
 def _fill_from_group(group, results: list[ChannelFit], usable: list[int]) -> None:
     aperiodic = np.atleast_2d(np.asarray(group.get_params("aperiodic"), dtype=np.float64))
-    peaks = _peak_table(group.get_params("periodic"))
     errors = np.atleast_1d(np.asarray(group.get_metrics("error"), dtype=np.float64))
     gof = np.atleast_1d(np.asarray(group.get_metrics("gof"), dtype=np.float64))
     for slot, channel_index in enumerate(usable):
@@ -168,11 +189,14 @@ def _fill_from_group(group, results: list[ChannelFit], usable: list[int]) -> Non
             item.offset, item.exponent, item.knee = _read_aperiodic(aperiodic[slot])
         item.error = float(errors[slot]) if slot < errors.size else None
         item.r_squared = float(gof[slot]) if slot < gof.size else None
-        item.peaks = _peaks_for(peaks, slot)
+        # The group table for "periodic" is the raw gaussian. The channel model
+        # reports the same converted height and two-sided width as a one-channel fit.
+        item.peaks = _peak_rows(model.get_params("periodic"))
 
 
 def _fill_one_by_one(spectral_model, results, usable, freqs, power, kwargs: dict) -> None:
     for slot, channel_index in enumerate(usable):
+        checkpoint(slot, len(usable), f"Fitting channel {slot + 1} of {len(usable)}")
         item = results[channel_index]
         model = spectral_model(**kwargs)
         try:
@@ -231,13 +255,6 @@ def _peak_rows(values) -> list[tuple[float, float, float]]:
     return rows
 
 
-def _peaks_for(table: np.ndarray, slot: int) -> list[tuple[float, float, float]]:
-    if table.size == 0:
-        return []
-    chosen = table[np.rint(table[:, -1]).astype(int) == int(slot)]
-    return [(float(row[0]), float(row[1]), float(row[2])) for row in chosen if np.all(np.isfinite(row[:3]))]
-
-
 def _preparation_notes(before: list[str], after: list[str]) -> str:
     added = [note for note in after if note not in before and not note.startswith("Fit window")]
     return " ".join(added)
@@ -279,6 +296,7 @@ def _fit_epochs(recording: Recording, settings: FitSettings) -> SpectrumFit:
         )
         preparation = _preparation_notes(list(recording.notes), prepared.notes)
         single.notes = " ".join(part for part in (preparation, extra) if part)
+        single.settings = replace(settings)
         return single
     pieces = []
     start = 0
@@ -286,14 +304,18 @@ def _fit_epochs(recording: Recording, settings: FitSettings) -> SpectrumFit:
         pieces.append((start, start + width))
         start += width
     fits = []
-    for i0, i1 in pieces:
+    for position, (i0, i1) in enumerate(pieces):
+        checkpoint(position, len(pieces), f"Fitting epoch {position + 1} of {len(pieces)}")
         try:
-            fits.append(fit_spectra(prepared.cropped(i0, i1), child))
+            epoch = fit_spectra(prepared.cropped(i0, i1), child)
+            epoch.t_start, epoch.t_end = t_start + i0 / prepared.sfreq, t_start + i1 / prepared.sfreq
+            fits.append(epoch)
         except ValueError:
             continue
     if not fits:
         raise ValueError("No epoch was long enough to fit.")
     combined = _combine_epochs(fits, settings, t_start, t_end)
+    combined.epochs = fits
     notes = _preparation_notes(list(recording.notes), prepared.notes)
     leftover = prepared.n_samples - start
     if leftover > 0 and prepared.sfreq:
@@ -306,6 +328,15 @@ def _fit_epochs(recording: Recording, settings: FitSettings) -> SpectrumFit:
             ) if part
         )
     combined.notes = notes
+    used = {name: [] for name in prepared.ch_names}
+    for fit in fits:
+        for name, info in fit.provenance.get("channels", {}).items():
+            for start_s, stop_s in info["accepted_spans_source_s"]:
+                used[name].append((
+                    int(round((start_s - prepared.source_start_s) * prepared.sfreq)),
+                    int(round((stop_s - prepared.source_start_s) * prepared.sfreq)),
+                ))
+    combined.provenance = sample_provenance(prepared, used)
     return combined
 
 
@@ -328,6 +359,7 @@ def _combine_epochs(fits: list[SpectrumFit], settings: FitSettings, t_start: flo
         welch_nperseg=fits[0].welch_nperseg,
         epoch_s=float(settings.epoch_s or 0.0),
         epoch_count=len(fits),
+        settings=replace(settings),
     )
 
 
@@ -369,9 +401,9 @@ def _combine_channel(items: list[ChannelFit], settings: FitSettings) -> ChannelF
         peaks=peaks,
         peak_counts=[count for _center, _power, _width, count in grouped],
         freqs=np.asarray(base.freqs, dtype=np.float64).copy(),
-        spectrum=np.mean([item.spectrum for item in curves], axis=0),
-        model=None if not models else np.mean(models, axis=0),
-        aperiodic=None if not aperiodics else np.mean(aperiodics, axis=0),
+        spectrum=_mean_power([item.spectrum for item in curves]),
+        model=None if not models else _mean_power(models),
+        aperiodic=None if not aperiodics else _mean_power(aperiodics),
         n_epochs=len(usable),
         n_peak_epochs=n_peak,
         peak_at_width_floor=bool(
@@ -386,8 +418,16 @@ EPOCH_PEAKS = (
     "The reported center, height, and width are the medians of the epochs in that group. "
     "An epoch that missed the peak is left out of the median. It is not entered as a height of zero. "
     "The number of epochs with an in-band peak is counted separately and does not scale the height. "
-    "Offset, exponent, and R² are medians across epochs that fit. The spectrum curve is their mean."
+    "Offset, exponent, and R² are medians across epochs that fit. "
+    "Spectrum and model curves are arithmetic means in linear power, displayed in log10 units."
 )
+
+
+def _mean_power(log_curves: list[np.ndarray]) -> np.ndarray:
+    """Average linear power without overflowing when converting log10 curves."""
+    curves = np.asarray(log_curves, dtype=np.float64)
+    peak = np.max(curves, axis=0)
+    return peak + np.log10(np.mean(np.power(10.0, curves - peak), axis=0))
 
 
 def epochs_for_peak(item: ChannelFit, peak: tuple[float, float, float] | None) -> int | None:

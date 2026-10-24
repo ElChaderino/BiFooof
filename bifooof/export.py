@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import csv
 import json
 from pathlib import Path
@@ -10,6 +12,7 @@ from . import __version__
 from .analysis.compare import ChannelComparison
 from .analysis.cycles import CycleFit
 from .analysis.settings import FitSettings, band_label
+from .analysis.prepare import prepare_recording, sample_provenance
 from .analysis.specparam_fit import SpectrumFit
 from .io.condition import CONDITION_LABELS
 from .io.recording import Recording
@@ -20,7 +23,16 @@ def save_figure(fig, path: str | Path) -> Path:
     if destination.suffix.lower() != ".png":
         destination = destination.with_suffix(".png")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(destination, dpi=150, bbox_inches="tight", facecolor="white")
+    original_size = fig.get_size_inches().copy()
+    compact = original_size[0] < 6 or original_size[1] < 3
+    try:
+        if compact:
+            fig.set_size_inches(10, 7, forward=False)
+        fig.savefig(destination, dpi=150, bbox_inches="tight", facecolor="white")
+    finally:
+        if compact:
+            fig.set_size_inches(*original_size, forward=False)
+            fig.canvas.draw_idle()
     return destination
 
 
@@ -39,6 +51,35 @@ def write_csv(path: str | Path, rows: list[dict]) -> Path:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: _cell(row.get(key)) for key in fields})
+    return destination
+
+
+def write_csv_stream(path, rows):
+    """Write a consistent-schema iterator with bounded memory and safe replacement."""
+    from .jobs import checkpoint
+    import os
+    import tempfile
+    destination = Path(path).with_suffix(".csv")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".bifooof-csv-", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as stream:
+            iterator = iter(rows)
+            first = next(iterator, None)
+            fields = list(first) if first else ["empty"]
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            if first is not None:
+                writer.writerow({key: _cell(value) for key, value in first.items()})
+            for index, row in enumerate(iterator):
+                if index % 1000 == 0:
+                    checkpoint(message=f"Writing table row {index + 2}")
+                writer.writerow({key: _cell(value) for key, value in row.items()})
+        checkpoint(message="Publishing completed table")
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return destination
 
 
@@ -150,6 +191,8 @@ def cycle_summary_row(fit: CycleFit, condition: str, source: str = "") -> dict:
         "burst_duration_s": fit.burst_duration_s,
         "burst_fraction": fit.burst_fraction,
         "burst_note": fit.burst_note,
+        "failed_runs": len(fit.failures),
+        "failed_run_details": json.dumps(fit.failures, ensure_ascii=False),
         "period_ms": fit.period_ms,
         "rise_decay": fit.rise_decay,
         "peak_trough": fit.peak_trough,
@@ -213,8 +256,13 @@ def fit_metadata(
     extras: dict | None = None,
 ) -> dict:
     """Settings and exclusions behind one fit, so a table can be read later."""
-    invalid = 0 if recording.valid is None else int((~recording.valid).sum())
-    accepted = recording.n_samples if recording.valid is None else int(recording.valid.any(axis=0).sum())
+    settings = replace(fit.settings or settings) if fit is not None else replace(settings)
+    provenance = {} if fit is None else fit.provenance
+    if not provenance:
+        effective = settings
+        if fit is not None and fit.t_end > fit.t_start:
+            effective = replace(settings, t_start=fit.t_start, t_length=fit.t_end - fit.t_start)
+        provenance = sample_provenance(prepare_recording(recording, effective))
     payload = {
         "bifooof": __version__,
         "specparam": _package_version("specparam"),
@@ -226,7 +274,7 @@ def fit_metadata(
         "format": recording.source_format,
         "sfreq_hz": recording.sfreq,
         "units": "microvolts",
-        "reference": "as stored in the file; BiFooof does not re-reference",
+        "recording_source_start_s": recording.source_start_s,
         "time_window_start_s": None if fit is None else fit.t_start,
         "time_window_end_s": None if fit is None else fit.t_end,
         "fmin_hz": settings.fmin if fit is None else fit.fmin,
@@ -240,7 +288,8 @@ def fit_metadata(
         "min_peak_height": settings.min_peak_height,
         "peak_threshold_sd": settings.peak_threshold,
         "band_hz": [settings.alpha_low, settings.alpha_high],
-        "reference": settings.reference,
+        "reference": provenance.get("reference_applied", settings.reference),
+        "reference_requested": settings.reference,
         "amplitude_limit_uv": settings.amplitude_limit_uv,
         "epoch_s": settings.epoch_s,
         "burst_thresholds": settings.cycle_thresholds(),
@@ -248,9 +297,12 @@ def fit_metadata(
         "rejected_spans_s": [
             {"start": start, "end": stop} for start, stop in recording.rejected_spans
         ],
-        "invalid_channel_samples": invalid,
-        "accepted_duration_s": accepted / recording.sfreq if recording.sfreq else 0.0,
+        **provenance,
+        "effective_epoch_s": None if fit is None else fit.epoch_s,
+        "contributing_epochs": 0 if fit is None else fit.epoch_count,
         "notes": list(recording.notes),
+        "import": dict(recording.import_info),
+        "preparation_notes": "" if fit is None else fit.notes,
         "peak_height_definition": (
             "EC minus EO fitted peak height above the aperiodic background, in log10 power. "
             "Each condition picks its own tallest peak in the band. A missing peak stays missing."

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -126,7 +128,7 @@ class ComparePanel(QWidget):
         return "ec" in self.fits and "eo" in self.fits
 
     def apply_settings(self, settings: FitSettings) -> None:
-        self.settings = settings
+        self.settings = replace(settings)
         self.band = settings.alpha_band()
         self._cycle_key = None
         self._refresh_headers()
@@ -146,10 +148,11 @@ class ComparePanel(QWidget):
         self.recordings = recordings
         self.fits = fits
         self.band = (float(band[0]), float(band[1]))
-        self.settings.alpha_low = self.band[0]
-        self.settings.alpha_high = self.band[1]
+        self.settings = replace(self.settings, alpha_low=self.band[0], alpha_high=self.band[1])
         self._refresh_headers()
         if not self.ready:
+            for condition in ("ec", "eo"):
+                self._generations[condition] = self._generations.get(condition, 0) + 1
             self.rows = []
             self.table.setRowCount(0)
             self.cycle_fits = {}
@@ -302,11 +305,11 @@ class ComparePanel(QWidget):
         side_left, side_right, short_left, short_right = self._names()
         _plot_condition(ax, ec_item, _EC, side_left, alpha)
         _plot_condition(ax, eo_item, _EO, side_right, alpha)
-        ax.set_xlabel("")
+        ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("log10 power")
         pair = "eyes closed vs eyes open" if self.mode.currentData() == "state" else f"{side_left} vs {side_right}"
         ax.set_title(
-            f"{self.channel}   ·   {pair}   ·   {shown}",
+            f"{self.channel}   ·   {shown}\n{pair}",
             fontsize=10, loc="left",
         )
         ax.legend(frameon=False, fontsize=8)
@@ -317,12 +320,12 @@ class ComparePanel(QWidget):
         draw_head(
             fig.add_subplot(maps[0, 0]), names,
             [row.exponent_delta for row in self.rows],
-            f"Exponent  {fmin:g}–{fmax:.0f} Hz  {short_right} − {short_left}", "viridis", self.channel, weak,
+            f"Exponent\n{fmin:g}–{fmax:.0f} Hz  ·  {short_right} − {short_left}", "viridis", self.channel, weak,
         )
         draw_head(
             fig.add_subplot(maps[1, 0]), names,
             [row.alpha_reactivity for row in self.rows],
-            f"{shown} peak height  {short_left} − {short_right}", "plasma", self.channel,
+            f"{shown}\nPeak height  ·  {short_left} − {short_right}", "plasma", self.channel,
             [weak[index] or row.peak_at_floor_ec or row.peak_at_floor_eo for index, row in enumerate(self.rows)],
         )
         _paired_dots(fig.add_subplot(curves[3, 0]), self.rows, side_left, side_right)
@@ -383,7 +386,7 @@ class ComparePanel(QWidget):
             ]
             worker = CallWorker(
                 generation, fit_cycles,
-                (recording, index, self.band, matched_settings(self.settings, recording, others)),
+                (recording, index, self.band, replace(matched_settings(self.settings, recording, others))),
             )
             worker.succeeded.connect(
                 lambda gen, result, cond=condition: self._cycle_done(cond, gen, result)
@@ -392,7 +395,7 @@ class ComparePanel(QWidget):
                 lambda gen, message, cond=condition: self._cycle_failed(cond, gen, message)
             )
             self._workers[condition] = worker
-            launch(self, worker)
+            launch(self, worker, key=condition)
         self._fill_cycles(None, None)
         self.status.emit(f"Comparing cycles on {self.channel}…")
 
@@ -476,7 +479,7 @@ def _paired_dots(ax, rows, left: str, right: str) -> None:
             ax.scatter([xpos[1]], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
     ax.set_ylabel("Peak height")
     ax.set_title(
-        f"One line per channel   ·   {drawn} with both peaks   ·   a missing peak is a dot",
+        f"{drawn} channels with paired peaks\nA missing peak is a single dot",
         fontsize=9, loc="left",
     )
     style_axes(ax, grid=True)

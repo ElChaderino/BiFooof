@@ -39,6 +39,10 @@ class Recording:
     # Ear or mastoid channels kept for a linked-ear reference. They are not fitted.
     reference_channels: dict[str, np.ndarray] = field(default_factory=dict)
     dropped_by_amplitude: list[str] = field(default_factory=list)
+    # Sample zero's position in the original source, preserved through crops.
+    source_start_s: float = 0.0
+    reference_applied: str = "stored"
+    import_info: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.data = np.ascontiguousarray(self.data, dtype=np.float64)
@@ -48,8 +52,10 @@ class Recording:
             raise ValueError(
                 f"{self.data.shape[0]} data rows but {len(self.ch_names)} channel names."
             )
-        if self.sfreq <= 0:
+        if not np.isfinite(self.sfreq) or self.sfreq <= 0:
             raise ValueError("Sampling rate must be positive.")
+        if not np.isfinite(self.source_start_s):
+            raise ValueError("The source start must be finite.")
         if self.valid is not None:
             self.valid = np.ascontiguousarray(self.valid, dtype=bool)
             if self.valid.shape != self.data.shape:
@@ -100,6 +106,9 @@ class Recording:
             rejected_spans=spans,
             reference_channels=refs,
             dropped_by_amplitude=list(self.dropped_by_amplitude),
+            source_start_s=self.source_start_s + t0,
+            reference_applied=self.reference_applied,
+            import_info=dict(self.import_info),
         )
 
     def mask(self, index: int) -> np.ndarray:
@@ -107,6 +116,17 @@ class Recording:
         if self.valid is None:
             return np.ones(self.n_samples, dtype=bool)
         return np.asarray(self.valid[index], dtype=bool)
+
+    def analysis_channel(self, name: str) -> bool:
+        """Voltage EEG channels eligible for neural analysis and referencing."""
+        if name in {"A1", "A2", "M1", "M2"}:
+            return False
+        kind = self.import_info.get("analysis_channel_types", {}).get(name, "eeg")
+        return kind in {"eeg", "seeg", "ecog", "dbs", "misc"}
+
+    def require_analysis_channel(self, index: int) -> None:
+        if not self.analysis_channel(self.ch_names[index]):
+            raise ValueError(f"{self.ch_names[index]} is an auxiliary/reference channel, retained for trace review only.")
 
     def slice_exclusions(self, i0: int, i1: int, t0: float) -> tuple[np.ndarray | None, list[tuple[float, float]]]:
         """Validity mask and rejected spans for samples ``i0:i1``, timed from the slice start."""

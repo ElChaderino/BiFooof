@@ -14,6 +14,7 @@ WinEEG .eeg reading is part of the app.
 """
 
 from pathlib import Path
+import os
 
 import mne
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -165,6 +166,12 @@ a = Analysis(
     ],
     noarchive=False,
 )
+# Qt 6 on Windows imports the OS ICU interface (unversioned function names).
+# A PDF/tooling directory on PATH can supply a different icuuc.dll whose exports
+# have version suffixes. Do not shadow Windows' ICU with that unrelated copy.
+if os.name == "nt":
+    windows_icu = {"icu.dll", "icuuc.dll", "icuin.dll"}
+    a.binaries = [entry for entry in a.binaries if Path(entry[0]).name.lower() not in windows_icu]
 pyz = PYZ(a.pure)
 
 # One file. Windows treats BiFooof.exe and bifooof.exe as the same file, so a

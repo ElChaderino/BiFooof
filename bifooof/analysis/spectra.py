@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from ..jobs import checkpoint
 from scipy.signal import detrend, welch
 
 from .segments import accepted_runs
@@ -54,6 +55,7 @@ def welch_spectra(
     power = None
     freqs = None
     for index in range(values.shape[0]):
+        checkpoint(index, values.shape[0], f"Estimating spectrum {index + 1} of {values.shape[0]}")
         pieces = []
         weights = []
         for start, stop in accepted_runs(accepted[index]):

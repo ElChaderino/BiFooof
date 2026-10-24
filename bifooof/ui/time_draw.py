@@ -177,6 +177,10 @@ def draw_raster(fig, fits: list[CycleFit], inspection) -> None:
         span = max(ends) - min(starts)
         pad = max(0.4, span * 0.04)
         ax.set_xlim(min(starts) - pad, max(ends) + pad)
+    else:
+        limits = _fit_limits(fits)
+        if limits is not None:
+            ax.set_xlim(*limits)
     ax.set_yticks(yticks)
     ax.set_yticklabels(labels)
     ax.set_xlabel("Time (s)")
@@ -403,6 +407,8 @@ def draw_coherence(fig, result: CoherenceResult, raw=None, other: CoherenceResul
 
 def draw_pac(fig, result: PacResult) -> None:
     _open(fig)
+    if result.phase_channel and result.amplitude_channel:
+        fig.suptitle(f"Phase: {result.phase_channel}   ·   Amplitude: {result.amplitude_channel}", fontsize=10)
     if result.histogram is None and result.comodulogram is None:
         ax = fig.add_subplot(111)
         _blank(ax, result.note or "No coupling estimate.")
@@ -735,6 +741,21 @@ def _finite_percentile(values, percent: float) -> np.ndarray:
         if finite.size:
             out[index] = float(np.percentile(finite, percent))
     return out
+
+
+def _fit_limits(fits: list[CycleFit]) -> tuple[float, float] | None:
+    """Recording-clock span of the fits, used when a burst row has no episodes."""
+    bounds = []
+    for fit in fits:
+        if fit.sfreq <= 0 or fit.filtered.size == 0:
+            continue
+        start = float(fit.t_offset)
+        end = start + fit.filtered.size / float(fit.sfreq)
+        if end > start:
+            bounds.append((start, end))
+    if not bounds:
+        return None
+    return min(item[0] for item in bounds), max(item[1] for item in bounds)
 
 
 def _blank(ax, message: str) -> None:

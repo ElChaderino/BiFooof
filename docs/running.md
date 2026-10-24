@@ -2,27 +2,45 @@
 
 This file is what BiFooof does while it is open. When a control, a caption, or a saved column changes, change this file in the same edit. [additional-graphs.md](additional-graphs.md) is the plan the Time views were built from. Where the two disagree, this file matches the program.
 
-Times on every page are seconds from the start of the recording on screen. A click moves the picture. **Refit** is the only control that refits. **Set fit window** writes a stretch into the fit bar and leaves Refit to you.
+Times on every page are seconds from the start of the recording on screen. A click moves the picture. **Refit** applies staged fit settings. **Set fit window** writes a stretch into the fit bar and leaves Refit to you. The selected band updates its dependent views immediately.
+
+MNE annotations use that recording-local clock, including cropped FIF recordings with a nonzero first sample. Ordinary event and eye-state annotations are retained. Duration-bearing WinEEG artifact marks are excluded from fits. Clock notes do not end an eye-state span. CSV time columns must be finite, increasing, and uniformly sampled; timestamp gaps or rate changes produce an error instead of being compressed. Timestamp rounding within 1% of the sample interval, or 1 microsecond, is accepted.
 
 The scrollbars on Traces and Cycles only move the picture. Rejected samples stay out of the fits. A missing specparam peak stays missing. It is not entered as zero.
 
 The command line fits spectra, cycles, and the eyes-closed / eyes-open comparison. It does not compute the Time views.
 
+## Controls and feedback
+
+The fit bar keeps window, spectrum preset, band, reference, epoch length, and amplitude limit visible. Its groups wrap at smaller window sizes. **More settings** opens the frequency limits, Welch segment, aperiodic model, peak limits, and burst rules; **Hide settings** folds them away.
+
+Staged edits show **Settings changed** and **Refit\***. Reverting the edit clears that message. The band updates immediately. Invalid ranges show a specific message and disable Refit until corrected. Refit is also disabled while the spectral or cycle analyses are running. A small status-bar progress indicator shows background work.
+
+Time keeps the view and channel on its first row. The controls for that view are labeled and wrap underneath. Long source names shorten in the header; the tooltip retains the complete description.
+
+Keyboard shortcuts: **Ctrl+O** opens eyes closed, **Ctrl+Shift+O** opens eyes open, **Ctrl+R** refits, **Ctrl+S** saves a project, **Ctrl+P** opens a project, **Ctrl+Shift+E** exports results, **Ctrl+Shift+S** saves the current image, and **Ctrl+E** saves current data. **Ctrl+B** adds a bookmark; **Ctrl+[ / Ctrl+]** navigate bookmarks; **Ctrl+Alt+Z / Ctrl+Alt+Y** undo/redo review edits; **Esc** requests cancellation; **F1** opens the measurement guide.
+
+File inspection and save errors show a short error with expandable technical details. Closing during analysis keeps the event loop responsive and closes automatically after running workers finish.
+
 ## Pages
 
-Traces, Spectrum, Time, Cycles, Compare, Findings. The channel you select is the channel on all of them.
+Traces, Spectrum, Time, Cycles, Compare, Findings, Review, Study. The channel you select follows you between the analysis pages.
 
 ### Traces
 
-The raw recording, in microvolts, for the page length and gain on that page. A click on Time scrolls this page so that time is in view. It does not change the fit window.
+The recording, in microvolts, for the page length and gain on that page. A click on Time scrolls this page so that time is in view. Left/Right and Page Up/Page Down page the trace; Jump moves to an explicit time. Drag to select an interval: the ruler reports time and the displayed-sample amplitude change on the channel where the drag began. Excluded endpoint samples have no amplitude measurement.
+
+Display bandpass/notch filters and average/bipolar montages affect the picture. They do not change fit settings. The average display montage uses eligible neural channels, and supported bipolar pairs must both be visible. Brief extrema and missing-sample gap boundaries survive display reduction. The fit window, review bookmarks and exclusions can appear as overlays.
 
 ### Spectrum
 
 specparam on the fit-bar window. The curve is the Welch spectrum, the model, and the aperiodic part, in log10 power. Under it is the residual, spectrum minus model, on the same frequency axis. Click either axes and the caption reports the residual at the nearest bin.
 
-The head maps sit to the right of the spectrum, exponent above peak frequency, large enough to read every site. A weak fit, R² below 0.6, is ringed. A peak at the narrowest allowed width is marked. A site with no fit is empty.
+The head maps sit to the right of the spectrum, exponent above peak frequency, large enough to read every site. A weak fit, R² below 0.6, is ringed. A peak at the narrowest allowed width is marked. A site with no fit is empty. The residual has its frequency label underneath; comparison titles use separate lines to stay readable in smaller windows.
 
 Epochs, 30 s or 60 s, still collapse to one spectrum. Peaks within 1 Hz are grouped. Center, height, and width are medians of the epochs that found the peak. An epoch that missed it is left out of the median. The Time tab does not use that collapse. Each sliding window stays its own fit.
+
+The epoch spectrum and model curves use the arithmetic mean of linear power, displayed in log10 units. Band-power comparisons therefore use mean linear Welch power. Parameter medians and peak counts remain separate from this curve average.
 
 ### Cycles
 
@@ -33,6 +51,8 @@ A click on Time scrolls the filtered trace to that time.
 ### Compare
 
 Eyes closed is the file opened with the eyes-closed button. Eyes open is the other. Both fits keep running.
+
+Whole-recording comparisons use the shorter duration on both sides in the window and CLI, including the cycle fits. Explicit start/length choices are preserved. Replacement fits invalidate the previous comparison immediately; failed or pending results are not available to export.
 
 The pair menu only changes words:
 
@@ -78,7 +98,11 @@ One tab, one menu, and a channel menu. The channel menu is the same channel as T
 
 **Leave out** copies the recording with that stretch removed and refits. The channel you were on stays selected. **Put back** restores a stretch that was left out here. Detected and suspected rows do nothing until Leave out.
 
+Confirmed exclusions on either split eye-state recording also apply to the original continuous recording used for event reactivity. Their source offsets are preserved. Restoring an exclusion restores those event samples as well. Live band changes reach the Time views immediately. Cached and in-progress Time jobs keep separate request identities, so a completed job cannot replace a different selected view.
+
 ## Saving
+
+The save buttons follow the current tab and its available results. Pending or failed Time jobs have no data to export. Export results becomes available after background analysis finishes. Checking button availability does not construct the potentially large spectrogram CSV.
 
 **Save image** writes the current page as a PNG. Findings is text; use Copy on that page.
 
@@ -92,4 +116,145 @@ One tab, one menu, and a channel menu. The channel menu is the same channel as T
 - Quality: one row per span.
 - Reactivity, when it is a single trace: time and band power.
 
-**Save session** writes the traces, each condition’s spectrum, peaks, and metadata, the cycle tables, the comparison, findings, and `time.png` / `time.csv` when the Time page has rows. The metadata names the spectrogram window and overlap once that picture exists, and the sliding window once that fit has been run.
+**Export results** writes the traces, each condition’s spectrum, peaks, and metadata, the cycle tables, the comparison, findings, and `time.png` / `time.csv` when the Time page has rows. The metadata names the spectrogram window and overlap once that picture exists, and the sliding window once that fit has been run. A project is a separate file for reopening the review.
+
+GUI sessions and CLI runs are staged before the destination is changed. A successful export replaces the BiFooof-owned files in that folder, removes obsolete peak/cycle/plot files, and keeps unrelated files. Canonical output names such as `metadata.json`, `peaks.csv`, `ec_spectrum.csv`, and `cycles.png` are reserved for the app. A failed calculation preserves the previous bundle; ordinary publishing errors roll it back. `bifooof-manifest.json` is written last and lists the completed output files.
+
+Metadata uses the settings snapshot attached to the fit. It reports the requested and applied references, source offset, contributing epochs, per-channel accepted sample counts/durations, and accepted/excluded intervals on the original source clock. The top-level accepted duration is time with at least one channel contributing samples. Short runs that cannot enter Welch and incomplete epoch tails are excluded from those counts.
+
+Coupling results identify both the phase channel and the amplitude channel. Every map cell uses those same channel choices and the same filtering/edge handling as the selected-band calculation. The map's band widths differ from the manually selected band, so their numerical indices need not match unless the band edges match.
+
+## Saved projects and recovery
+
+File → Save project writes a versioned `.bifooof.json` review; Open project restores
+it. The file references source recordings rather than copying their sample data.
+Keep those sources and companion files. SHA-256 identities cover the primary
+source, BrainVision data/marker files, JSON manifest CSV files and declared EEGLAB
+FDT files. Moved sources can be relinked during reopening; their contents must
+match. Changed sources are rejected before restoration and can be opened as a
+new recording. Event review copies follow a verified relink.
+
+The project preserves condition assignments, source offsets, manual exclusions,
+bad-channel decisions, bookmarks, notes and undo/redo history, regions, edited
+events, applied settings, staged edits, selected channel and view controls.
+Completed measurement summaries support the session index. Reopening recomputes
+the analyses; an unfinished calculation is not restored as a completed result.
+
+Review edits and view changes trigger a debounced recovery copy. File → Recover
+last workspace reopens it through the same source verification. Atomic writes
+preserve a `.previous` copy. Preferences, recovery and profile files live under
+`%USERPROFILE%\.bifooof`; `BIFOOOF_STATE_DIR` selects another location. Recent
+projects/folders and window geometry persist there.
+
+## Review journal and quality overview
+
+Review → Quality lists per-channel accepted duration, excluded percentage,
+Welch support, contributing epochs, fit error/R², peak-width flags, requested
+and applied reference, failure reasons and reviewer status. Comparison checks
+show mismatched channel sets, reference contributors, frequency coverage,
+settings, source units and clean-data support. Equal elapsed windows can contain
+different amounts of usable signal. These checks are evidence to inspect;
+Reviewed is a reviewer decision separate from the calculated flags.
+
+Double-click a quality row to inspect the channel's spectrum. Mark reviewed,
+exclude channel or restore it using the explicit actions. Trace visibility
+does not control analysis eligibility. Original file bad channels and masks
+remain excluded when a manual decision is undone.
+
+Notes and bookmarks supports an alias, session date, observations, and bookmarks
+with condition, channel scope, time, duration, label and note. Bookmarks are
+informational until explicitly excluded. Their navigation opens the signal;
+editing, deleting and excluding a bookmark participates in review undo/redo.
+
+Import inspection shows original/normalized names, retained channels, analysis
+eligibility, types, units, rate and known/unknown stored reference. File → Import
+channel selection changes future imports between the standard 19 preference
+and all remaining voltage channels. EOG/ECG/EMG and ear references can be retained
+for trace review but do not enter neural fits or the EEG average reference.
+MNE status/stimulation channels are omitted. Nonstandard neural channels can be
+fitted, but head maps still require known electrode positions. CSV defaults to
+microvolts; JSON can declare units, reference and a channel-name-to-type mapping.
+
+## Profiles and help
+
+Profiles saves, previews, imports and exports versioned named processing settings
+including custom burst thresholds and Time controls. The Review label shows a
+modified profile when controls differ. Exclusions and source identity belong to
+the project. A CLI run can use the same fit snapshot with
+`python -m bifooof run FILE --profile PROFILE.json`. Time controls apply in the GUI.
+Help → Measurement guide defines the measures; Help → Open synthetic demonstration
+creates generated EC/EO rhythms for trying the review workflow.
+
+## Study views
+
+- **Epoch stability:** examine retained individual epochs or compute explicit
+  nonoverlapping windows with spectral and cycle summaries. Window rows link to
+  the signal. The plot shows the selected channel's measurements, median and IQR;
+  the summary table includes total/peak-present window counts and first/second
+  half medians. These describe variability, not confidence intervals.
+- **Alpha candidates:** choose a declared region and search range. Rows show
+  supported fitted peaks, resolution, fit quality, epoch support and width flags.
+  Accept a selected row with an explicit half-width to apply one shared band to
+  both conditions. Its defining condition/channel/search is saved as band origin.
+  Unsupported peaks remain missing; the band must fit the actual spectral range
+  and both Nyquist limits.
+- **Regions:** add/edit named channel groups. Summaries use the same available,
+  usable members across conditions and list missing members. They summarize
+  existing channel fits; they are not a new fit to an averaged regional PSD.
+  Left/right asymmetry is `log10(mean left band PSD / mean right band PSD)`.
+  Band PSD is mean linear density in µV²/Hz. Nonpositive or missing power yields
+  no asymmetry value.
+- **Events:** inspect and navigate source-clock events, edit review copies, map
+  eye states or leave an event informational, and add/remove review events.
+  EC→EO and EO→EC remain separate. Time → Reactivity uses the selected direction
+  on a real continuous source, displays baseline/response windows and contributing
+  event counts, and exports per-event aligned band-power rows. Partial curves
+  remain visible; events lacking baseline or response are excluded from the
+  direction-specific change estimate. Separate recordings retain separate courses.
+- **Repeated sessions:** add saved project files to the local index, select a
+  channel, measure and baseline. Dated EC/EO points share the session position.
+  Baseline delta means session minus baseline; tables preserve its project,
+  definition, processing settings, reference, profile, notes, accepted support
+  and fit quality. Unknown/different stored references and changed processing
+  are flagged. Double-click a point or table row to reopen its verified project.
+  Save a project after calculations finish to update its completed summaries.
+
+Study tables can be exported with Save data. Saved projects retain the underlying
+review and source references; exporting a table does not replace that project.
+
+## Reports, batch work and longer recordings
+
+File → Preview report and results lets you choose sections, individual current
+plots and whether source paths/filenames are included. The preview shows labels
+and reviewer text before export. The offline HTML and A4 PDF contain observations,
+calculated findings, quality/support, applied settings, versions and measurement
+definitions from one completed snapshot. Selected plots render at a readable
+size even when their tab is hidden. Reviewer notes/aliases are included as typed.
+
+The results bundle adds versioned `review.json`, `events.tsv`/`events.json`,
+`channels.tsv`, `measurement_dictionary.json`, `quality.csv`, `regions.csv` and
+`epochs.csv` to the existing outputs. Event TSV times use sample zero of the
+original source. These documented sidecars do not constitute a complete BIDS
+dataset. Reports and sidecars appear in the export manifest.
+
+Tools → Batch queue locks the applied processing settings for a queue. Assign
+each input to EC or EO, optionally select a channel region for cycles, and choose
+the output folder. Jobs run sequentially in unique destinations. A malformed
+input does not stop other items. Retry failed/pending items preserves successful
+outputs and aggregate rows; JSON records the locked fit settings. Cancellation
+leaves completed items intact and never marks an unfinished item complete.
+
+Background work reports its current channel/window/run where supported. Esc or
+Tools → Cancel requests cooperative cancellation; a library call already running
+finishes before the next checkpoint. Each request scope keeps one active and
+one latest pending job. Stale results cannot replace newer requests. Time's
+result cache is bounded to 128 MiB and Tools can clear it. Review masks share
+source sample storage. Spectrogram/sliding CSV data streams in a worker; cancelled
+exports preserve the previous destination. Skipped cycle runs retain their
+reasons in caption details and cycle-summary exports.
+
+The recorded performance fixture uses a generated one-hour, 19-channel, 256 Hz
+recording: 133.6 MiB of samples, 2.39 s for whole-window spectra and 7.75 s for
+one channel's cycles on this machine. Peak process working set was 639 MiB.
+It includes cold library imports and excludes file decoding and GUI work;
+it is one reproducible local measurement, not a bound for every recording.

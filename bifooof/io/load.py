@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+from contextvars import ContextVar
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +45,20 @@ _MNE_READERS = {
 }
 
 
-def load_recording(path: str | Path, sfreq: float | None = None) -> Recording:
+_channel_policy = ContextVar("channel_policy", default="standard")
+
+
+def load_recording(path: str | Path, sfreq: float | None = None, *, channel_policy="standard") -> Recording:
+    if channel_policy not in {"standard", "all"}:
+        raise ValueError("Channel policy is standard or all.")
+    token = _channel_policy.set(channel_policy)
+    try:
+        return _load_recording(path, sfreq)
+    finally:
+        _channel_policy.reset(token)
+
+
+def _load_recording(path: str | Path, sfreq: float | None = None) -> Recording:
     """Load ``path`` and return a microvolt :class:`Recording`."""
     source = Path(path)
     kind = sniff(source)
@@ -105,6 +119,7 @@ def finalize(
     valid: np.ndarray | None = None,
     bad_channels: list[str] | None = None,
     rejected_spans: list[tuple[float, float]] | None = None,
+    channel_types: dict[str, str] | None = None,
 ) -> Recording:
     """Clean names, drop annotation channels, and prefer the standard 19.
 
@@ -134,8 +149,16 @@ def finalize(
     seen: set[str] = set()
     dropped_aux = 0
     dropped_dup = 0
+    if channel_types is not None and (not isinstance(channel_types, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in channel_types.items())):
+        raise ValueError("channel_types must map channel names to type strings.")
+    analysis_types = {}
     for index, raw_name in enumerate(names):
-        if is_auxiliary(raw_name):
+        kind = (channel_types or {}).get(raw_name, "eeg").lower()
+        if not channel_types:
+            for auxiliary in ("eog", "ecg", "ekg", "emg"):
+                if str(raw_name).strip().lower().startswith(auxiliary):
+                    kind = "ecg" if auxiliary == "ekg" else auxiliary
+        if is_auxiliary(raw_name) or kind not in {"eeg", "eog", "ecg", "emg", "misc", "bio", "seeg", "ecog", "dbs"}:
             dropped_aux += 1
             continue
         label = clean_channel_name(raw_name)
@@ -147,6 +170,7 @@ def finalize(
             continue
         seen.add(label)
         cleaned.append(label)
+        analysis_types[label] = kind
         kept_rows.append(index)
 
     if not kept_rows:
@@ -161,7 +185,7 @@ def finalize(
             ear[~accepted[index]] = np.nan
             reference_channels[name] = ear
     matched = match_standard_19(cleaned)
-    if matched:
+    if matched and _channel_policy.get() == "standard":
         order = [cleaned.index(name) for name in matched]
         array = array[order]
         accepted = accepted[order]
@@ -169,8 +193,10 @@ def finalize(
         skipped = len(kept_rows) - len(order)
         if skipped:
             notes.append(f"Kept {len(cleaned)} standard 10-20 channels and set aside {skipped} others.")
-    else:
+    elif not matched:
         notes.append("No standard 10-20 channels matched; kept all remaining channels.")
+    else:
+        notes.append("Retained all voltage channels; auxiliary and ear-reference channels are for trace review only.")
     if dropped_aux:
         notes.append(f"Dropped {dropped_aux} annotation or marker channel(s).")
     if dropped_dup:
@@ -208,6 +234,10 @@ def finalize(
         bad_channels=kept_bad,
         rejected_spans=list(rejected_spans or []),
         reference_channels=reference_channels,
+        import_info={"original_channels": list(names), "normalized_channels": [clean_channel_name(name) for name in names],
+            "analysis_channel_types": analysis_types,
+            "included_channels": list(cleaned), "set_aside_channels": [name for name in names if clean_channel_name(name) not in cleaned],
+            "channel_policy": _channel_policy.get(), "source_units": "Unknown; converted input is in µV", "stored_reference": "Unknown"},
     )
 
 
@@ -241,15 +271,19 @@ def _recording_from_raw(raw, path: Path, kind: str) -> Recording:
     sfreq = float(raw.info["sfreq"])
     valid = np.ones(data.shape, dtype=bool)
     spans: list[tuple[float, float]] = []
+    marks: list[Mark] = []
     annotations = getattr(raw, "annotations", None)
     descriptions = [] if annotations is None else list(annotations.description)
     channel_lists = getattr(annotations, "ch_names", None) if annotations is not None else None
     names = list(raw.ch_names)
     for index, description in enumerate(descriptions):
+        # MNE annotation onsets include first_time, also after raw.crop().
+        onset = float(annotations.onset[index]) - float(raw.first_time)
+        duration = float(annotations.duration[index])
+        end = onset + duration
         if not str(description).upper().startswith("BAD"):
+            marks.append(Mark(onset, str(description), duration))
             continue
-        onset = float(annotations.onset[index])
-        end = onset + float(annotations.duration[index])
         i0 = min(max(0, int(round(onset * sfreq))), data.shape[1])
         i1 = min(max(i0, int(round(end * sfreq))), data.shape[1])
         named: list[str] = []
@@ -264,10 +298,16 @@ def _recording_from_raw(raw, path: Path, kind: str) -> Recording:
             if clean_channel_name(raw_name) in named:
                 valid[row, i0:i1] = False
     bads = [str(name) for name in raw.info.get("bads", [])]
-    return finalize(
+    recording = finalize(
         data, names, sfreq, str(path), kind,
         valid=valid, bad_channels=bads, rejected_spans=spans,
+        channel_types=dict(zip(raw.ch_names, raw.get_channel_types())),
     )
+    recording.marks = marks
+    recording.import_info.update(channel_types=dict(zip(raw.ch_names, raw.get_channel_types())),
+        source_units=dict(getattr(raw, "_orig_units", {}) or {}),
+        stored_reference="Custom reference applied in source" if raw.info.get("custom_ref_applied") else "Unknown")
+    return recording
 
 
 def _load_wineeg(path: Path) -> Recording:
@@ -302,14 +342,28 @@ def _load_wineeg(path: Path) -> Recording:
     width = min(len(row) for row in rows)
     data = np.asarray([row[:width] for row in rows], dtype=np.float64)
     sfreq = float(eeg.header["sample_rate_hz"])
+    parsed_marks = parse_legacy_marks(eeg)
     marks = [
         Mark(item.onset_ms / 1000.0, item.label, item.duration_ms / 1000.0)
-        for item in parse_legacy_marks(eeg)
+        for item in parsed_marks
     ]
     mark_line = describe_marks(marks)
     if mark_line:
         notes.append(mark_line)
-    recording = finalize(data, kept_names, sfreq, str(path), "wineeg", notes)
+    valid = np.ones(data.shape, dtype=bool)
+    spans = []
+    for item in parsed_marks:
+        if item.family != "extended_type_0" or item.duration_ms <= 0:
+            continue
+        start = max(0.0, item.onset_ms / 1000.0)
+        end = min(width / sfreq, (item.onset_ms + item.duration_ms) / 1000.0)
+        if end > start:
+            valid[:, int(round(start * sfreq)):int(round(end * sfreq))] = False
+            spans.append((start, end))
+    recording = finalize(
+        data, kept_names, sfreq, str(path), "wineeg", notes,
+        valid=valid, rejected_spans=spans,
+    )
     recording.marks = marks
     return recording
 
@@ -347,7 +401,7 @@ def _load_bxs(path: Path) -> Recording:
 
 
 def _load_csv(path: Path, sfreq: float | None, unit: str = "uV",
-              delimiter: str = ",", channel_names: list[str] | None = None) -> Recording:
+              delimiter: str = ",", channel_names: list[str] | None = None, channel_types: dict | None = None) -> Recording:
     data, inferred, names = _read_csv_matrix(path, delimiter=delimiter)
     if channel_names:
         if len(channel_names) != data.shape[0]:
@@ -358,7 +412,9 @@ def _load_csv(path: Path, sfreq: float | None, unit: str = "uV",
         raise ValueError(
             "Sampling rate is required when the CSV has no time_s, time, sec, or seconds column."
         )
-    return finalize(_to_microvolts(data, unit), names, rate, str(path), "csv")
+    result = finalize(_to_microvolts(data, unit), names, rate, str(path), "csv", channel_types=channel_types)
+    result.import_info.update(source_units=unit, channel_types=dict(channel_types or {}))
+    return result
 
 
 def _load_json(path: Path, sfreq: float | None) -> Recording:
@@ -379,9 +435,11 @@ def _load_json(path: Path, sfreq: float | None) -> Recording:
         unit=str(meta.get("unit") or "uV"),
         delimiter=str(meta.get("delimiter") or ","),
         channel_names=list(names) if names else None,
+        channel_types=meta.get("channel_types"),
     )
     recording.source_path = str(path)
     recording.source_format = "json"
+    recording.import_info.update(source_units=str(meta.get("unit") or "uV"), stored_reference=str(meta.get("reference") or "Unknown"))
     return recording
 
 
@@ -402,7 +460,17 @@ def _load_embedded_json(path: Path, meta: dict, sfreq: float | None) -> Recordin
     if len(names) != data.shape[0]:
         raise ValueError("channel_names length does not match the embedded data.")
     unit = str(meta.get("unit") or "uV")
-    return finalize(_to_microvolts(data, unit), names, float(rate), str(path), "json", notes)
+    types = meta.get("channel_types")
+    if types is not None and (not isinstance(types, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in types.items())):
+        raise ValueError("channel_types must map channel names to type strings.")
+    recording = finalize(_to_microvolts(data, unit), names, float(rate), str(path), "json", notes, channel_types=types)
+    recording.import_info.update(source_units=unit, stored_reference=str(meta.get("reference") or "Unknown"), channel_types=dict(types or {}))
+    for item in meta.get("marks", []):
+        onset, duration = float(item["onset_s"]), float(item.get("duration_s", 0))
+        if not (0 <= onset <= recording.duration_s and 0 <= duration < float("inf")):
+            raise ValueError("JSON mark times must be finite, nonnegative, and inside the recording.")
+        recording.marks.append(Mark(onset, str(item["label"]), duration))
+    return recording
 
 
 def _read_csv_matrix(path: Path, delimiter: str = ",") -> tuple[np.ndarray, float | None, list[str]]:
@@ -433,10 +501,22 @@ def _read_csv_matrix(path: Path, delimiter: str = ",") -> tuple[np.ndarray, floa
             times.append(float(row[0].strip()))
             samples.append(_floats(row[1:]))
         time_arr = np.asarray(times, dtype=np.float64)
+        if not np.isfinite(time_arr).all():
+            raise ValueError("The time column must contain finite timestamps.")
         diffs = np.diff(time_arr)
         if np.any(diffs <= 0):
             raise ValueError("The time column must be strictly increasing.")
         inferred = float(1.0 / np.median(diffs)) if len(time_arr) > 1 else None
+        if diffs.size:
+            step = float(np.median(diffs))
+            # Exported decimal clocks may round by a few microseconds. Gaps
+            # and actual rate changes cannot be represented by Recording.
+            tolerance = max(1e-6, step * 0.01)
+            if not np.allclose(diffs, step, rtol=0.0, atol=tolerance):
+                raise ValueError(
+                    "The time column is not uniformly sampled (a gap or rate change was found). "
+                    "Export uniformly sampled data with explicit rejected samples."
+                )
         data = np.asarray(samples, dtype=np.float64).T
         return data, inferred, names
 
@@ -469,6 +549,6 @@ def _to_microvolts(data: np.ndarray, unit: str) -> np.ndarray:
 
 def _positive(value) -> bool:
     try:
-        return float(value) > 0
+        return bool(np.isfinite(float(value)) and float(value) > 0)
     except (TypeError, ValueError):
         return False

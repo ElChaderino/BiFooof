@@ -49,6 +49,7 @@ def coherence_pair(
     for index in (index_a, index_b):
         if not 0 <= index < recording.n_channels:
             raise IndexError("Channel index is outside the recording.")
+        recording.require_analysis_channel(index)
     chosen = settings
     chosen.validate()
     prepared = prepare_recording(recording, chosen)

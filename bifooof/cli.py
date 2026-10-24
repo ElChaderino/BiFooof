@@ -104,14 +104,15 @@ def _run(args: argparse.Namespace) -> int:
         folder = args.out / _stem(path)
         print(f"Fitting {Path(path).name} -> {folder}")
         try:
+            selected_settings = _settings(args)
             written = run_file(
                 path, folder,
                 condition=None if args.condition == "auto" else args.condition,
                 channel=args.channel,
-                band=args.band,
+                band=f"{selected_settings.alpha_low:g}-{selected_settings.alpha_high:g}" if args.profile else args.band,
                 cycles=not args.no_cycles,
                 plots=not args.no_plots,
-                settings=_settings(args),
+                settings=selected_settings,
             )
         except Exception as exc:
             failed += 1
@@ -127,13 +128,14 @@ def _run(args: argparse.Namespace) -> int:
 def _compare(args: argparse.Namespace) -> int:
     folder = args.out
     print(f"Comparing {Path(args.ec).name} and {Path(args.eo).name} -> {folder}")
+    selected_settings = _settings(args)
     written = compare_files(
         args.ec, args.eo, folder,
         channel=args.channel,
-        band=args.band,
+        band=f"{selected_settings.alpha_low:g}-{selected_settings.alpha_high:g}" if args.profile else args.band,
         cycles=not args.no_cycles,
         plots=not args.no_plots,
-        settings=_settings(args),
+        settings=selected_settings,
     )
     for item in written:
         print(f"  {item.name}")
@@ -141,6 +143,7 @@ def _compare(args: argparse.Namespace) -> int:
 
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--profile", type=Path, help="Use all fit settings from an exported BiFooof profile.")
     parser.add_argument("--tmin", type=float, default=0.0, help="Start of the fit window, in seconds.")
     parser.add_argument("--tmax", type=float, default=None, help="End of the fit window, in seconds. Default: end of the file.")
     parser.add_argument("--fmin", type=float, default=1.0, help="Lowest frequency in the spectrum fit.")
@@ -167,6 +170,9 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _settings(args: argparse.Namespace) -> FitSettings:
+    if getattr(args, "profile", None):
+        from .project import read_profile, settings_from
+        return settings_from(read_profile(args.profile)["settings"])
     length = None if args.tmax is None else float(args.tmax) - float(args.tmin)
     bursts = {"library": 0, "resting": 1, "paper": 2}[args.bursts]
     amp, amp_c, period_c, mono, min_cycles = BURST_PRESETS[bursts][1:]

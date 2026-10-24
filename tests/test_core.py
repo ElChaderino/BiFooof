@@ -374,6 +374,20 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(reasons["Fp1"], "Amplitude above the limit.")
         self.assertTrue(both_fit.channels[0].name == "O1" and both_fit.channels[0].usable)
 
+    def test_a_large_offset_does_not_reject_the_eeg(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        signal = 10000.0 + 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        signal[int(3 * sfreq):int(4 * sfreq)] += 5000.0
+        recording = Recording(
+            data=signal[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="offset.csv", source_format="csv",
+        )
+        prepared = prepare_recording(recording, FitSettings())
+        self.assertTrue(np.isfinite(prepared.data[0, : int(2 * sfreq)]).all())
+        self.assertTrue(np.isnan(prepared.data[0, int(3 * sfreq):int(4 * sfreq)]).all())
+        self.assertTrue(any("500" in note for note in prepared.notes))
+
     def test_a_spike_does_not_enter_the_average(self):
         values = np.full(16, 10.0)
         spike = values.copy()
@@ -430,6 +444,7 @@ class QualityTests(unittest.TestCase):
         self.assertAlmostEqual(found[1], 0.4)
         inside = ChannelFit(name="O1", index=1, usable=True, peaks=[(10.0, 1.0, 1.0)])
         self.assertIsNone(nearest_outside_peak(inside, (8.0, 12.0)))
+        self.assertTrue(peak_at_width_floor(0.5, 0.5))
         self.assertTrue(peak_at_width_floor(0.25, 0.5))
         self.assertFalse(peak_at_width_floor(1.0, 0.5))
         rows = compare_spectra(
@@ -779,7 +794,7 @@ class WindowTests(unittest.TestCase):
         self.assertNotIn("ADHD", window.findings.plain)
         self.assertNotIn("hyperarousal", window.findings.plain)
         for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig, window.cycles.canvas.fig):
-            self.assertTrue(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
+            self.assertFalse(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
         window.close()
 
     def test_marks_open_both_sides(self):
@@ -840,7 +855,7 @@ class SessionTests(unittest.TestCase):
             time.sleep(0.05)
         self.app.processEvents()
         self.assertTrue(window.compare.ready, window.statusBar().currentMessage())
-        self.assertTrue(any(
+        self.assertFalse(any(
             text.get_text() == "EEG Paradox Solutions" for text in window.compare.canvas.fig.texts
         ))
         fp1 = next(row for row in window.compare.rows if row.name == "Fp1")
@@ -863,7 +878,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(window.trace.channels.item(1).checkState(), Qt.Unchecked)
         self.assertIn("Eyes closed", window.trace.canvas.fig.axes[0].get_title(loc="left"))
         for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig):
-            self.assertTrue(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
+            self.assertFalse(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
         with tempfile.TemporaryDirectory() as tmp:
             written = window.save_session(tmp)
             names = {path.name for path in written}

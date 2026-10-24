@@ -11,6 +11,7 @@ import numpy as np
 
 from ..io.recording import Recording
 from .settings import FitSettings, clip_recording
+from .segments import accepted_runs
 
 # Below this, a specparam fit is drawn as a weak result rather than a solid one.
 R2_WEAK = 0.6
@@ -54,14 +55,17 @@ def apply_reference(recording: Recording, mode: str, limit_uv: float = 0.0) -> R
     if mode == "average":
         data = np.array(recording.data, dtype=np.float64, copy=True)
         mask = np.isfinite(data) if recording.valid is None else recording.valid & np.isfinite(data)
+        eligible = np.array([recording.analysis_channel(name) for name in recording.ch_names])
+        mask &= eligible[:, None]
         total = np.where(mask, data, 0.0).sum(axis=0)
         count = mask.sum(axis=0)
         mean = np.divide(total, count, out=np.zeros(data.shape[1], dtype=np.float64), where=count >= 2)
         # One valid channel would be subtracted from itself and become zero.
-        data[:, count >= 2] -= mean[count >= 2]
+        data[np.ix_(eligible, count >= 2)] -= mean[count >= 2]
         return _copied(
             recording, data,
             "Average reference across the channels in the fit.",
+            reference_applied="average",
         )
     if mode == "linked":
         pair = _ear_pair(recording, limit_uv)
@@ -72,22 +76,29 @@ def apply_reference(recording: Recording, mode: str, limit_uv: float = 0.0) -> R
             )
         left, right, left_name, right_name = pair
         data = np.array(recording.data, dtype=np.float64, copy=True)
-        data -= (left + right) / 2.0
+        eligible = np.array([recording.analysis_channel(name) for name in recording.ch_names])
+        data[eligible] -= (left + right) / 2.0
         return _copied(
             recording, data,
             f"Linked-ear reference from {left_name} and {right_name}.",
+            reference_applied="linked",
         )
     raise ValueError("The reference is stored, average, or linked ears.")
 
 
 def reject_large_amplitudes(recording: Recording, limit_uv: float) -> Recording:
-    """Drop samples outside ±limit. Zero keeps every sample."""
+    """Drop samples that rise more than ±limit above the channel's linear trend.
+
+    A constant offset or a straight drift, which WinEEG files often carry, is
+    not a spike. A channel that stays flat beyond the limit is still dropped.
+    Zero keeps every sample.
+    """
     limit = float(limit_uv)
     if limit <= 0:
         return recording
     data = np.array(recording.data, dtype=np.float64, copy=True)
     valid = np.ones(data.shape, dtype=bool) if recording.valid is None else np.array(recording.valid, copy=True)
-    loud = np.isfinite(data) & (np.abs(data) > limit) & valid
+    loud = _above_trend(data, valid, limit)
     if not bool(loud.any()):
         return recording
     valid[loud] = False
@@ -109,11 +120,11 @@ def reject_large_amplitudes(recording: Recording, limit_uv: float) -> Recording:
 def peak_at_width_floor(bandwidth: float, width_low: float) -> bool:
     """True when a peak is sitting on the narrowest width specparam is allowed to use.
 
-    The control is a full width. specparam stores half of that.
+    Reported width is the two-sided bandwidth, the same unit as the width control.
     """
     if not np.isfinite(bandwidth) or width_low <= 0:
         return False
-    return float(bandwidth) <= (float(width_low) / 2.0) * 1.01 + 1e-9
+    return float(bandwidth) <= float(width_low) * 1.01 + 1e-9
 
 
 def _ear_pair(
@@ -136,6 +147,39 @@ def _ear_pair(
     return None
 
 
+def _above_trend(data: np.ndarray, valid: np.ndarray, limit: float) -> np.ndarray:
+    """Mark samples whose residual from a straight line exceeds the limit.
+
+    The line is fit without the samples that already sit far from the median,
+    so one spike cannot tilt it. When most of the channel is far from the
+    median, the shape is a drift and the line uses every finite sample.
+    """
+    loud = np.zeros(data.shape, dtype=bool)
+    for index in range(data.shape[0]):
+        finite = np.isfinite(data[index]) & valid[index]
+        count = int(finite.sum())
+        if count == 0:
+            continue
+        values = data[index, finite]
+        if count < 2:
+            loud[index, finite] = np.abs(values) > limit
+            continue
+        position = np.flatnonzero(finite).astype(np.float64)
+        center = float(np.median(values))
+        far = np.abs(values - center) > limit
+        if int((~far).sum()) >= 2 and float(far.mean()) < 0.5:
+            slope, intercept = np.polyfit(position[~far], values[~far], 1)
+        else:
+            slope, intercept = np.polyfit(position, values, 1)
+        residual = values - (slope * position + intercept)
+        # A flat line beyond the limit has no EEG-sized residual to preserve.
+        if float(np.median(np.abs(values))) > limit and float(np.median(np.abs(residual))) <= 1.0:
+            loud[index, finite] = True
+        else:
+            loud[index, finite] = np.abs(residual) > limit
+    return loud
+
+
 def _quiet(values: np.ndarray, limit_uv: float) -> np.ndarray:
     row = np.array(values, dtype=np.float64, copy=True)
     limit = float(limit_uv)
@@ -150,6 +194,7 @@ def _copied(
     note: str,
     valid: np.ndarray | None = None,
     dropped_by_amplitude: list[str] | None = None,
+    reference_applied: str | None = None,
 ) -> Recording:
     return Recording(
         data=data,
@@ -166,4 +211,52 @@ def _copied(
         dropped_by_amplitude=list(
             recording.dropped_by_amplitude if dropped_by_amplitude is None else dropped_by_amplitude
         ),
+        source_start_s=recording.source_start_s,
+        reference_applied=recording.reference_applied if reference_applied is None else reference_applied,
+        import_info=dict(recording.import_info),
     )
+
+
+def sample_provenance(recording: Recording, used: dict[str, list[tuple[int, int]]] | None = None) -> dict:
+    """Counts and source-clock spans of samples contributing to an analysis.
+
+    ``used`` can further restrict prepared samples to runs/epochs actually fit.
+    It is omitted only when describing preparation without a completed fit.
+    """
+    masks = np.isfinite(recording.data)
+    if recording.valid is not None:
+        masks &= recording.valid
+    reference_contributors = [name for index, name in enumerate(recording.ch_names) if recording.analysis_channel(name) and masks[index].any()]
+    if used is not None:
+        allowed = np.zeros(masks.shape, dtype=bool)
+        for index, name in enumerate(recording.ch_names):
+            for start, stop in used.get(name, []):
+                allowed[index, max(0, start):min(recording.n_samples, stop)] = True
+        masks &= allowed
+    channels = {}
+    for index, name in enumerate(recording.ch_names):
+        mask = masks[index]
+        channels[name] = {
+            "accepted_samples": int(mask.sum()),
+            "accepted_duration_s": float(mask.sum()) / recording.sfreq,
+            "accepted_spans_source_s": [
+                [recording.source_start_s + start / recording.sfreq,
+                 recording.source_start_s + stop / recording.sfreq]
+                for start, stop in accepted_runs(mask)
+            ],
+            "excluded_spans_source_s": [
+                [recording.source_start_s + start / recording.sfreq,
+                 recording.source_start_s + stop / recording.sfreq]
+                for start, stop in accepted_runs(~mask)
+            ],
+        }
+    return {
+        "source_start_s": recording.source_start_s,
+        "reference_applied": recording.reference_applied,
+        "reference_contributors": reference_contributors if recording.reference_applied == "average" else list(recording.reference_channels) if recording.reference_applied == "linked" else [],
+        "analyzed_window_duration_s": recording.duration_s,
+        "invalid_channel_samples": int((~masks).sum()),
+        "accepted_duration_s": float(masks.any(axis=0).sum()) / recording.sfreq,
+        "accepted_duration_definition": "Time with at least one channel contributing accepted samples.",
+        "channels": channels,
+    }

@@ -37,7 +37,7 @@ def describe_marks(marks: list[Mark]) -> str:
 def split_marked_conditions(recording: Recording) -> dict[str, Recording]:
     """Clip out each condition a mark names.
 
-    A mark with no duration runs until the next mark, or the end of the file.
+    A mark with no duration runs until the next state mark, or the end of the file.
     A clock stamp or any other label is left on the recording and does not cut it.
     Spans shorter than one second are ignored.
     """
@@ -57,7 +57,7 @@ def split_marked_conditions(recording: Recording) -> dict[str, Recording]:
             later = [
                 other.onset_s
                 for other in ordered[index + 1 :]
-                if other.onset_s > start + 1e-6
+                if other.onset_s > start + 1e-6 and condition_in_text(other.label) is not None
             ]
             end = min(duration, later[0] if later else duration)
         length = end - start

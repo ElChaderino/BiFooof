@@ -9,6 +9,7 @@ and eyes-open/eyes-closed papers.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import isfinite
 
 from ..io.recording import Recording
 
@@ -44,25 +45,34 @@ class FitSettings:
     epoch_s: float | None = None
 
     def validate(self) -> None:
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if isinstance(value, (int, float)) and not isfinite(value):
+                raise ValueError(f"{name.replace('_', ' ').capitalize()} must be finite.")
         if self.t_start < 0:
             raise ValueError("The fit window cannot start before 0 s.")
         if self.t_length is not None and self.t_length <= 0:
             raise ValueError("The fit window length must be longer than 0 s.")
-        if self.fmax <= self.fmin:
+        if self.fmin <= 0 or self.fmax <= self.fmin:
             raise ValueError("The spectrum fit needs a low frequency below the high one.")
         if self.segment_s <= 0:
             raise ValueError("The Welch segment must be longer than 0 s.")
         if self.aperiodic_mode not in {"fixed", "knee"}:
             raise ValueError("The aperiodic mode is fixed or knee.")
-        if self.peak_width_high <= self.peak_width_low:
+        if self.peak_width_low <= 0 or self.peak_width_high <= self.peak_width_low:
             raise ValueError("Peak width needs a lower limit below the upper limit.")
-        if self.max_n_peaks < 1:
+        if self.max_n_peaks < 1 or int(self.max_n_peaks) != self.max_n_peaks:
             raise ValueError("At least one peak has to be allowed.")
-        if self.alpha_high <= self.alpha_low:
+        if self.alpha_low <= 0 or self.alpha_high <= self.alpha_low:
             raise ValueError("The band needs a low frequency below the high one.")
         if self.peak_threshold <= 0:
             raise ValueError("The peak threshold must be above 0.")
-        if self.min_n_cycles < 1:
+        if self.min_peak_height < 0:
+            raise ValueError("The minimum peak height cannot be negative.")
+        for name in ("amp_fraction", "amp_consistency", "period_consistency", "monotonicity"):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name.replace('_', ' ').capitalize()} must be between 0 and 1.")
+        if self.min_n_cycles < 1 or int(self.min_n_cycles) != self.min_n_cycles:
             raise ValueError("A burst needs at least one cycle.")
         if self.amplitude_limit_uv < 0:
             raise ValueError("The amplitude limit cannot be negative. Use 0 to keep every sample.")
@@ -208,11 +218,11 @@ def matched_settings(
 
     An explicit start or length is left as the user set it. A single open file is unchanged.
     """
-    if settings.t_length is not None or settings.t_start > 0.05 or not others:
+    if settings.t_length is not None or settings.t_start > 0.0 or not others:
         return settings
     durations = [recording.duration_s, *[item.duration_s for item in others]]
     shorter = min(durations)
-    if max(durations) - shorter <= 1.0 or recording.duration_s <= shorter + 1.0:
+    if recording.duration_s <= shorter + 1e-9:
         return settings
     return replace(settings, t_length=shorter)
 

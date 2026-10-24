@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QScrollBar,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QDoubleSpinBox, QPushButton,
 )
 
 from ..io.recording import Recording
+from ..jobs import display_envelope
+from ..analysis.display import display_filter
+from .layouts import FlowLayout, control_group
 from ..plots import clear_figure, stamp_figure
 from .canvas import MplCanvas, style_axes
 
@@ -24,6 +28,7 @@ class TracePanel(QWidget):
     """Scroll a page of EEG. Checked channels are drawn; the current row is selected."""
 
     channel_selected = Signal(int)
+    interval_selected = Signal(float, float)
 
     def __init__(self):
         super().__init__()
@@ -36,6 +41,10 @@ class TracePanel(QWidget):
         self._visible: list[int] = []
         self._page: dict[int, float] = {}
         self._hidden: dict[int, set[str]] = {}
+        self.selection = None
+        self.fit_window = None
+        self.overlays = []
+        self._drag = None
 
         self.channels = QListWidget()
         self.channels.setFixedWidth(168)
@@ -68,16 +77,44 @@ class TracePanel(QWidget):
         controls.addStretch(1)
         hint = QLabel("Check a channel to show it. Click it to select it for the fits.")
         hint.setObjectName("Muted")
+        hint.setWordWrap(True)
         controls.addWidget(hint)
+        self.jump = QDoubleSpinBox()
+        self.jump.setRange(0, 1e8)
+        self.jump.setSuffix(" s")
+        go = QPushButton("Go")
+        go.setObjectName("Secondary")
+        go.clicked.connect(lambda: self.show_time(self.jump.value()))
+        self.display_band = QComboBox()
+        self.display_band.addItems(["Off", "0.5–40", "1–30", "1–70"])
+        self.notch = QComboBox()
+        for label, value in (("Off", 0), ("50 Hz", 50), ("60 Hz", 60)):
+            self.notch.addItem(label, value)
+        self.montage = QComboBox()
+        self.montage.addItems(["As stored", "Average display", "Bipolar display"])
+        self.display_band.currentIndexChanged.connect(self._render)
+        self.notch.currentIndexChanged.connect(self._render)
+        self.montage.currentIndexChanged.connect(self._render)
+        tools = QWidget()
+        flow = FlowLayout(tools)
+        for label, widgets in (("JUMP", (self.jump, go)), ("DISPLAY BAND Hz", (self.display_band,)),
+                               ("NOTCH", (self.notch,)), ("MONTAGE", (self.montage,))):
+            flow.addWidget(control_group(label, *widgets))
+        self.ruler = QLabel("Drag to select an interval and measure time/amplitude. Display filters do not alter fits.")
+        self.ruler.setWordWrap(True)
+        self.ruler.setObjectName("Muted")
 
         self.canvas = MplCanvas(width=9.0, height=5.2)
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
         self.scroll = QScrollBar(Qt.Horizontal)
         self.scroll.setEnabled(False)
         self.scroll.valueChanged.connect(self._on_scroll)
 
         right = QVBoxLayout()
         right.addLayout(controls)
+        right.addWidget(tools)
+        right.addWidget(self.ruler)
         right.addWidget(self.canvas, 1)
         right.addWidget(self.scroll)
 
@@ -91,6 +128,12 @@ class TracePanel(QWidget):
         root = QHBoxLayout(self)
         root.addLayout(side)
         root.addLayout(right, 1)
+        self._shortcuts = []
+        for keys, direction in (("Left", -1), ("Right", 1), ("PgUp", -1), ("PgDown", 1)):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(lambda value=direction: self._on_scroll(self.scroll.value() + value * self.scroll.pageStep()))
+            self._shortcuts.append(shortcut)
         self._empty("Open a recording to see the traces.")
 
     def set_recording(self, recording: Recording, selected: int | None = None) -> None:
@@ -180,6 +223,7 @@ class TracePanel(QWidget):
 
     def _on_scroll(self, value: int) -> None:
         self._t0 = value / 10.0
+        self._configure_scroll()
         self._render()
 
     def _checked(self) -> list[int]:
@@ -195,9 +239,31 @@ class TracePanel(QWidget):
             return
         offsets = [(len(self._visible) - 1 - row) for row in range(len(self._visible))]
         nearest = int(np.argmin([abs(event.ydata - offset) for offset in offsets]))
+        if event.xdata is not None:
+            self._drag = (float(event.xdata), nearest)
         self.channel_selected.emit(self._visible[nearest])
 
+    def _on_release(self, event):
+        if self._drag is None or event.xdata is None or event.ydata is None:
+            return
+        start, row = self._drag
+        self._drag = None
+        end = float(event.xdata)
+        if abs(end - start) < .02:
+            return
+        left, right = sorted((start, end))
+        self.selection = (left, right)
+        times, values, names = self._ruler_data
+        indices = [min(len(times) - 1, max(0, int(np.searchsorted(times, moment)))) for moment in (start, end)]
+        delta_uv = values[row, indices[1]] - values[row, indices[0]]
+        amplitude = f"{delta_uv:+.2f} µV" if np.isfinite(delta_uv) else "unavailable across excluded samples"
+        self.ruler.setText(f"Selected {left:.3f}–{right:.3f} s · Δt {right-left:.3f} s · {names[row]} displayed-sample Δamplitude {amplitude}")
+        self.interval_selected.emit(left, right)
+        self._render()
+
     def _empty(self, message: str) -> None:
+        self._visible = []
+        self._drag = None
         self.canvas.clear()
         ax = self.canvas.fig.add_subplot(111)
         ax.axis("off")
@@ -221,9 +287,36 @@ class TracePanel(QWidget):
             self._empty("This page has no samples.")
             return
         times = np.arange(start, stop) / sfreq
-        step = max(1, len(times) // 2500)
-        times = times[::step]
-        segment = recording.data[visible, start:stop][:, ::step]
+        all_data = np.array(recording.data[:, start:stop], copy=True)
+        if recording.valid is not None:
+            all_data[~recording.valid[:, start:stop]] = np.nan
+        if self.montage.currentIndex() == 1:
+            valid = np.isfinite(all_data)
+            eligible = np.array([recording.analysis_channel(name) for name in recording.ch_names])
+            valid &= eligible[:, None]
+            count_valid = valid.sum(axis=0)
+            mean = np.divide(np.where(valid, all_data, 0).sum(axis=0), count_valid, out=np.zeros(all_data.shape[1]), where=count_valid >= 2)
+            all_data[eligible] -= mean
+        names = [recording.ch_names[index] for index in visible]
+        segment = all_data[visible]
+        if self.montage.currentIndex() == 2:
+            pairs = [(a, b) for a, b in (("Fp1", "F7"), ("F7", "T7"), ("T7", "P7"), ("P7", "O1"),
+                ("Fp2", "F8"), ("F8", "T8"), ("T8", "P8"), ("P8", "O2"), ("Fz", "Cz"), ("Cz", "Pz"))
+                if a in names and b in names]
+            if not pairs:
+                self._empty("No supported bipolar pair is visible. Choose As stored or show both channels of a pair.")
+                return
+            segment = np.vstack([all_data[recording.ch_names.index(a)] - all_data[recording.ch_names.index(b)] for a, b in pairs])
+            names = [f"{a}−{b}" for a, b in pairs]
+            visible = [recording.ch_names.index(a) for a, b in pairs]
+            self._visible = visible
+        try:
+            segment = display_filter(segment, sfreq, self.display_band.currentText(), self.notch.currentData())
+        except ValueError as exc:
+            self._empty(str(exc))
+            return
+
+        self._ruler_data = (times, segment, names)
 
         fig = self.canvas.fig
         clear_figure(fig)
@@ -234,13 +327,23 @@ class TracePanel(QWidget):
         offsets = [(count - 1 - row) * separation for row in range(count)]
         for offset in offsets:
             ax.axhline(offset, color="#e4eaf1", lw=0.6, zorder=0)
+        if self.fit_window:
+            ax.axvspan(*self.fit_window, color="#1c4e78", alpha=.06, zorder=0)
+        if self.selection:
+            ax.axvspan(*self.selection, color="#0e8f86", alpha=.13, zorder=1)
+        for item in self.overlays:
+            left = float(item.get("time_s", item.get("start_s", 0)))
+            right = float(item.get("end_s", left + float(item.get("duration_s", 0))))
+            if right < self._t0 or left > self._t0 + self._win_s:
+                continue
+            ax.axvspan(left, max(right, left + .02), color="#9a3412" if item.get("excluded") else "#63748a", alpha=.15)
         for row, channel_index in enumerate(visible):
             color = _SELECTED if channel_index == self._selected else _TRACE
             width = 1.15 if channel_index == self._selected else 0.7
             clipped = np.clip(segment[row] * scale, -separation, separation)
-            ax.plot(times, clipped + offsets[row], color=color, lw=width, zorder=2)
+            points = display_envelope(segment[row])
+            ax.plot(times[points], clipped[points] + offsets[row], color=color, lw=width, zorder=2)
 
-        names = [recording.ch_names[index] for index in visible]
         ax.set_yticks(offsets)
         ax.set_yticklabels(names, fontsize=8)
         for label, channel_index in zip(ax.get_yticklabels(), visible):
@@ -266,4 +369,6 @@ class TracePanel(QWidget):
         style_axes(ax)
         fig.tight_layout()
         stamp_figure(fig)
+        ax.text(.99, .99, f"DISPLAY: {self.montage.currentText()} · band {self.display_band.currentText()} · notch {self.notch.currentText()}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=7, color="#63748a")
         self.canvas.draw_idle()

@@ -1,0 +1,12 @@
+# Direct dependency versions validated on Windows / Python 3.12, 2026-10-23.
+# Use with: python -m pip install -r requirements.txt -c constraints-tested.txt
+# This constrains the tested stack; it is not a complete transitive lockfile.
+numpy==1.26.4
+scipy==1.16.2
+mne==1.10.1
+matplotlib==3.10.7
+PySide6==6.11.0
+pandas==2.3.3
+specparam==2.0.0rc7
+bycycle==1.2.0
+pyinstaller==6.17.0

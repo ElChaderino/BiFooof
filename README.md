@@ -10,6 +10,29 @@ Supports EDF, WinEEG `.eeg`, BrainVision, EEGLAB, FIF, CNT, CSV and JSON. The Wi
 
 You can load eyes-closed (EC) and eyes-open (EO) recordings together and compare their spectra, peaks, background slopes and alpha reactivity.
 
+## Review workspace · 0.2.0
+
+Save and reopen verified projects with review notes, bookmarks, exclusions,
+undo/redo, applied settings and staged edits. Recovery copies, recent projects,
+named processing profiles and a synthetic demonstration are available from the menus.
+
+The **Review** page shows usable signal, fit flags, reference and comparison
+checks, review status, and original/imported channel information. **Study** adds
+nonoverlapping-window stability, individual alpha-band candidates, saved regions,
+explicit left/right summaries, editable events and repeated-session trends.
+One fit window stays in the Study table. It is not drawn as a variability
+series until you press Compute.
+
+Traces retain brief extrema and offer display filters, montages, keyboard paging,
+jump-to-time and a sample-based ruler. Long jobs support progress and cancellation;
+Time caches have a memory limit. **Tools → Batch queue** runs explicitly assigned
+recordings with locked settings and retryable failures.
+
+**Ctrl+S** saves a project; **Ctrl+Shift+E** exports completed results. The report
+preview exports offline HTML and PDF alongside the detailed tables and review
+sidecars. See [the running guide](docs/running.md) for the workflow and measurement
+definitions, and [the completed roadmap](docs/product-roadmap.md) for scope.
+
 ## Spectral fitting
 
 The fit controls let you decide what part of the recording to analyze and how specparam handles it.
@@ -53,7 +76,7 @@ Clock-time marks are preserved as notes rather than treated as state boundaries.
 
 The comparison keeps two measurements separate.
 
-**Peak Δ** is the EC fitted peak height minus the EO fitted peak height, measured above the aperiodic background in log10 power. Each state uses its own detected peak. If a peak isn't present, the value stays missing.
+**Peak Δ** is the EC fitted peak height minus the EO fitted peak height, measured above the aperiodic background in log10 power. Each state uses its own detected peak. If a peak isn't present, the value stays missing. The command line and the window report that same peak. Width is the two-sided bandwidth, in the same Hz as the width control.
 
 **Δ band %** compares mean Welch power within the selected band:
 
@@ -77,7 +100,7 @@ If an epoch doesn't contain the peak, it isn't counted as zero. This keeps an in
 
 The caption tells you how many epochs actually contained an in-band peak.
 
-Offset, exponent and R² are calculated from the medians of successfully fitted epochs, while the displayed spectrum is their mean.
+Offset, exponent and R² are calculated from the medians of successfully fitted epochs. Spectrum and model curves are averaged in linear power, then displayed in log10 units.
 
 Changes to epochs, reference or amplitude limits require **Refit**.
 
@@ -97,7 +120,7 @@ These checks matter because a clean-looking graph doesn't necessarily mean the f
 
 The Time tab uses the same recording window, reference and accepted samples as the spectral analysis.
 
-The default view is a spectrogram showing how power changes across frequency and time, with detected burst episodes overlaid when available.
+The default view is a spectrogram showing how power changes across frequency and time, with detected burst episodes overlaid when available. The burst channel list follows a single selected channel and scrolls that row into view. A list with several checks stays as you set it.
 
 Clicking a point in time moves the trace display to that location. **Set fit window** sends the selected interval to the fit controls, but you still need to press Refit to recalculate the analysis.
 
@@ -118,6 +141,8 @@ Coupling analysis runs separately from the normal refit and warns when there isn
 
 Session exports include `metadata.json`, the spectrum CSV and a separate table containing one row per fitted peak.
 
+Exports are prepared in a temporary folder before replacing the previous result bundle. Reusing a folder removes obsolete BiFooof output files, keeps unrelated files, and writes `bifooof-manifest.json` last. Metadata includes the accepted samples and source-time intervals for each fitted channel, along with the reference actually applied.
+
 This keeps the measurements alongside the settings used to generate them, making it easier to compare recordings or check results later.
 
 ## What it's useful for
@@ -136,19 +161,32 @@ The controls and calculations are documented in [docs/running.md](docs/running.m
 
 That document should be updated whenever the interface or processing changes.
 
+Version 0.2.0 is the review workspace above. Wrapping controls, the advanced-settings
+foldout, pending and invalid settings, keyboard shortcuts, and file-error dialogs
+are described in the [controls and feedback guide](docs/running.md#controls-and-feedback).
+Closing during background work stays responsive.
+
+The [code walk and improvement backlog](docs/code-walk.md) maps the code and
+records the resolved findings and their regression coverage. Run the tests
+with `python -m unittest discover -s tests -v`. Windows CI runs the same suite.
+
+The [feature roadmap](docs/product-roadmap.md) reviews useful additions for
+daily EEG review, reproducible projects, comparisons, reporting, and larger
+workloads, with suggested implementation order and completion checks.
+
 ## Screenshots
 
-The screenshots use a 60-second section of EO and EC EDF recordings, from 120–180 seconds.
+The screenshots use a 60-second section of eyes-closed and eyes-open EDF recordings, from 120–180 seconds. The files are shown as `eyes_closed.edf` and `eyes_open.edf`.
 
-The trace view shows 158–173 seconds, where the occipital 10 Hz rhythm is most prominent. The Time page shows the spectrogram for the selected window, and Findings contains the interpretation of that fit.
-
-The filenames shown are placeholders, with identifying information excluded from the interface.
+Traces is a 15-second page at 100 µV, from 158–173 seconds, with O1 selected. Spectrum, Cycles, Compare, and Findings are that same O1 fit: a 10 Hz peak with eyes closed, a smaller peak near 9 Hz with eyes open, and no library bursts. Time shows the spectrogram, then the burst row on the 120–180 second clock. Review flags the weak eyes-closed fits. Study lists the one fit window and waits for Compute before drawing a variability series.
 
 ![Traces](docs/screenshots/traces.png)
 
 ![Spectrum](docs/screenshots/spectrum.png)
 
-![Time](docs/screenshots/time.png)
+![Time, spectrogram](docs/screenshots/time.png)
+
+![Time, bursts](docs/screenshots/time-bursts.png)
 
 ![Cycles](docs/screenshots/cycles.png)
 
@@ -156,12 +194,19 @@ The filenames shown are placeholders, with identifying information excluded from
 
 ![Findings](docs/screenshots/findings.png)
 
+![Review](docs/screenshots/review.png)
+
+![Study](docs/screenshots/study.png)
+
 ## Run from source
 
 ```text
 pip install -r requirements.txt
 python -m bifooof
 ```
+
+To reproduce the tested direct dependency versions on Python 3.12, install with
+`python -m pip install -r requirements.txt -c constraints-tested.txt`.
 
 From a command prompt:
 
@@ -181,4 +226,4 @@ pip install pyinstaller
 pyinstaller bifooof.spec
 ```
 
-The result is `dist\BiFooof.exe`. Copy that file by itself. The first launch unpacks into a temporary folder, so the window takes a little longer to appear.
+The result is `dist\BiFooof.exe`. Copy that file by itself. Double-click it for the window. From a command prompt the same file runs `info`, `run`, `compare`, and `formats`. The first launch unpacks into a temporary folder, so the window takes a little longer to appear. WinEEG `.eeg` reading is inside the file. BXS still needs `bxs2edf.exe` on the machine.

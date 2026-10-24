@@ -55,12 +55,8 @@ def mark_spectrum(ax, fmin: float, fmax: float) -> None:
 
 
 def stamp_figure(fig) -> None:
-    """Faint brand mark, drawn over the axes and kept on saved images."""
-    fig.text(
-        0.5, 0.5, "EEG Paradox Solutions",
-        ha="center", va="center", fontsize=15, color="#7f93a8", alpha=0.20,
-        rotation=24, zorder=20, clip_on=False,
-    )
+    """Saved figures stay unmarked. The argument is kept for existing callers."""
+    del fig
 
 
 def finish_figure(fig) -> None:
@@ -130,10 +126,11 @@ def render_spectrum(fig, fit: SpectrumFit, index: int, label: str = "", mark_hz:
             spectrum.plot(item.freqs, item.aperiodic, color="#0e8f86", lw=1.5, ls="--", label="Aperiodic", zorder=3)
         _mark_peaks(spectrum, item)
         spectrum.set_xlabel("")
+        spectrum.tick_params(labelbottom=False)
         spectrum.set_ylabel("log10 power")
         title = (
             f"{item.name}   ·   {fit.t_start:.0f}–{fit.t_end:.0f} s"
-            f"   ·   {fit.fmin:g}–{fit.fmax:.0f} Hz   ·   frequency"
+            f"   ·   {fit.fmin:g}–{fit.fmax:.0f} Hz"
         )
         if label:
             title = f"{label}   ·   {title}"
@@ -166,7 +163,8 @@ def _draw_residual(ax, item, mark_hz: float | None) -> None:
     if mark_hz is not None:
         ax.axvline(mark_hz, color="#63748a", lw=0.7, ls="--", zorder=1)
     ax.set_ylabel("log10 residual")
-    ax.tick_params(labelbottom=False)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.tick_params(labelbottom=True)
     style_axes(ax, grid=True)
 
 
@@ -185,23 +183,23 @@ def render_comparison(fig, eyes_closed: SpectrumFit, eyes_open: SpectrumFit, cha
     mark_spectrum(ax, fmin, fmax)
     _plot_condition(ax, _by_name(eyes_closed, channel), _EC, "Eyes closed", alpha)
     _plot_condition(ax, _by_name(eyes_open, channel), _EO, "Eyes open", alpha)
-    ax.set_xlabel("")
+    ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("log10 power")
     shown = band_phrase(*alpha)
-    ax.set_title(f"{channel}   ·   eyes closed vs eyes open   ·   {shown}", fontsize=10, loc="left")
+    ax.set_title(f"{channel}   ·   {shown}\neyes closed vs eyes open", fontsize=10, loc="left")
     ax.legend(frameon=False, fontsize=8)
     style_axes(ax, grid=True)
     names = [row.name for row in rows]
     draw_head(
         fig.add_subplot(maps[0, 0]), names,
         [row.exponent_delta for row in rows],
-        f"Exponent  {fmin:g}–{fmax:.0f} Hz  EO − EC", "viridis", channel,
+        f"Exponent\n{fmin:g}–{fmax:.0f} Hz  ·  EO − EC", "viridis", channel,
         [_weak_fit(row.r_squared_ec) or _weak_fit(row.r_squared_eo) for row in rows],
     )
     draw_head(
         fig.add_subplot(maps[1, 0]), names,
         [row.alpha_reactivity for row in rows],
-        f"{shown} peak height  EC − EO", "plasma", channel,
+        f"{shown}\nPeak height  ·  EC − EO", "plasma", channel,
         [
             _weak_fit(row.r_squared_ec) or _weak_fit(row.r_squared_eo) or row.peak_at_floor_ec or row.peak_at_floor_eo
             for row in rows
@@ -236,7 +234,7 @@ def _peak_lines(ax, rows) -> None:
             ax.scatter([1], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
     ax.set_ylabel("Peak height")
     ax.set_title(
-        f"One line per channel   ·   {drawn} with both peaks   ·   a missing peak is a dot",
+        f"{drawn} channels with paired peaks\nA missing peak is a single dot",
         fontsize=9, loc="left",
     )
     style_axes(ax, grid=True)

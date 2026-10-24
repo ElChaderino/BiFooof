@@ -31,6 +31,7 @@ class SpectrumPanel(QWidget):
     channel_selected = Signal(int)
     status = Signal(str)
     fit_ready = Signal(str)
+    fit_invalidated = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -113,7 +114,7 @@ class SpectrumPanel(QWidget):
         self._draw()
 
     def apply_settings(self, settings: FitSettings) -> None:
-        self.settings = settings
+        self.settings = replace(settings)
         self.fits.clear()
         self.fit = None
         self.table.setRowCount(0)
@@ -126,6 +127,8 @@ class SpectrumPanel(QWidget):
     def set_band(self, low: float, high: float) -> None:
         """The band changes the in-band peak without refitting specparam."""
         self.settings = replace(self.settings, alpha_low=float(low), alpha_high=float(high))
+        for fit in self.fits.values():
+            fit.settings = replace(fit.settings or self.settings, alpha_low=float(low), alpha_high=float(high))
         if self.fit is not None:
             self._fill_table()
             self._describe()
@@ -149,16 +152,22 @@ class SpectrumPanel(QWidget):
             return
         self._generations[condition] = self._generations.get(condition, 0) + 1
         generation = self._generations[condition]
+        self.fits.pop(condition, None)
+        if condition == self.condition:
+            self.fit = None
+            self.table.setRowCount(0)
+            self._empty("Fitting spectra…")
+        self.fit_invalidated.emit(condition)
         label = "eyes closed" if condition == "ec" else "eyes open"
         self.status.emit(f"Fitting {label} spectra…")
         others = [item for key, item in self.recordings.items() if key != condition]
-        settings = matched_settings(self.settings, recording, others)
+        settings = replace(matched_settings(self.settings, recording, others))
         worker = CallWorker(generation, fit_spectra, (recording, settings))
         worker.succeeded.connect(lambda gen, result, cond=condition: self._fitted(cond, gen, result))
         worker.failed.connect(lambda gen, message, cond=condition: self._failed(cond, gen, message))
         self._workers[condition] = worker
         self._worker = worker
-        launch(self, worker)
+        launch(self, worker, key=condition)
 
     def _fitted(self, condition: str, generation: int, result: object) -> None:
         if generation != self._generations.get(condition) or not isinstance(result, SpectrumFit):
@@ -176,10 +185,13 @@ class SpectrumPanel(QWidget):
     def _failed(self, condition: str, generation: int, message: str) -> None:
         if generation != self._generations.get(condition):
             return
+        self.fits.pop(condition, None)
+        self.fit_invalidated.emit(condition)
         detail = message.strip().splitlines()[-1] if message.strip() else "Spectrum fit failed."
         self.status.emit(detail)
         if condition == self.condition:
             self.fit = None
+            self.table.setRowCount(0)
             self._empty(detail)
 
     def _fill_table(self) -> None:
@@ -268,8 +280,9 @@ class SpectrumPanel(QWidget):
         exponent = "—" if item.exponent is None else f"exponent {item.exponent:.2f}"
         r_squared = "—" if item.r_squared is None else f"R² {item.r_squared:.2f}"
         knee = ""
-        if item.knee is not None and item.exponent not in (None, 0):
-            knee_hz = item.knee ** (1.0 / item.exponent)
+        if item.knee is not None and item.knee > 0 and item.exponent not in (None, 0):
+            with np.errstate(over="ignore", invalid="ignore"):
+                knee_hz = np.exp(np.log(item.knee) / item.exponent)
             if np.isfinite(knee_hz) and knee_hz > 0:
                 knee = f"  ·  knee {knee_hz:.1f} Hz"
         window = f"{self.fit.t_start:.0f}–{self.fit.t_end:.0f} s"

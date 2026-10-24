@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QScrollArea,
     QScrollBar, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -12,8 +14,10 @@ from PySide6.QtWidgets import (
 from ..analysis.cycles import BANDS, CycleFit, fit_cycles
 from ..analysis.settings import FitSettings
 from ..io.recording import Recording
+from ..jobs import display_envelope
 from ..plots import clear_figure, stamp_figure
 from .canvas import MplCanvas, style_axes
+from .layouts import CompactDoubleSpinBox
 from .workers import CallWorker, launch, wait_for
 
 _BURST = "#0e8f86"
@@ -142,12 +146,15 @@ class CyclePanel(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if not self._split_ready:
-            QTimer.singleShot(0, self._give_plot_the_room)
+        self._give_plot_the_room()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._give_plot_the_room()
 
     def _give_plot_the_room(self) -> None:
         height = self._split.height()
-        if height < 240:
+        if height < 240 or self._split_ready:
             return
         self._split_ready = True
         self._split.setSizes([int(height * 0.52), int(height * 0.48)])
@@ -168,8 +175,8 @@ class CyclePanel(QWidget):
     def set_band(self, low: float, high: float, *, named: bool) -> None:
         """Match the fit bar. Signals stay blocked so this does not echo or refit twice."""
         same = (
-            abs(float(self.low.value()) - float(low)) < 0.05
-            and abs(float(self.high.value()) - float(high)) < 0.05
+            round(float(self.low.value()), 4) == round(float(low), 4)
+            and round(float(self.high.value()), 4) == round(float(high), 4)
         )
         self.band.blockSignals(True)
         self.low.blockSignals(True)
@@ -178,7 +185,7 @@ class CyclePanel(QWidget):
             matched = False
             for index in range(self.band.count()):
                 data = self.band.itemData(index)
-                if data is not None and abs(float(data[0]) - low) < 0.05 and abs(float(data[1]) - high) < 0.05:
+                if data is not None and abs(float(data[0]) - low) < .00005 and abs(float(data[1]) - high) < .00005:
                     self.band.setCurrentIndex(index)
                     matched = True
                     break
@@ -199,7 +206,7 @@ class CyclePanel(QWidget):
             self._refit()
 
     def apply_settings(self, settings: FitSettings) -> None:
-        self.settings = settings
+        self.settings = replace(settings)
         self._t0 = 0.0
         self._refit()
 
@@ -219,10 +226,12 @@ class CyclePanel(QWidget):
         index = min(max(self._selected, 0), self.recording.n_channels - 1)
         band = self.current_band()
         self._generation += 1
+        self.fit = None
+        self.fit_ready.emit()
         name = self.recording.ch_names[index]
         self.caption.setText(f"Finding cycles on {name}…")
         self.status.emit(f"Finding cycles on {name}…")
-        worker = CallWorker(self._generation, fit_cycles, (self.recording, index, band, self.settings))
+        worker = CallWorker(self._generation, fit_cycles, (self.recording, index, band, replace(self.settings)))
         worker.succeeded.connect(self._fitted)
         worker.failed.connect(self._failed)
         self._worker = worker
@@ -269,7 +278,10 @@ class CyclePanel(QWidget):
             text = f"{text}. {result.burst_note}"
         if result.notes:
             text = f"{text}. {result.notes}"
+        if result.failures:
+            text += f". {len(result.failures)} accepted run(s) could not be fitted; see details."
         self.caption.setText(text)
+        self.caption.setToolTip("\n".join(f"{item['start_s']:.3f}–{item['end_s']:.3f} s: {item['reason']}" for item in result.failures))
         self.status.emit("Cycle fit ready.")
         self.fit_ready.emit()
 
@@ -391,9 +403,13 @@ class CyclePanel(QWidget):
             self._empty("This page has no samples.")
             return
         times = fit.t_offset + np.arange(start, stop) / sfreq
-        step = max(1, len(times) // 2500)
-        view_t = times[::step]
-        view_y = fit.filtered[start:stop][::step]
+        values = fit.filtered[start:stop]
+        if not np.isfinite(values).any():
+            self._empty("No accepted filtered samples in this page. Inspect exclusions or select another channel.")
+            return
+        points = display_envelope(values)
+        view_t = times[points]
+        view_y = values[points]
 
         fig = self.canvas.fig
         clear_figure(fig)
@@ -430,9 +446,9 @@ class CyclePanel(QWidget):
 
 
 def _hertz(value: float) -> QDoubleSpinBox:
-    box = QDoubleSpinBox()
+    box = CompactDoubleSpinBox()
     box.setRange(0.5, 80.0)
-    box.setDecimals(1)
+    box.setDecimals(4)
     box.setSingleStep(0.5)
     box.setValue(value)
     box.setFixedWidth(76)

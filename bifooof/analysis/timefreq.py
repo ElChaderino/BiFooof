@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 import numpy as np
+from ..jobs import checkpoint
 from scipy.signal import detrend, spectrogram
 
 from ..io.recording import Recording
@@ -88,6 +89,7 @@ def channel_spectrogram(
     """
     if not 0 <= channel_index < recording.n_channels:
         raise IndexError("Channel index is outside the recording.")
+    recording.require_analysis_channel(channel_index)
     if window_s <= 0:
         raise ValueError("The spectrogram window has to be longer than 0 s.")
     if not 0 <= float(overlap) < 0.95:
@@ -228,7 +230,8 @@ def sliding_spectra(
     windows: list[SpectrumFit] = []
     fractions: list[float] = []
     mask = None if prepared.valid is None else prepared.valid
-    for i0, i1 in pieces:
+    for position, (i0, i1) in enumerate(pieces):
+        checkpoint(position, len(pieces), f"Sliding window {position + 1} of {len(pieces)}")
         fractions.append(_fraction(mask, prepared.data, i0, i1, channel_index))
         piece = prepared.cropped(i0, i1)
         if channel_index is not None:
@@ -441,6 +444,7 @@ def block_band_power(
     """Mean Welch power in ``band`` for successive blocks. Times are block centers."""
     if not 0 <= channel_index < recording.n_channels:
         raise IndexError("Channel index is outside the recording.")
+    recording.require_analysis_channel(channel_index)
     if block_s <= 0:
         raise ValueError("The block has to be longer than 0 s.")
     chosen = settings
@@ -545,6 +549,9 @@ def _only(recording: Recording, index: int) -> Recording:
         rejected_spans=list(recording.rejected_spans),
         reference_channels=dict(recording.reference_channels),
         dropped_by_amplitude=[item for item in recording.dropped_by_amplitude if item == name],
+        source_start_s=recording.source_start_s,
+        reference_applied=recording.reference_applied,
+        import_info=dict(recording.import_info),
     )
 
 
