@@ -202,7 +202,23 @@ The screenshots use a 60-second section of eyes-closed and eyes-open EDF recordi
 
 Traces is a 15-second page at 100 µV, from 158–173 seconds, with O1 selected. Spectrum, Cycles, Compare, and Findings are that same O1 fit: a 10 Hz peak with eyes closed, a smaller peak near 9 Hz with eyes open, and no library bursts. Time shows the spectrogram, then the burst row on the 120–180 second clock. Review flags the weak eyes-closed fits. Study lists the one fit window and waits for Compute before drawing a variability series.
 
-TracesSpectrumTime, spectrogramTime, burstsCyclesCompareFindingsReviewStudy
+![Traces](docs/screenshots/traces.png)
+
+![Spectrum](docs/screenshots/spectrum.png)
+
+![Time, spectrogram](docs/screenshots/time.png)
+
+![Time, bursts](docs/screenshots/time-bursts.png)
+
+![Cycles](docs/screenshots/cycles.png)
+
+![Compare](docs/screenshots/compare.png)
+
+![Findings](docs/screenshots/findings.png)
+
+![Review](docs/screenshots/review.png)
+
+![Study](docs/screenshots/study.png)
 
 ## Run from source
 
