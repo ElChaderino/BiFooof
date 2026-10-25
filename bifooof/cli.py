@@ -161,12 +161,27 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
                         help="Band used for alpha reactivity.")
     parser.add_argument("--bursts", choices=("library", "resting", "paper"), default="library",
                         help="Burst rule: library, resting alpha, or the paper alpha thresholds.")
-    parser.add_argument("--reference", choices=("stored", "average", "linked"), default="stored",
-                        help="stored keeps the file reference. average or linked ears are explicit.")
+    parser.add_argument(
+        "--reference",
+        choices=(
+            "stored", "average", "linked", "mastoid", "left", "right", "vertex",
+            "ipsilateral", "contralateral", "rest", "hjorth", "csd", "global",
+        ),
+        default="stored",
+        help=(
+            "stored keeps the file reference. average subtracts the fitted-channel mean. "
+            "linked uses both ears. mastoid uses both mastoids. left and right use one ear. "
+            "vertex subtracts Cz. ipsilateral and contralateral use the ear on that side. "
+            "rest is the infinity reference from a template spherical forward model. "
+            "hjorth is the equal-weight local Laplacian and stays in microvolts. "
+            "csd is the spherical-spline Laplacian. "
+            "global is the average reference followed by the global scale factor."
+        ),
+    )
     parser.add_argument("--epoch", type=float, default=None,
                         help="Fit non-overlapping epochs of this many seconds. Peak height is the median of epochs that found the peak, not lowered by epochs that missed it.")
     parser.add_argument("--amplitude-limit", type=float, default=500.0,
-                        help="Drop samples beyond this many microvolts. 0 keeps every sample.")
+                        help="Drop samples that rise more than this many microvolts above the channel's straight trend. A constant offset is kept. 0 keeps every sample.")
 
 
 def _settings(args: argparse.Namespace) -> FitSettings:

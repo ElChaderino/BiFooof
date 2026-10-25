@@ -10,7 +10,7 @@ Supports EDF, WinEEG `.eeg`, BrainVision, EEGLAB, FIF, CNT, CSV and JSON. The Wi
 
 You can load eyes-closed (EC) and eyes-open (EO) recordings together and compare their spectra, peaks, background slopes and alpha reactivity.
 
-## Review workspace · 0.2.0
+## Review workspace · 0.3.0
 
 Save and reopen verified projects with review notes, bookmarks, exclusions,
 undo/redo, applied settings and staged edits. Recovery copies, recent projects,
@@ -44,6 +44,28 @@ You can change the fit range to 2–40 Hz for EO/EC comparisons, narrow it to 3�
 Fixed and knee models are available, along with controls for peak width, number of peaks, minimum height and the 2 SD peak threshold.
 
 **Refit** runs specparam and bycycle again using the selected time window and settings. Scrolling through the traces or cycles only changes what's displayed, not the underlying fit.
+
+## Reference and montage
+
+The fit bar and the trace page do different jobs. **Refit** rebuilds the spectrum, the cycles, and the findings from the fit-bar reference. The trace montage changes only the picture.
+
+The fit applies the amplitude limit to the original samples before the transform. The default is ±500 µV above each channel's straight trend. A constant offset is kept. Set the limit to 0 to keep every sample. The trace does not apply that limit, and there is no separate limit in µV/m². A sample past the limit stays at its original time. Welch and cycles do not join the samples on either side of the gap.
+
+Fit references:
+
+- **As stored.** The reference already in the file.
+- **Average.** One fixed set of analysis channels for the window. The mean is subtracted only where every channel in that set is finite. One missing contributor blanks that sample. A file with fewer than two analysis channels stays as stored.
+- **Linked ears** and **one ear.** A1/A2, also named LE/EL and RE/ER. **Linked mastoids** use M1/M2, also named T9/T10. Ears and mastoids are not substitutes. A missing pair, or one blank side of a linked pair, keeps the stored reference and says so.
+- **Vertex (Cz).** The fit subtracts Cz and leaves Cz out of the spectrum. On the trace, Cz is the zero line.
+- **Ipsilateral** and **contralateral** ears. A lateral channel follows the ear that output depends on. Midline channels need both ears.
+- **REST.** An infinity reference from a template spherical forward model. The values stay in microvolts. If the forward solution cannot be built, the stored signal is kept. REST is not offered as a trace montage, and it is not applied a second time.
+- **Local Laplacian.** Each site minus the equal mean of its listed neighbors. The result stays in microvolts. A center is used only when every listed neighbor is in the file. Fit only.
+- **CSD.** The spherical-spline surface Laplacian, in µV/m², with spectra in µV²/(m⁴·Hz). Four 10-20 channels is the minimum the spline will calculate. Fewer than eight is marked as a sparse surface. A missing sample on one contributor blanks that time on every CSD channel.
+- **Global scale.** The average reference, then one factor: the geometric mean of the positive channel-by-frequency Welch power inside the fit band. Samples are divided by the square root of that factor, so linear spectra divide by the factor. The aperiodic offset moves by log10 of the factor. Exponent, peak frequency, bandwidth, and peak height above the background stay put, apart from ordinary fit differences. Each recording is scaled on its own. This is a scale correction, not a regression and not a principal-component removal.
+
+Linked ears, linked mastoids, REST, the local Laplacian, and global scale are fit-only. The trace montages are as stored, average, vertex, either ear, ipsilateral, contralateral, longitudinal bipolar, transverse bipolar, circumferential bipolar, and CSD. A bipolar pair is drawn when both channels are checked. Display band and notch run after the montage. The default display band is Off.
+
+Captions name the reference that was actually applied. When the request could not be applied, the fallback is named too. An eyes-closed / eyes-open pair names both applied transforms when they differ. `--reference` on the command line takes the same fit choices.
 
 ## Frequency bands
 
@@ -108,11 +130,11 @@ Changes to epochs, reference or amplitude limits require **Refit**.
 
 The app also flags measurements that need a closer look.
 
-Fits with R² below 0.6 are ringed on the head map. Peaks sitting against the minimum allowed width are marked.
+Fits with R² below 0.6 are drawn as a diamond on the head map. The selected channel is ringed. Peaks sitting against the minimum allowed width are marked. A missing site stays gray.
 
 Recordings with suspicious voltage scales are flagged beside the filename rather than silently rescaled.
 
-The active reference is shown in the Spectrum and Compare captions. By default, the app uses the reference stored in the recording.
+Spectrum and Compare captions name the reference that was applied. The default is the reference stored in the recording. Saved PNGs carry that caption along the bottom edge. The picture on screen does not.
 
 These checks matter because a clean-looking graph doesn't necessarily mean the fit or the original signal is reliable.
 
@@ -161,7 +183,7 @@ The controls and calculations are documented in [docs/running.md](docs/running.m
 
 That document should be updated whenever the interface or processing changes.
 
-Version 0.2.0 is the review workspace above. Wrapping controls, the advanced-settings
+Version 0.3.0 keeps the review workspace above and adds the reference and montage controls. Wrapping controls, the advanced-settings
 foldout, pending and invalid settings, keyboard shortcuts, and file-error dialogs
 are described in the [controls and feedback guide](docs/running.md#controls-and-feedback).
 Closing during background work stays responsive.
@@ -180,23 +202,7 @@ The screenshots use a 60-second section of eyes-closed and eyes-open EDF recordi
 
 Traces is a 15-second page at 100 µV, from 158–173 seconds, with O1 selected. Spectrum, Cycles, Compare, and Findings are that same O1 fit: a 10 Hz peak with eyes closed, a smaller peak near 9 Hz with eyes open, and no library bursts. Time shows the spectrogram, then the burst row on the 120–180 second clock. Review flags the weak eyes-closed fits. Study lists the one fit window and waits for Compute before drawing a variability series.
 
-![Traces](docs/screenshots/traces.png)
-
-![Spectrum](docs/screenshots/spectrum.png)
-
-![Time, spectrogram](docs/screenshots/time.png)
-
-![Time, bursts](docs/screenshots/time-bursts.png)
-
-![Cycles](docs/screenshots/cycles.png)
-
-![Compare](docs/screenshots/compare.png)
-
-![Findings](docs/screenshots/findings.png)
-
-![Review](docs/screenshots/review.png)
-
-![Study](docs/screenshots/study.png)
+TracesSpectrumTime, spectrogramTime, burstsCyclesCompareFindingsReviewStudy
 
 ## Run from source
 
@@ -217,7 +223,7 @@ python -m bifooof compare --ec EC_FILE --eo EO_FILE --channel O1 --out bifooof-o
 python -m bifooof formats
 ```
 
-`--band` sets the cycle band: `delta`, `theta`, `alpha`, `beta`, `gamma`, or a range such as `8-12`. `--alpha LOW HIGH` sets the reactivity peak. In the window those two stay on the same band.
+`--band` sets the cycle band: `delta`, `theta`, `alpha`, `beta`, `gamma`, or a range such as `8-12`. `--alpha LOW HIGH` sets the reactivity peak. In the window those two stay on the same band. `--reference` selects the fit reference (`stored`, `average`, `linked`, `mastoid`, `left`, `right`, `vertex`, `ipsilateral`, `contralateral`, `rest`, `hjorth`, `csd`, or `global`). `--amplitude-limit` is the microvolt limit applied before that reference. `0` keeps every sample.
 
 ## One file
 

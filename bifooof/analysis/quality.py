@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..io.recording import Recording
+from .prepare import beyond_trend
 from .segments import accepted_runs
 
 _FLAT_UV = 0.5
@@ -44,8 +45,11 @@ def quality_spans(recording: Recording, limit_uv: float = 500.0) -> list[Quality
             ))
         limit = float(limit_uv)
         if limit > 0:
-            loud = np.isfinite(signal) & (np.abs(signal) > limit)
-            found.extend(_runs(name, recording.sfreq, loud, "amplitude", "detected", f"Beyond ±{limit:g} µV."))
+            loud = beyond_trend(signal, limit)
+            found.extend(_runs(
+                name, recording.sfreq, loud, "amplitude", "detected",
+                f"Beyond ±{limit:g} µV of the trend.",
+            ))
         found.extend(_flat(name, signal, recording.sfreq))
         found.extend(_steps(name, signal, recording.sfreq))
         found.extend(_windows(name, signal, recording.sfreq))
@@ -53,30 +57,54 @@ def quality_spans(recording: Recording, limit_uv: float = 500.0) -> list[Quality
 
 
 def mask_spans(recording: Recording, spans: list[QualitySpan], *, copy_data=True) -> Recording:
-    """Return a copy with these spans left out of later fits. The file is unchanged."""
+    """Return a copy with these spans left out of later fits. The file is unchanged.
+
+    A span on an ear also blanks that ear in the linked-reference copy. A span
+    on every channel blanks every stored ear. Otherwise the excluded ear would
+    still be subtracted from the channels that were kept. Ear arrays are always
+    copied, so this does not rewrite the recording it was given. When
+    ``copy_data`` is false the voltage array is shared and the validity mask is
+    what leaves a sample out.
+    """
     if not spans:
         return recording
     data = np.array(recording.data, dtype=np.float64, copy=True) if copy_data else recording.data
     valid = np.ones(data.shape, dtype=bool) if recording.valid is None else np.array(recording.valid, copy=True)
     rejected = list(recording.rejected_spans)
+    refs = {
+        name: np.array(values, dtype=np.float64, copy=True)
+        for name, values in recording.reference_channels.items()
+    }
+
+    def blank_reference(name: str, i0: int, i1: int) -> None:
+        values = refs.get(name)
+        if values is None:
+            return
+        stop = min(i1, int(values.shape[0]))
+        if stop > i0:
+            values[i0:stop] = np.nan
+
     for span in spans:
         i0 = max(0, int(round(span.start_s * recording.sfreq)))
         i1 = min(recording.n_samples, int(round(span.end_s * recording.sfreq)))
         if i1 <= i0:
             continue
-        if span.channel in ("", "*") or span.channel not in recording.ch_names:
-            if span.channel not in ("", "*"):
-                continue
+        if span.channel in ("", "*"):
             valid[:, i0:i1] = False
             if copy_data:
                 data[:, i0:i1] = np.nan
-        else:
-            index = recording.ch_names.index(span.channel)
-            valid[index, i0:i1] = False
-            if copy_data:
-                data[index, i0:i1] = np.nan
-        if span.channel in ("", "*"):
+            for name in refs:
+                blank_reference(name, i0, i1)
             rejected.append((float(span.start_s), float(span.end_s)))
+            continue
+        if span.channel not in recording.ch_names:
+            blank_reference(span.channel, i0, i1)
+            continue
+        index = recording.ch_names.index(span.channel)
+        valid[index, i0:i1] = False
+        if copy_data:
+            data[index, i0:i1] = np.nan
+        blank_reference(span.channel, i0, i1)
     return Recording(
         data=data,
         ch_names=list(recording.ch_names),
@@ -88,7 +116,7 @@ def mask_spans(recording: Recording, spans: list[QualitySpan], *, copy_data=True
         valid=valid,
         bad_channels=list(recording.bad_channels),
         rejected_spans=rejected,
-        reference_channels={name: np.array(values, copy=True) if copy_data else values for name, values in recording.reference_channels.items()},
+        reference_channels=refs,
         dropped_by_amplitude=list(recording.dropped_by_amplitude),
         source_start_s=recording.source_start_s,
         reference_applied=recording.reference_applied,
@@ -111,6 +139,28 @@ def project_exclusions(source: Recording, recordings: list[Recording]) -> Record
                 spans.append(QualitySpan(
                     name, max(0.0, offset + start / source.sfreq),
                     min(source.duration_s, offset + stop / source.sfreq),
+                    "session", "confirmed", "Projected from the condition recording.",
+                ))
+        for name, row in recording.reference_channels.items():
+            source_row = source.reference_channels.get(name)
+            if source_row is None:
+                continue
+            values = np.asarray(row, dtype=np.float64)
+            origin = np.asarray(source_row, dtype=np.float64)
+            shift = int(round(offset * source.sfreq))
+            source_index = np.arange(values.size) + shift
+            inside = (source_index >= 0) & (source_index < origin.size)
+            source_index = source_index[inside]
+            # An ear that was already missing on the source is not a new exclusion.
+            blanked = ~np.isfinite(values[inside]) & np.isfinite(origin[source_index])
+            if not np.any(blanked):
+                continue
+            missing = np.zeros(origin.size, dtype=bool)
+            missing[source_index[blanked]] = True
+            for start, stop in accepted_runs(missing):
+                spans.append(QualitySpan(
+                    name, max(0.0, start / source.sfreq),
+                    min(source.duration_s, stop / source.sfreq),
                     "session", "confirmed", "Projected from the condition recording.",
                 ))
     return mask_spans(source, spans)
@@ -167,8 +217,10 @@ def _windows(name: str, signal: np.ndarray, sfreq: float) -> list[QualitySpan]:
         spectrum = np.abs(np.fft.rfft(centered)) ** 2
         start_s = start / sfreq
         end_s = (start + width) / sfreq
-        slope = abs(float(piece[-1] - piece[0]))
-        if slope >= _DRIFT_UV:
+        # The change along a fitted line. The first and last samples of a sine
+        # can differ by its whole swing without any wander underneath.
+        slope = float(np.polyfit(np.arange(piece.size, dtype=np.float64), piece, 1)[0])
+        if abs(slope) * (piece.size - 1) >= _DRIFT_UV:
             found.append(QualitySpan(name, start_s, end_s, "drift", "suspected", "Slow wander inside this window."))
         if _band_ratio(freqs, spectrum, 30.0, min(45.0, sfreq / 2.0 - 1.0), 4.0, 20.0) >= 4.0:
             found.append(QualitySpan(name, start_s, end_s, "muscle", "suspected", "High-frequency power is high for this window."))
@@ -184,7 +236,9 @@ def _band_ratio(freqs, spectrum, high_low, high_high, low_low, low_high) -> floa
     low = spectrum[(freqs >= low_low) & (freqs <= low_high)]
     if high.size == 0 or low.size == 0:
         return 0.0
-    floor = float(np.median(low))
+    # Mean, not median. A narrow peak leaves most low-band bins empty, and the
+    # median of those bins is numerical dust.
+    floor = float(np.mean(low))
     if floor <= 0:
         return 0.0
     return float(np.mean(high) / floor)
@@ -195,13 +249,15 @@ def _mains(freqs, spectrum) -> bool:
     if neighbors.size < 5:
         return False
     floor = float(np.median(neighbors))
-    if floor <= 0:
+    peak = float(np.max(spectrum))
+    if floor <= 0 or peak <= 0:
         return False
     for line in (50.0, 60.0):
         index = int(np.argmin(np.abs(freqs - line)))
         if abs(freqs[index] - line) > 1.5:
             continue
-        if spectrum[index] >= floor * 6.0:
+        # A line that is only taller than numerical dust is not mains.
+        if spectrum[index] >= floor * 6.0 and spectrum[index] >= peak * 1e-4:
             return True
     return False
 

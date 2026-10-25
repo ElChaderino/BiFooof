@@ -159,6 +159,33 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(source.mask(1).all())
         self.assertIn("O2", result.bad_channels)
 
+    def test_a_review_exclusion_leaves_the_source_and_stays_out_of_the_average(self):
+        from bifooof.analysis.prepare import apply_reference
+
+        ear = np.full(256, 4.0)
+        source = Recording(
+            np.ones((1, 256)), ["O1"], 128.0, "source.csv", "csv",
+            reference_channels={"A1": ear, "A2": np.full(256, 2.0)},
+        )
+        state = ReviewState()
+        state.change(exclusions={"ec": [asdict(QualitySpan("A1", 0.5, 1.0, "user", "confirmed", "ear"))]})
+        result = state.apply(source, "ec")
+        self.assertTrue(np.isfinite(source.reference_channels["A1"]).all())
+        self.assertTrue(np.isnan(result.reference_channels["A1"][64:128]).all())
+        self.assertTrue(np.isfinite(result.reference_channels["A2"]).all())
+
+        data = np.full((2, 128), 10.0)
+        data[0, 10] = 1000.0
+        pair = Recording(data, ["Fp1", "O1"], 128.0, "pair.csv", "csv")
+        state.change(exclusions={"ec": [asdict(QualitySpan("Fp1", 10 / 128, 11 / 128, "user", "confirmed", "spike"))]})
+        masked = state.apply(pair, "ec")
+        self.assertEqual(float(pair.data[0, 10]), 1000.0)
+        self.assertFalse(bool(masked.valid[0, 10]))
+        self.assertEqual(float(masked.data[0, 10]), 1000.0)
+        averaged = apply_reference(masked, "average")
+        self.assertTrue(np.isnan(averaged.data[:, 10]).all())
+        self.assertAlmostEqual(float(averaged.data[1, 0]), 0.0)
+
 
 class AnalysisFeatureTests(unittest.TestCase):
     def test_auxiliary_types_are_review_only_and_do_not_pull_eeg_reference(self):
@@ -205,10 +232,13 @@ class AnalysisFeatureTests(unittest.TestCase):
         values = np.sin(np.arange(1000)[None, :] / 10)
         values[:, 400:450] = np.nan
         before = values.copy()
-        result = display_filter(values, 128, "1–30")
+        result, note = display_filter(values, 128, "1–30")
+        self.assertEqual(note, "")
         np.testing.assert_equal(values, before)
         self.assertTrue(np.isnan(result[:, 400:450]).all())
         self.assertFalse(np.allclose(result[:, :400], values[:, :400]))
+        hyphen, _note = display_filter(values, 128, "1-30")
+        np.testing.assert_allclose(hyphen, result, equal_nan=True)
 
     def test_epoch_results_retain_times_and_support(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -394,6 +424,43 @@ class DesktopFeatureTests(unittest.TestCase):
         panel._on_click(SimpleNamespace(inaxes=True, xdata=1., ydata=1.))
         panel._on_release(SimpleNamespace(xdata=2., ydata=-.8))
         self.assertIn("O1 displayed-sample Δamplitude +128.00 µV", panel.ruler.text())
+
+    def test_an_ear_montage_keeps_a_bad_span_blank(self):
+        from bifooof.ui.trace_panel import TracePanel
+        panel = TracePanel()
+        self.addCleanup(panel.close)
+        valid = np.ones((1, 8), dtype=bool)
+        valid[0, 3] = False
+        source = Recording(
+            np.full((1, 8), 10.0), ["O1"], 256.0, "bad.csv", "csv",
+            valid=valid, reference_channels={"A1": np.full(8, 4.0)},
+        )
+        panel.set_recording(source)
+        panel.montage.setCurrentIndex(panel.montage.findData("left"))
+        _times, segment, names = panel._ruler_data
+        self.assertEqual(names, ["O1"])
+        self.assertAlmostEqual(float(segment[0, 0]), 6.0)
+        self.assertTrue(np.isnan(segment[0, 3]))
+
+    def test_a_missing_ear_montage_says_so_on_the_ruler(self):
+        from bifooof.ui.trace_panel import TracePanel
+        panel = TracePanel()
+        self.addCleanup(panel.close)
+        panel.set_recording(Recording(np.ones((2, 32)), ["O1", "O2"], 256.0, "ears.csv", "csv"))
+        panel.montage.setCurrentIndex(panel.montage.findData("left"))
+        self.assertIn("Left ear was not in the file", panel.ruler.text())
+        panel.montage.setCurrentIndex(panel.montage.findData("stored"))
+        self.assertIn("Drag to select", panel.ruler.text())
+
+    def test_the_trace_names_the_fit_reference_beside_the_picture(self):
+        from bifooof.ui.trace_panel import TracePanel
+        panel = TracePanel()
+        self.addCleanup(panel.close)
+        panel.set_recording(Recording(np.ones((1, 32)), ["O1"], 256.0, "line.csv", "csv"))
+        panel.set_fit_reference("left", 500.0)
+        panel.montage.setCurrentIndex(panel.montage.findData("left"))
+        self.assertIn("Trace: Left ear, amplitude limit not applied", panel.reference_line.text())
+        self.assertIn("Fit: Left ear, amplitude limit ±500 µV applied before the reference", panel.reference_line.text())
 
     @classmethod
     def setUpClass(cls):

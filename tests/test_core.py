@@ -22,7 +22,13 @@ from PySide6.QtWidgets import QApplication
 
 from bifooof.analysis.compare import ChannelComparison, alpha_peak, compare_spectra, nearest_outside_peak
 from bifooof.analysis.cycles import burst_cutoffs, burst_episodes, burst_note, fit_cycles
-from bifooof.analysis.prepare import apply_reference, peak_at_width_floor, prepare_recording, voltage_scale_note
+from bifooof.analysis.prepare import (
+    apply_current_source_density, apply_reference, apply_vertex_reference,
+    bipolar_derivations, global_scale_factor,
+    CIRCUMFERENTIAL_BIPOLAR, LONGITUDINAL_BIPOLAR, TRANSVERSE_BIPOLAR,
+    peak_at_width_floor, prepare_recording,
+    sample_provenance, voltage_scale_note,
+)
 from bifooof.analysis.segments import episode_count
 from bifooof.analysis.settings import FitSettings, band_label, band_phrase, matched_settings
 from bifooof.analysis.specparam_fit import ChannelFit, fit_spectra
@@ -54,6 +60,61 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(clean_channel_name("T6"), "P8")
         self.assertEqual(clean_channel_name("C3-Av"), "C3")
         self.assertEqual(clean_channel_name("Cz-REF"), "Cz")
+        self.assertEqual(clean_channel_name("LE"), "A1")
+        self.assertEqual(clean_channel_name("RE"), "A2")
+        self.assertEqual(clean_channel_name("T9"), "M1")
+        self.assertEqual(clean_channel_name("T10"), "M2")
+        self.assertEqual(clean_channel_name("EL"), "A1")
+        self.assertEqual(clean_channel_name("ER"), "A2")
+
+    def test_a_modern_name_wins_when_the_old_alias_is_also_present(self):
+        legacy_first = finalize(np.array([[10.0, 0.0], [99.0, 99.0]]), ["T3", "T7"], 100.0, "edge.csv", "csv")
+        self.assertEqual(legacy_first.ch_names, ["T7"])
+        self.assertEqual(legacy_first.data[0, 0], 99.0)
+        self.assertIn("Set aside T3 and kept T7", " ".join(legacy_first.notes))
+        self.assertIn("T3", legacy_first.import_info["set_aside_channels"])
+
+        modern_first = finalize(np.array([[99.0, 99.0], [10.0, 0.0]]), ["T7", "T3"], 100.0, "edge.csv", "csv")
+        self.assertEqual(modern_first.data[0, 0], 99.0)
+
+        alias_only = finalize(np.array([[5.0, 5.0]]), ["T3"], 100.0, "edge.csv", "csv")
+        self.assertEqual(alias_only.ch_names, ["T7"])
+        self.assertEqual(alias_only.data[0, 0], 5.0)
+        self.assertNotIn("Set aside", " ".join(alias_only.notes))
+
+        named = finalize(
+            np.vstack([np.full(4, 10.0), np.full(4, 4.0), np.full(4, 8.0)]),
+            ["O1", "LE", "T10"], 256.0, "ears.csv", "csv",
+        )
+        self.assertIn("A1", named.reference_channels)
+        self.assertIn("M2", named.reference_channels)
+        self.assertNotIn("LE", named.ch_names)
+        self.assertNotIn("T10", named.ch_names)
+        referenced = apply_reference(named, "left")
+        self.assertEqual(referenced.reference_applied, "left")
+        o1 = referenced.ch_names.index("O1")
+        self.assertAlmostEqual(float(referenced.data[o1, 0]), 6.0)
+        right = apply_reference(named, "right")
+        self.assertEqual(right.reference_applied, "stored")
+        self.assertNotIn("M2", right.notes[-1])
+        self.assertAlmostEqual(float(right.data[right.ch_names.index("O1"), 0]), 10.0)
+
+    def test_empty_edf_and_ragged_json_name_the_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            empty = root / "empty.edf"
+            empty.write_bytes(b"")
+            with self.assertRaises(ValueError) as caught:
+                load_recording(empty)
+            self.assertIn("empty", str(caught.exception).lower())
+            self.assertNotIn("invalid literal", str(caught.exception))
+
+            ragged = root / "ragged.json"
+            ragged.write_text('{"sfreq": 100, "data": [[1, 2], [3]]}', encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                load_recording(ragged)
+            self.assertIn("same number of samples", str(caught.exception))
+            self.assertNotIn("inhomogeneous", str(caught.exception))
 
     def test_eeg_magic_and_orphan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,6 +207,40 @@ class FormatTests(unittest.TestCase):
         self.assertAlmostEqual(recording.duration_s, 4.0, delta=0.02)
         self.assertIn("10:36:38", " ".join(recording.notes))
 
+    def test_a_second_eyes_closed_mark_does_not_cut_the_first(self):
+        recording = Recording(
+            data=np.zeros((1, int(12 * 256))), ch_names=["O1"], sfreq=256.0,
+            source_path="marked.csv", source_format="csv",
+            marks=[Mark(0.0, "EC"), Mark(5.0, "still EC"), Mark(10.0, "EO")],
+        )
+        sides = split_marked_conditions(recording)
+        self.assertAlmostEqual(sides["ec"].duration_s, 10.0, delta=0.02)
+        self.assertAlmostEqual(sides["eo"].duration_s, 2.0, delta=0.02)
+        self.assertNotIn("left out", sides["ec"].notes[-1])
+
+    def test_a_separate_eyes_closed_span_is_named_when_it_is_left_out(self):
+        recording = Recording(
+            data=np.zeros((1, int(12 * 256))), ch_names=["O1"], sfreq=256.0,
+            source_path="marked.csv", source_format="csv",
+            marks=[Mark(0.0, "EC", 2.0), Mark(8.0, "EC", 3.0)],
+        )
+        closed = split_marked_conditions(recording)["ec"]
+        self.assertAlmostEqual(closed.duration_s, 3.0, delta=0.02)
+        self.assertIn("left out", closed.notes[-1])
+        self.assertIn("2.0 s at 0.0 s", closed.notes[-1])
+
+    def test_a_written_duration_stops_at_the_next_condition(self):
+        recording = Recording(
+            data=np.zeros((1, int(12 * 256))), ch_names=["O1"], sfreq=256.0,
+            source_path="marked.csv", source_format="csv",
+            marks=[Mark(0.0, "EC", 10.0), Mark(6.0, "EO", 4.0)],
+        )
+        sides = split_marked_conditions(recording)
+        self.assertAlmostEqual(sides["ec"].duration_s, 6.0, delta=0.02)
+        self.assertAlmostEqual(sides["eo"].duration_s, 4.0, delta=0.02)
+        self.assertIn("cut at the next eyes open mark", sides["ec"].notes[-1])
+        self.assertNotIn("cut at", sides["eo"].notes[-1])
+
     def test_csv_and_json_roundtrip(self):
         times, data, names = _synthetic()
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +316,33 @@ class FitTests(unittest.TestCase):
         self.assertEqual(fit.aperiodic_mode, "fixed")
         self.assertAlmostEqual(fit.t_start, 0.0)
         self.assertAlmostEqual(fit.t_end, self.recording.duration_s, delta=0.05)
+
+    def test_welch_segment_stays_at_the_requested_length(self):
+        sfreq = 100.0
+        times = np.arange(int(60 * sfreq)) / sfreq
+        data = (20.0 * np.sin(2 * np.pi * 10.0 * times))[None, :]
+        _freqs, _power, nperseg = welch_spectra(data, sfreq, segment_s=2.0)
+        self.assertEqual(nperseg, 200)
+
+    def test_a_short_sine_is_not_called_flat(self):
+        samples = 20.0 * np.sin(np.linspace(0, 6, 15))
+        recording = Recording(samples[None, :], ["O1"], 128.0, "edge", "synthetic")
+        with self.assertRaises(ValueError) as caught:
+            fit_spectra(recording)
+        message = str(caught.exception)
+        self.assertIn("16", message)
+        self.assertNotIn("flat", message.lower())
+
+    def test_a_low_sampling_rate_says_the_range_was_brought_down(self):
+        sfreq = 64.0
+        times = np.arange(int(8 * sfreq)) / sfreq
+        data = (20.0 * np.sin(2 * np.pi * 10.0 * times))[None, :]
+        recording = Recording(data, ["O1"], sfreq, "edge", "synthetic")
+        fit = fit_spectra(recording, FitSettings(fmin=1, fmax=40, segment_s=2))
+        self.assertLess(fit.fmax, 32.0)
+        self.assertIn("31.5", fit.notes)
+        self.assertIn("brought down", fit.notes)
+        self.assertEqual(fit.welch_nperseg, 128)
 
     def test_fit_window_and_range(self):
         settings = FitSettings(t_start=1.0, t_length=4.0, fmin=2.0, fmax=30.0, segment_s=2.0)
@@ -398,9 +520,123 @@ class QualityTests(unittest.TestCase):
         )
         prepared = prepare_recording(recording, FitSettings(reference="average"))
         self.assertTrue(np.isnan(prepared.data[0, 4]))
-        self.assertAlmostEqual(float(prepared.data[1, 4]), 10.0)
+        self.assertTrue(np.isnan(prepared.data[1, 4]))
         self.assertAlmostEqual(float(prepared.data[0, 0]), 0.0)
         self.assertAlmostEqual(float(prepared.data[1, 0]), 0.0)
+
+    def test_a_rejected_sample_stays_out_of_the_reference(self):
+        values = np.full(8, 10.0)
+        spike = values.copy()
+        spike[3] = 1000.0
+        valid = np.ones((3, 8), dtype=bool)
+        valid[0, 3] = False
+        recording = Recording(
+            np.vstack([spike, values, values]), ["Fp1", "Cz", "O1"], 256.0,
+            "rejected.csv", "csv", valid=valid,
+        )
+        averaged = apply_reference(recording, "average")
+        self.assertTrue(np.isnan(averaged.data[:, 3]).all())
+        self.assertAlmostEqual(float(averaged.data[1, 0]), 0.0)
+        self.assertEqual(float(recording.data[0, 3]), 1000.0)
+        self.assertTrue(bool(recording.valid[1, 3]))
+
+        vertex_valid = np.ones((2, 8), dtype=bool)
+        vertex_valid[1, 3] = False
+        vertex = apply_reference(
+            Recording(
+                np.vstack([values, spike]), ["O1", "Cz"], 256.0, "vertex.csv", "csv",
+                valid=vertex_valid,
+            ),
+            "vertex",
+        )
+        self.assertTrue(np.isnan(vertex.data[0, 3]))
+        self.assertAlmostEqual(float(vertex.data[0, 0]), 0.0)
+
+        neighbors = np.zeros((4, 8))
+        neighbors[0] = values
+        hole = np.ones((4, 8), dtype=bool)
+        hole[1, 3] = False
+        neighbors[1, 3] = 1000.0
+        laplacian = apply_reference(
+            Recording(
+                neighbors, ["Fp1", "Fp2", "F7", "F3"], 256.0, "lap.csv", "csv", valid=hole,
+            ),
+            "hjorth",
+        )
+        self.assertTrue(np.isnan(laplacian.data[0, 3]))
+        self.assertTrue(np.isfinite(laplacian.data[0, 0]))
+
+        csd_valid = np.ones((4, 8), dtype=bool)
+        csd_valid[0, 3] = False
+        csd_data = np.zeros((4, 8))
+        csd_data[0, 3] = 1.0e6
+        density = apply_reference(
+            Recording(
+                csd_data, ["Fp1", "Fz", "Cz", "Pz"], 256.0, "csd.csv", "csv", valid=csd_valid,
+            ),
+            "csd",
+        )
+        self.assertTrue(np.isnan(density.data[:, 3]).all())
+        self.assertEqual(float(csd_data[0, 3]), 1.0e6)
+
+        scalp = np.full(8, 10.0)
+        left = np.full(8, 4.0)
+        right = np.full(8, 2.0)
+        ear_valid = np.ones((3, 8), dtype=bool)
+        ear_valid[1, 3] = False
+        linked = apply_reference(
+            Recording(
+                np.vstack([scalp, left, right]), ["O1", "A1", "A2"], 256.0, "ears.csv", "csv",
+                valid=ear_valid, reference_channels={"A1": left.copy(), "A2": right.copy()},
+            ),
+            "linked",
+        )
+        self.assertTrue(np.isnan(linked.data[0, 3]))
+        self.assertAlmostEqual(float(linked.data[0, 0]), 7.0)
+        self.assertEqual(float(left[3]), 4.0)
+
+        blanked = np.ones((2, 8), dtype=bool)
+        blanked[0, :] = False
+        loud = np.full((2, 8), 10.0)
+        loud[0, :] = 5000.0
+        kept = apply_reference(
+            Recording(loud, ["Fp1", "O1"], 256.0, "blanked.csv", "csv", valid=blanked),
+            "average",
+        )
+        self.assertEqual(kept.reference_applied, "stored")
+        self.assertAlmostEqual(float(kept.data[1, 0]), 10.0)
+        self.assertTrue(np.isnan(kept.data[0]).all())
+
+    def test_a_second_pass_keeps_the_reference_that_was_already_applied(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        tone = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        recording = Recording(
+            np.vstack([tone, 0.5 * tone]), ["O1", "O2"], sfreq, "again.csv", "csv",
+        )
+        plain = prepare_recording(recording, FitSettings(reference="stored", amplitude_limit_uv=0))
+        self.assertEqual(plain.import_info["reference_requested"], "stored")
+        averaged = prepare_recording(recording, FitSettings(reference="average", amplitude_limit_uv=0))
+        again = prepare_recording(averaged, FitSettings(reference="stored", amplitude_limit_uv=0))
+        self.assertEqual(again.reference_applied, "average")
+        self.assertEqual(again.import_info["reference_requested"], "average")
+        self.assertEqual(sample_provenance(again)["reference_fallback"], "")
+        failed = prepare_recording(
+            Recording(tone[None, :], ["O1"], sfreq, "one.csv", "csv"),
+            FitSettings(reference="linked", amplitude_limit_uv=0),
+        )
+        kept = prepare_recording(failed, FitSettings(reference="stored", amplitude_limit_uv=0))
+        self.assertEqual(kept.import_info["reference_requested"], "linked")
+        self.assertEqual(kept.reference_applied, "stored")
+        self.assertIn("stored reference was kept", sample_provenance(kept)["reference_fallback"])
+        fit = fit_spectra(recording, FitSettings(reference="average", epoch_s=8.0, amplitude_limit_uv=0))
+        self.assertEqual(fit.provenance["reference_requested"], "average")
+        self.assertEqual(fit.provenance["reference_applied"], "average")
+        self.assertTrue(fit.epochs)
+        for epoch in fit.epochs:
+            self.assertEqual(epoch.provenance["reference_requested"], "average")
+            self.assertEqual(epoch.provenance["reference_applied"], "average")
+            self.assertEqual(epoch.provenance["reference_fallback"], "")
 
     def test_a_short_window_is_not_called_an_epoch(self):
         sfreq = 256.0
@@ -435,6 +671,678 @@ class QualityTests(unittest.TestCase):
         )
         self.assertIn("not in the file", missing.notes[-1])
         self.assertAlmostEqual(float(missing.data[0, 0]), 10.0)
+
+    def test_current_source_density_removes_a_shared_signal_and_names_its_limits(self):
+        sfreq = 256.0
+        times = np.arange(int(2.0 * sfreq)) / sfreq
+        shared = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        names = ["Fp1", "Fz", "Cz", "Pz"]
+        common = apply_reference(
+            Recording(np.tile(shared, (4, 1)), names, sfreq, "common.csv", "csv"),
+            "csd",
+        )
+        self.assertEqual(common.reference_applied, "csd")
+        self.assertIn("µV/m²", common.notes[-1])
+        self.assertLess(float(np.nanmax(np.abs(common.data))), 1e-4)
+        focal_data = np.zeros((4, times.size))
+        focal_data[2] = shared
+        focal = apply_reference(Recording(focal_data, names, sfreq, "focal.csv", "csv"), "csd")
+        self.assertGreater(float(np.nanmax(np.abs(focal.data[2]))), float(np.nanmax(np.abs(focal.data[0]))))
+        shifted = apply_reference(
+            Recording(focal_data + 1000.0, names, sfreq, "shift.csv", "csv"),
+            "csd",
+        )
+        self.assertLess(float(np.nanmax(np.abs(focal.data - shifted.data))), 1e-4)
+
+        short = apply_reference(
+            Recording(np.tile(shared, (3, 1)), names[:3], sfreq, "short.csv", "csv"),
+            "csd",
+        )
+        self.assertEqual(short.reference_applied, "stored")
+        self.assertIn("at least 4", short.notes[-1])
+        self.assertAlmostEqual(float(short.data[0, 0]), float(shared[0]))
+        blank = apply_reference(
+            Recording(np.full((4, times.size), np.nan), names, sfreq, "blank.csv", "csv"),
+            "csd",
+        )
+        self.assertEqual(blank.reference_applied, "stored")
+        self.assertIn("no finite samples", blank.notes[-1])
+        self.assertTrue(np.isnan(blank.data).all())
+
+        extra = np.vstack([focal_data, shared])
+        mixed = apply_reference(
+            Recording(extra, [*names, "X1"], sfreq, "extra.csv", "csv"),
+            "csd",
+        )
+        self.assertTrue(np.isnan(mixed.data[-1]).all())
+        self.assertIn("X1", mixed.notes[-1])
+        self.assertIn("10-20", mixed.notes[-1])
+
+        hole = focal_data.copy()
+        hole[0, 3] = np.nan
+        punched = apply_reference(Recording(hole, names, sfreq, "hole.csv", "csv"), "csd")
+        self.assertTrue(np.isnan(punched.data[:, 3]).all())
+        self.assertTrue(np.isfinite(punched.data[:, 0]).all())
+        self.assertIn("missing", punched.notes[-1])
+        self.assertFalse(bool(punched.valid[:, 3].any()))
+
+    def test_a_different_channel_set_builds_the_laplacian_quickly(self):
+        import time
+
+        from bifooof.analysis.prepare import _laplacian_matrix
+
+        _laplacian_matrix(("Fp1", "Fz", "Cz", "Pz"))
+        names = (
+            "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T7", "C3", "Cz",
+            "C4", "T8", "P7", "P3", "Pz", "P4", "P8", "O1", "O2",
+        )
+        started = time.perf_counter()
+        matrix = _laplacian_matrix(names)
+        self.assertEqual(matrix.shape, (19, 19))
+        self.assertLess(time.perf_counter() - started, 0.2)
+        started = time.perf_counter()
+        other = _laplacian_matrix(names[:-1])
+        self.assertEqual(other.shape, (18, 18))
+        self.assertLess(time.perf_counter() - started, 0.2)
+        self.assertGreater(float(np.max(np.abs(matrix))), 0.0)
+
+    def test_global_scale_uses_the_average_and_the_geometric_mean(self):
+        self.assertAlmostEqual(global_scale_factor(np.array([[1.0], [np.e], [np.e ** 2]])), np.e, places=6)
+        partial = global_scale_factor(np.array([[1.0], [np.e], [-1.0]]))
+        self.assertAlmostEqual(partial, float(np.exp(0.5)), places=6)
+        self.assertIsNone(global_scale_factor(np.zeros((2, 3))))
+
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        tone = np.sin(2 * np.pi * 10.0 * times)
+        data = np.vstack([40.0 * tone, 10.0 * tone])
+        recording = Recording(data, ["O1", "O2"], sfreq, "scale.csv", "csv")
+        scaled = prepare_recording(recording, FitSettings(reference="global", amplitude_limit_uv=0))
+        self.assertEqual(scaled.reference_applied, "global")
+        self.assertIn("Global scale factor", scaled.notes[-1])
+        self.assertAlmostEqual(float(np.nanmax(np.abs(scaled.data.sum(axis=0)))), 0.0, places=6)
+        _freqs, power, _nperseg = welch_spectra(scaled.data, sfreq, 1.0, 40.0, 4.0)
+        self.assertAlmostEqual(global_scale_factor(power), 1.0, places=4)
+        self.assertEqual(sample_provenance(scaled)["reference_contributors"], ["O1", "O2"])
+
+        same = prepare_recording(
+            Recording(np.tile(20.0 * tone, (2, 1)), ["O1", "O2"], sfreq, "same.csv", "csv"),
+            FitSettings(reference="global", amplitude_limit_uv=0),
+        )
+        self.assertEqual(same.reference_applied, "average")
+        self.assertIn("no positive", same.notes[-1])
+
+        alone = prepare_recording(
+            Recording((20.0 * tone)[None, :], ["O1"], sfreq, "alone.csv", "csv"),
+            FitSettings(reference="global", amplitude_limit_uv=0),
+        )
+        self.assertEqual(alone.reference_applied, "stored")
+        self.assertIn("at least two", alone.notes[-1])
+        self.assertAlmostEqual(float(alone.data[0, 0]), float(20.0 * tone[0]))
+
+        brief = np.sin(2 * np.pi * 10.0 * np.arange(10) / sfreq)
+        too_short = prepare_recording(
+            Recording(np.vstack([brief, brief * 0.5]), ["O1", "O2"], sfreq, "brief.csv", "csv"),
+            FitSettings(reference="global", segment_s=4.0, amplitude_limit_uv=0),
+        )
+        self.assertEqual(too_short.reference_applied, "average")
+        self.assertIn("needs a spectrum", too_short.notes[-1])
+        FitSettings(reference="csd").validate()
+        FitSettings(reference="global").validate()
+        FitSettings(reference="vertex").validate()
+        FitSettings(reference="ipsilateral").validate()
+        FitSettings(reference="contralateral").validate()
+        FitSettings(reference="left").validate()
+        FitSettings(reference="right").validate()
+        FitSettings(reference="mastoid").validate()
+        FitSettings(reference="rest").validate()
+
+    def test_rest_uses_a_spherical_model_and_refuses_without_geometry(self):
+        sfreq = 256.0
+        times = np.arange(int(2.0 * sfreq)) / sfreq
+        shared = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        names = ["Fp1", "F3", "C3", "P3", "O1", "F4", "C4", "O2"]
+        common = apply_reference(
+            Recording(np.tile(shared, (len(names), 1)), names, sfreq, "rest-common.csv", "csv"),
+            "rest",
+        )
+        self.assertEqual(common.reference_applied, "rest")
+        self.assertIn("template geometry/spherical model", common.notes[-1])
+        self.assertIn("microvolts", common.notes[-1])
+        self.assertLess(float(np.nanmax(np.abs(common.data))), 1e-6)
+        provenance = sample_provenance(common)
+        self.assertEqual(provenance["rest_model"], "template geometry/spherical model")
+        self.assertEqual(provenance["reference_contributors"], names)
+        self.assertEqual(len(provenance["rest_sphere_m"]), 4)
+        focal = np.zeros((len(names), times.size))
+        focal[2] = shared
+        transformed = apply_reference(Recording(focal, names, sfreq, "rest-focal.csv", "csv"), "rest")
+        self.assertGreater(
+            float(np.nanmax(np.abs(transformed.data[2]))),
+            float(np.nanmax(np.abs(transformed.data[0]))),
+        )
+        punched = focal.copy()
+        punched[0, 3] = np.nan
+        gapped = apply_reference(Recording(punched, names, sfreq, "rest-gap.csv", "csv"), "rest")
+        self.assertTrue(np.isnan(gapped.data[:, 3]).all())
+        self.assertTrue(np.isfinite(gapped.data[:, 0]).all())
+        spike = np.zeros((len(names), 4))
+        spike[0, 1] = 1.0e6
+        mask = np.ones(spike.shape, dtype=bool)
+        mask[0, 1] = False
+        rejected = apply_reference(
+            Recording(spike, names, sfreq, "rest-bad.csv", "csv", valid=mask), "rest",
+        )
+        self.assertTrue(np.isnan(rejected.data[:, 1]).all())
+        self.assertTrue(np.isfinite(rejected.data[:, 0]).all())
+        self.assertEqual(float(spike[0, 1]), 1.0e6)
+        import mne
+
+        info = mne.create_info(names, sfreq, ch_types="eeg")
+        info.set_montage("standard_1020", match_case=False, on_missing="raise", verbose="error")
+        raw = mne.io.RawArray(focal * 1e-6, info, verbose="error")
+        sphere_model = mne.make_sphere_model("auto", "auto", info, verbose="error")
+        source = mne.setup_volume_source_space(
+            sphere=sphere_model, pos=15.0, exclude=30.0, sphere_units="m", verbose="error",
+        )
+        forward = mne.make_forward_solution(
+            info, trans=None, src=source, bem=sphere_model, meg=False, eeg=True, verbose="error",
+        )
+        raw.set_eeg_reference("REST", forward=forward, verbose="error")
+        np.testing.assert_allclose(transformed.data, raw.get_data() * 1e6, rtol=1e-5, atol=1e-5)
+        unnamed = apply_reference(
+            Recording(np.tile(shared, (4, 1)), ["E1", "E2", "E3", "E4"], sfreq, "rest-none.csv", "csv"),
+            "rest",
+        )
+        self.assertEqual(unnamed.reference_applied, "stored")
+        self.assertIn("10-20 layout", unnamed.notes[-1])
+        self.assertIn("stored reference was kept", unnamed.notes[-1])
+        self.assertNotIn("average", unnamed.notes[-1].lower())
+        with self.assertRaises(ValueError):
+            FitSettings(reference="nope").validate()
+
+    def test_local_laplacian_keeps_voltage_units_and_its_neighbor_list(self):
+        sfreq = 256.0
+        times = np.arange(int(1.0 * sfreq)) / sfreq
+        shared = 12.0 * np.sin(2 * np.pi * 10.0 * times)
+        names = ["Fp1", "Fp2", "F7", "F3"]
+        common = apply_reference(
+            Recording(np.tile(shared, (len(names), 1)), names, sfreq, "lap.csv", "csv"),
+            "hjorth",
+        )
+        self.assertEqual(common.reference_applied, "hjorth")
+        self.assertIn("microvolts", common.notes[-1])
+        self.assertIn("equal", common.notes[-1])
+        self.assertLess(float(np.nanmax(np.abs(common.data[0]))), 1e-6)
+        self.assertTrue(np.isnan(common.data[1]).all())
+        self.assertEqual(common.import_info["hjorth_neighbors"]["Fp1"], ["Fp2", "F7", "F3"])
+        self.assertEqual(common.import_info["hjorth_weights"], "equal, no distance scaling")
+        self.assertEqual(sample_provenance(common)["reference_contributors"], ["Fp1"])
+        focal = np.zeros((len(names), times.size))
+        focal[0] = shared
+        transformed = apply_reference(Recording(focal, names, sfreq, "lap-focal.csv", "csv"), "hjorth")
+        np.testing.assert_allclose(transformed.data[0], shared, atol=1e-6)
+        punched = np.tile(shared, (len(names), 1))
+        punched[2, 5] = np.nan
+        gapped = apply_reference(Recording(punched, names, sfreq, "lap-gap.csv", "csv"), "hjorth")
+        self.assertTrue(np.isnan(gapped.data[0, 5]))
+        self.assertTrue(np.isfinite(gapped.data[0, 0]))
+        again = apply_reference(common, "hjorth")
+        self.assertEqual(again.reference_applied, "hjorth")
+        self.assertIn("already applied", again.notes[-1])
+
+    def test_an_incomplete_average_blanks_the_sample_instead_of_keeping_it(self):
+        values = np.array([[10.0, 10.0], [20.0, 20.0], [90.0, np.nan]], dtype=float)
+        averaged = apply_reference(
+            Recording(values, ["Fp1", "O1", "Cz"], 256.0, "mean.csv", "csv"),
+            "average",
+        )
+        self.assertEqual(averaged.reference_applied, "average")
+        self.assertAlmostEqual(float(averaged.data[0, 0]), -30.0)
+        self.assertTrue(np.isnan(averaged.data[:, 1]).all())
+        self.assertIn("only one channel remains", averaged.notes[-1])
+        alone = apply_reference(
+            Recording(np.full((1, 4), 10.0), ["O1"], 256.0, "one.csv", "csv"),
+            "average",
+        )
+        self.assertEqual(alone.reference_applied, "stored")
+        self.assertAlmostEqual(float(alone.data[0, 0]), 10.0)
+
+    def test_a_blank_ear_sample_does_not_become_the_other_ear(self):
+        scalp = np.full((3, 8), 10.0)
+        left = np.full(8, 4.0)
+        right = np.full(8, 2.0)
+        right[3] = np.nan
+        recording = Recording(
+            scalp, ["O1", "O2", "Fz"], 256.0, "ears.csv", "csv",
+            reference_channels={"A1": left, "A2": right},
+        )
+        linked = apply_reference(recording, "linked")
+        self.assertAlmostEqual(float(linked.data[0, 0]), 7.0)
+        self.assertTrue(np.isnan(linked.data[:, 3]).all())
+        ipsilateral = apply_reference(recording, "ipsilateral")
+        self.assertAlmostEqual(float(ipsilateral.data[0, 3]), 6.0)
+        self.assertTrue(np.isnan(ipsilateral.data[1, 3]))
+        self.assertTrue(np.isnan(ipsilateral.data[2, 3]))
+
+    def test_a_gap_is_not_joined_before_the_spectrum(self):
+        stepped = np.zeros((1, 512))
+        stepped[0, 256:] = 1000.0
+        joined, _nperseg_joined = welch_spectra(stepped, 256.0, 1.0, 40.0, 1.0)[1:]
+        gapped = stepped.copy()
+        gapped[0, 248:264] = np.nan
+        _freqs, separated, _nperseg = welch_spectra(gapped, 256.0, 1.0, 40.0, 1.0)
+        self.assertGreater(float(np.nanmax(joined)), 1.0)
+        self.assertLess(float(np.nanmax(separated)), 1e-6)
+
+    def test_unequal_runs_are_weighted_by_welch_windows(self):
+        from scipy.signal import detrend, welch
+
+        sfreq = 256.0
+        nperseg = 256
+        times_short = np.arange(nperseg) / sfreq
+        times_long = np.arange(nperseg * 2) / sfreq
+        short = np.sin(2 * np.pi * 10.0 * times_short)
+        long = 3.0 * np.sin(2 * np.pi * 10.0 * times_long)
+        signal = np.concatenate([short, np.full(32, np.nan), long])[None, :]
+        freqs, power, used = welch_spectra(signal, sfreq, 1.0, 40.0, 1.0)
+        self.assertEqual(used, nperseg)
+        noverlap = nperseg // 2
+        step = nperseg - noverlap
+        weights = [(len(piece) - noverlap) // step for piece in (short, long)]
+        self.assertEqual(weights, [1, 3])
+        spectra = [
+            welch(detrend(piece, type="linear"), fs=sfreq, nperseg=nperseg, noverlap=noverlap)[1]
+            for piece in (short, long)
+        ]
+        expected = (weights[0] * spectra[0] + weights[1] * spectra[1]) / sum(weights)
+        by_samples = (short.size * spectra[0] + long.size * spectra[1]) / (short.size + long.size)
+        band = (freqs >= 1.0) & (freqs <= 40.0)
+        source_band = (welch(short, fs=sfreq, nperseg=nperseg)[0] >= 1.0) & (
+            welch(short, fs=sfreq, nperseg=nperseg)[0] <= 40.0
+        )
+        np.testing.assert_allclose(power[0], expected[source_band], rtol=1e-6, atol=1e-12)
+        self.assertGreater(float(np.max(np.abs(power[0] - by_samples[source_band]))), 1e-3)
+        self.assertTrue(band.any())
+
+    def test_global_scale_removes_a_uniform_amplitude_difference(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        quiet = np.vstack([
+            10.0 * np.sin(2 * np.pi * 10.0 * times),
+            4.0 * np.sin(2 * np.pi * 6.0 * times),
+        ])
+        settings = FitSettings(reference="global", amplitude_limit_uv=0, fmin=1.0, fmax=40.0, segment_s=4.0)
+        low = prepare_recording(Recording(quiet, ["O1", "O2"], sfreq, "quiet.csv", "csv"), settings)
+        high = prepare_recording(Recording(quiet * 2.0, ["O1", "O2"], sfreq, "loud.csv", "csv"), settings)
+        low_factor = low.import_info["global_scale_factor"]
+        high_factor = high.import_info["global_scale_factor"]
+        self.assertAlmostEqual(high_factor / low_factor, 4.0, places=4)
+        _freqs, power_low, _nperseg = welch_spectra(low.data, sfreq, 1.0, 40.0, 4.0)
+        _freqs, power_high, _nperseg = welch_spectra(high.data, sfreq, 1.0, 40.0, 4.0)
+        np.testing.assert_allclose(power_high, power_low, rtol=1e-4, atol=1e-8)
+        averaged = prepare_recording(
+            Recording(quiet, ["O1", "O2"], sfreq, "avg.csv", "csv"),
+            FitSettings(reference="average", amplitude_limit_uv=0),
+        )
+        _freqs, power_average, _nperseg = welch_spectra(averaged.data, sfreq, 1.0, 40.0, 4.0)
+        np.testing.assert_allclose(power_average / low_factor, power_low, rtol=1e-4, atol=1e-8)
+        finite = np.isfinite(power_average) & (power_average > 0) & np.isfinite(power_low) & (power_low > 0)
+        shift = np.log10(power_average[finite]) - np.log10(power_low[finite])
+        np.testing.assert_allclose(shift, np.log10(low_factor), rtol=1e-5, atol=1e-6)
+        provenance = sample_provenance(low)
+        self.assertEqual(provenance["reference_requested"], "global")
+        self.assertEqual(provenance["reference_applied"], "global")
+        self.assertEqual(provenance["reference_fallback"], "")
+        self.assertIn("channel-by-frequency", provenance["global_scale_definition"])
+
+    def test_a_failed_reference_keeps_the_request_beside_what_was_applied(self):
+        prepared = prepare_recording(
+            Recording(np.ones((1, 8)), ["O1"], 256.0, "missing.csv", "csv"),
+            FitSettings(reference="linked", amplitude_limit_uv=0),
+        )
+        provenance = sample_provenance(prepared)
+        self.assertEqual(provenance["reference_requested"], "linked")
+        self.assertEqual(provenance["reference_applied"], "stored")
+        self.assertIn("not in the file", provenance["reference_fallback"])
+
+    def test_overlapping_pages_keep_one_current_source_density_operator(self):
+        sfreq = 256.0
+        count = int(4.0 * sfreq)
+        times = np.arange(count) / sfreq
+        names = ["Fp1", "F3", "Fz", "Cz", "Pz"]
+        signal = np.zeros((len(names), count))
+        signal[3] = 30.0 * np.sin(2 * np.pi * 10.0 * times)
+        first, note, applied = apply_current_source_density(signal[:, :300], names, None, names)
+        second, _note, _applied = apply_current_source_density(signal[:, 100:400], names, None, names)
+        self.assertTrue(applied)
+        self.assertIn("Sphere radius", note)
+        self.assertIn("sparse", note)
+        np.testing.assert_allclose(first[:, 100:], second[:, :200], atol=1e-6)
+        punched = signal[:, :200].copy()
+        punched[0] = np.nan
+        held, held_note, held_applied = apply_current_source_density(punched, names, None, names)
+        shrunk, _shrunk_note, shrunk_applied = apply_current_source_density(punched, names, None, None)
+        self.assertFalse(held_applied)
+        self.assertIn("do not share a finite sample", held_note)
+        self.assertTrue(shrunk_applied)
+        self.assertTrue(np.array_equal(held, punched, equal_nan=True))
+
+    def test_vertex_ipsilateral_and_contralateral_references(self):
+        o1 = np.full(8, 10.0)
+        o2 = np.full(8, 10.0)
+        fz = np.full(8, 10.0)
+        cz = np.full(8, 4.0)
+        data = np.vstack([o1, o2, fz, cz])
+        names = ["O1", "O2", "Fz", "Cz"]
+        ears = {"A1": np.full(8, 3.0), "A2": np.full(8, 7.0)}
+        recording = Recording(data, names, 256.0, "ref.csv", "csv", reference_channels=ears)
+
+        vertex = apply_reference(recording, "vertex")
+        self.assertEqual(vertex.reference_applied, "vertex")
+        self.assertTrue(np.isnan(vertex.data[names.index("Cz")]).all())
+        self.assertAlmostEqual(float(vertex.data[0, 0]), 6.0)
+        self.assertEqual(sample_provenance(vertex)["reference_contributors"], ["Cz"])
+        shown, note, applied = apply_vertex_reference(data, names)
+        self.assertTrue(applied)
+        self.assertAlmostEqual(float(shown[names.index("Cz"), 0]), 0.0)
+        self.assertIn("minus Cz", note)
+        missing = apply_reference(
+            Recording(data[:3], names[:3], 256.0, "no-cz.csv", "csv"), "vertex",
+        )
+        self.assertEqual(missing.reference_applied, "stored")
+        self.assertIn("Cz was not in the file", missing.notes[-1])
+        hole = data.copy()
+        hole[names.index("Cz"), 2] = np.nan
+        punched = apply_reference(Recording(hole, names, 256.0, "cz-hole.csv", "csv"), "vertex")
+        self.assertTrue(np.isnan(punched.data[:, 2]).all())
+        self.assertFalse(bool(punched.valid[:, 2].any()))
+        alone = apply_reference(
+            Recording(cz[None, :], ["Cz"], 256.0, "only-cz.csv", "csv"), "vertex",
+        )
+        self.assertIn("besides Cz", alone.notes[-1])
+
+        ipsilateral = apply_reference(recording, "ipsilateral")
+        self.assertEqual(ipsilateral.reference_applied, "ipsilateral")
+        self.assertAlmostEqual(float(ipsilateral.data[names.index("O1"), 0]), 7.0)
+        self.assertAlmostEqual(float(ipsilateral.data[names.index("O2"), 0]), 3.0)
+        self.assertAlmostEqual(float(ipsilateral.data[names.index("Fz"), 0]), 5.0)
+        self.assertEqual(sample_provenance(ipsilateral)["reference_contributors"], ["A1", "A2"])
+        contralateral = apply_reference(recording, "contralateral")
+        self.assertAlmostEqual(float(contralateral.data[names.index("O1"), 0]), 3.0)
+        self.assertAlmostEqual(float(contralateral.data[names.index("O2"), 0]), 7.0)
+        self.assertAlmostEqual(float(contralateral.data[names.index("Fz"), 0]), 5.0)
+        absent = apply_reference(Recording(data, names, 256.0, "no-ears.csv", "csv"), "ipsilateral")
+        self.assertEqual(absent.reference_applied, "stored")
+        self.assertIn("not in the file", absent.notes[-1])
+        extra = np.vstack([data, np.full(8, 9.0)])
+        mixed = apply_reference(
+            Recording(extra, [*names, "X1"], 256.0, "extra.csv", "csv", reference_channels=ears),
+            "ipsilateral",
+        )
+        self.assertTrue(np.isnan(mixed.data[-1]).all())
+        self.assertIn("X1", mixed.notes[-1])
+        ear_hole = {"A1": np.full(8, 3.0), "A2": np.full(8, 7.0)}
+        ear_hole["A1"][4] = np.nan
+        gapped = apply_reference(
+            Recording(data, names, 256.0, "ear-hole.csv", "csv", reference_channels=ear_hole),
+            "ipsilateral", 0.0,
+        )
+        self.assertTrue(np.isnan(gapped.data[names.index("O1"), 4]))
+        self.assertTrue(np.isfinite(gapped.data[names.index("O2"), 4]))
+        self.assertIn("missing", gapped.notes[-1])
+
+        derived = bipolar_derivations(
+            np.vstack([np.full(4, 5.0), np.full(4, 2.0), np.full(4, 1.0)]),
+            ["Fp1", "F7", "O2"], LONGITUDINAL_BIPOLAR,
+        )
+        self.assertIsNotNone(derived)
+        rows, labels, _anchors = derived
+        self.assertEqual(labels, ["Fp1−F7"])
+        self.assertAlmostEqual(float(rows[0, 0]), 3.0)
+        hidden = bipolar_derivations(
+            np.vstack([np.full(4, 5.0), np.full(4, 2.0)]),
+            ["Fp1", "F7"], LONGITUDINAL_BIPOLAR, ["Fp1"],
+        )
+        self.assertIsNone(hidden)
+        self.assertIn(("Fp1", "F3"), LONGITUDINAL_BIPOLAR)
+        self.assertIn(("O1", "O2"), TRANSVERSE_BIPOLAR)
+        self.assertIn(("Fp1", "Fp2"), CIRCUMFERENTIAL_BIPOLAR)
+        self.assertIn(("F7", "Fp1"), CIRCUMFERENTIAL_BIPOLAR)
+
+    def test_one_ear_reference_and_legacy_site_names(self):
+        o1 = np.full(8, 10.0)
+        left = apply_reference(
+            Recording(
+                o1[None, :], ["O1"], 256.0, "left.csv", "csv",
+                reference_channels={"A1": np.full(8, 4.0), "A2": np.full(8, np.nan)},
+            ),
+            "left",
+        )
+        self.assertEqual(left.reference_applied, "left")
+        self.assertAlmostEqual(float(left.data[0, 0]), 6.0)
+        self.assertIn("A1", left.notes[-1])
+        self.assertEqual(sample_provenance(left)["reference_contributors"], ["A1"])
+        blocked = apply_reference(
+            Recording(o1[None, :], ["O1"], 256.0, "right.csv", "csv", reference_channels={"A1": np.full(8, 4.0)}),
+            "right",
+        )
+        self.assertEqual(blocked.reference_applied, "stored")
+        self.assertIn("not in the file", blocked.notes[-1])
+        self.assertAlmostEqual(float(blocked.data[0, 0]), 10.0)
+
+        times = np.arange(int(8.0 * 256.0)) / 256.0
+        brain = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        fallback = apply_reference(
+            Recording(
+                brain[None, :], ["O1"], 256.0, "mastoid.csv", "csv",
+                reference_channels={"A1": np.full(times.shape, 5000.0), "M1": brain + 4.0},
+            ),
+            "left",
+            500.0,
+        )
+        self.assertEqual(fallback.reference_applied, "stored")
+        self.assertIn("A1", fallback.notes[-1])
+        self.assertNotIn("M1", fallback.notes[-1])
+        self.assertAlmostEqual(float(fallback.data[0, 0]), float(brain[0]))
+
+        in_data = apply_reference(
+            Recording(
+                np.vstack([np.full(8, 10.0), np.full(8, 4.0), np.full(8, 9.0)]),
+                ["O1", "A1", "A2"], 256.0, "rows.csv", "csv",
+            ),
+            "left",
+        )
+        self.assertEqual(in_data.reference_applied, "left")
+        self.assertAlmostEqual(float(in_data.data[0, 0]), 6.0)
+        self.assertAlmostEqual(float(in_data.data[1, 0]), 0.0)
+        self.assertEqual(sample_provenance(in_data)["reference_contributors"], ["A1"])
+        linked = apply_reference(
+            Recording(
+                np.vstack([np.full(8, 10.0), np.full(8, 2.0), np.full(8, 6.0)]),
+                ["O1", "A1", "A2"], 256.0, "linked-rows.csv", "csv",
+            ),
+            "linked",
+        )
+        self.assertEqual(linked.reference_applied, "linked")
+        self.assertAlmostEqual(float(linked.data[0, 0]), 6.0)
+
+        hole = np.full(8, 4.0)
+        hole[3] = np.nan
+        gapped = apply_reference(
+            Recording(np.full(8, 10.0)[None, :], ["O1"], 256.0, "gap.csv", "csv", reference_channels={"A1": hole}),
+            "left",
+        )
+        self.assertTrue(np.isnan(gapped.data[0, 3]))
+        self.assertFalse(gapped.valid[0, 3])
+        self.assertIn("missing", gapped.notes[-1])
+
+        legacy = apply_reference(
+            Recording(
+                np.vstack([np.full(8, 10.0), np.full(8, 10.0)]),
+                ["T3", "T4"], 256.0, "legacy.csv", "csv",
+                reference_channels={"A1": np.full(8, 4.0), "A2": np.full(8, 7.0)},
+            ),
+            "ipsilateral",
+        )
+        self.assertAlmostEqual(float(legacy.data[0, 0]), 6.0)
+        self.assertAlmostEqual(float(legacy.data[1, 0]), 3.0)
+        derived = bipolar_derivations(
+            np.vstack([np.full(4, 5.0), np.full(4, 2.0)]),
+            ["T3", "T5"], LONGITUDINAL_BIPOLAR,
+        )
+        self.assertIsNotNone(derived)
+        rows, labels, _anchors = derived
+        self.assertEqual(labels, ["T3−T5"])
+        self.assertAlmostEqual(float(rows[0, 0]), 3.0)
+
+    def test_an_offset_on_the_ears_is_still_a_linked_reference(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        offset = 2000.0 + 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        ears = {"A1": offset.copy(), "A2": offset.copy()}
+        ears["A1"][100] = 9000.0
+        recording = Recording(
+            data=offset[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="ears.csv", source_format="csv", reference_channels=ears,
+        )
+        linked = apply_reference(recording, "linked", 500.0)
+        self.assertIn("A1 and A2", linked.notes[-1])
+        self.assertNotIn("not in the file", linked.notes[-1])
+        self.assertTrue(np.isnan(linked.data[0, 100]))
+        finite = linked.data[0, np.isfinite(linked.data[0])]
+        self.assertLess(float(np.max(np.abs(finite))), 1.0)
+
+    def test_a_flat_ear_beyond_the_limit_is_named(self):
+        sfreq = 256.0
+        signal = np.full(int(8.0 * sfreq), 20.0)
+        recording = Recording(
+            data=signal[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="flat-ear.csv", source_format="csv",
+            reference_channels={"A1": np.full(signal.shape, 5000.0), "A2": np.full(signal.shape, 5000.0)},
+        )
+        linked = apply_reference(recording, "linked", 500.0)
+        self.assertIn("were in the file", linked.notes[-1])
+        self.assertIn("trend", linked.notes[-1])
+        self.assertNotIn("not in the file", linked.notes[-1])
+        self.assertAlmostEqual(float(linked.data[0, 0]), 20.0)
+
+    def test_linked_ears_name_only_the_pair_that_was_used(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        offset = 2000.0 + 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        both = {
+            "A1": offset.copy(), "A2": offset.copy(),
+            "M1": np.full(times.shape, 50.0), "M2": np.full(times.shape, 80.0),
+        }
+        recording = Recording(
+            data=offset[None, :], ch_names=["O1"], sfreq=sfreq,
+            source_path="both-ears.csv", source_format="csv", reference_channels=both,
+        )
+        linked = apply_reference(recording, "linked", 500.0)
+        self.assertIn("A1 and A2", linked.notes[-1])
+        self.assertEqual(sample_provenance(linked)["reference_contributors"], ["A1", "A2"])
+        self.assertLess(float(np.nanmax(np.abs(linked.data))), 1.0)
+        fallback_ears = {
+            "A1": np.full(times.shape, 5000.0), "A2": np.full(times.shape, 5000.0),
+            "M1": offset.copy(), "M2": offset.copy(),
+        }
+        fallback = apply_reference(
+            Recording(
+                data=offset[None, :], ch_names=["O1"], sfreq=sfreq,
+                source_path="mastoid.csv", source_format="csv", reference_channels=fallback_ears,
+            ),
+            "linked",
+            500.0,
+        )
+        self.assertIn("A1 and A2", fallback.notes[-1])
+        self.assertIn("trend", fallback.notes[-1])
+        self.assertEqual(fallback.reference_applied, "stored")
+        self.assertNotIn("M1 and M2", fallback.notes[-1])
+        mastoid = apply_reference(
+            Recording(
+                data=offset[None, :], ch_names=["O1"], sfreq=sfreq,
+                source_path="mastoid.csv", source_format="csv", reference_channels=fallback_ears,
+            ),
+            "mastoid",
+            500.0,
+        )
+        self.assertEqual(mastoid.reference_applied, "mastoid")
+        self.assertIn("M1 and M2", mastoid.notes[-1])
+        self.assertEqual(sample_provenance(mastoid)["reference_contributors"], ["M1", "M2"])
+        self.assertLess(float(np.nanmax(np.abs(mastoid.data))), 1.0)
+
+    def test_epoch_fits_keep_the_sampling_rate_note(self):
+        sfreq = 64.0
+        short_times = np.arange(int(6.0 * sfreq)) / sfreq
+        short = Recording(
+            (20.0 * np.sin(2 * np.pi * 10.0 * short_times))[None, :],
+            ["O1"], sfreq, "epoch-short.csv", "csv",
+        )
+        short_fit = fit_spectra(short, FitSettings(fmin=1, fmax=40, segment_s=10, epoch_s=8))
+        self.assertIn("brought down", short_fit.notes)
+        self.assertIn("31.5", short_fit.notes)
+        self.assertIn("Welch segment", short_fit.notes)
+        self.assertIn("shorter than one", short_fit.notes)
+        self.assertIn("8 s", short_fit.notes)
+        fractional = fit_spectra(short, FitSettings(fmin=1, fmax=40, segment_s=2, epoch_s=8.5))
+        self.assertIn("8.5 s", fractional.notes)
+        self.assertNotIn("9 s epoch", fractional.notes)
+        times = np.arange(int(20.0 * sfreq)) / sfreq
+        recording = Recording(
+            (20.0 * np.sin(2 * np.pi * 10.0 * times))[None, :],
+            ["O1"], sfreq, "epoch.csv", "csv",
+        )
+        fit = fit_spectra(recording, FitSettings(fmin=1, fmax=40, segment_s=2, epoch_s=8))
+        self.assertEqual(fit.epoch_count, 2)
+        self.assertIn("brought down", fit.notes)
+        self.assertIn("31.5", fit.notes)
+        self.assertIn("last 4", fit.notes)
+        self.assertEqual(fit.notes.count("brought down"), 1)
+
+    def test_a_rejected_epoch_is_named_and_the_leftover_keeps_its_fraction(self):
+        sfreq = 256.0
+        times = np.arange(int(round(22.4 * sfreq))) / sfreq
+        tone = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        leftover = fit_spectra(
+            Recording(tone[None, :], ["O1"], sfreq, "tail.csv", "csv"),
+            FitSettings(epoch_s=12, segment_s=2),
+        )
+        self.assertIn("last 10.4", leftover.notes)
+        self.assertNotIn("last 10 s", leftover.notes)
+        n = int(24 * sfreq)
+        gap = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(n) / sfreq)
+        gap[int(8 * sfreq):int(16 * sfreq)] = 5000.0
+        fit = fit_spectra(
+            Recording(gap[None, :], ["O1"], sfreq, "gap.csv", "csv"),
+            FitSettings(epoch_s=8, segment_s=2, amplitude_limit_uv=500),
+        )
+        self.assertEqual(fit.epoch_count, 2)
+        self.assertIn("8–16 s was left out", fit.notes)
+        self.assertIn("No accepted samples", fit.notes)
+        flat = Recording(np.full((1, n), 5000.0), ["O1"], sfreq, "flat.csv", "csv")
+        with self.assertRaisesRegex(ValueError, "Amplitude above the limit"):
+            fit_spectra(flat, FitSettings(epoch_s=8, segment_s=2, amplitude_limit_uv=500))
+
+    def test_a_channel_left_out_of_one_epoch_is_named(self):
+        sfreq = 256.0
+        count = int(24 * sfreq)
+        times = np.arange(count) / sfreq
+        occipital = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        occipital = occipital.copy()
+        occipital[int(8 * sfreq):int(16 * sfreq)] = 5000.0
+        central = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        fit = fit_spectra(
+            Recording(np.vstack([occipital, central]), ["O1", "Cz"], sfreq, "gap.csv", "csv"),
+            FitSettings(epoch_s=8, segment_s=2, amplitude_limit_uv=500),
+        )
+        by_name = {item.name: item for item in fit.channels}
+        self.assertEqual(fit.epoch_count, 3)
+        self.assertEqual(by_name["O1"].n_epochs, 2)
+        self.assertEqual(by_name["Cz"].n_epochs, 3)
+        self.assertIn("O1 at 8–16 s was left out", fit.notes)
+        self.assertIn("No accepted samples", fit.notes)
+        self.assertNotIn("Cz at 8–16", fit.notes)
 
     def test_nearest_peak_stays_out_of_the_band_number(self):
         outside = ChannelFit(name="C3", index=0, usable=True, peaks=[(12.4, 0.2, 1.0), (6.5, 0.4, 1.0)])
@@ -538,6 +1446,32 @@ class QualityTests(unittest.TestCase):
         self.assertFalse(rows[0].peak_at_floor_ec)
         self.assertAlmostEqual(rows[0].alpha_cf_ec, 6.0)
 
+    def test_a_nonfinite_band_change_stays_blank(self):
+        from bifooof.analysis.compare import ChannelComparison, band_reactivity_percent
+        from bifooof.analysis.findings import _power_clause
+
+        self.assertIsNone(band_reactivity_percent(float("inf"), float("inf")))
+        self.assertIsNone(band_reactivity_percent(1.0, float("nan")))
+        self.assertIsNone(band_reactivity_percent(1.0, 0.0))
+        blank = _power_clause(
+            ChannelComparison(name="O1", band_power_reactivity_percent=float("nan")),
+            "Eyes closed", "Eyes open",
+        )
+        self.assertEqual(blank, "")
+
+    def test_an_even_number_of_exponent_changes_uses_the_middle_pair(self):
+        from bifooof.analysis.compare import ChannelComparison
+        from bifooof.analysis.findings import _slope_sentence
+
+        rows = [
+            ChannelComparison(name="O1", exponent_delta=-2.0),
+            ChannelComparison(name="O2", exponent_delta=-1.0),
+            ChannelComparison(name="Pz", exponent_delta=0.0),
+            ChannelComparison(name="Cz", exponent_delta=5.0),
+        ]
+        text = _slope_sentence(rows[0], rows, "Eyes closed", "Eyes open")
+        self.assertIn("median change is -0.50", text)
+
     def test_findings_keep_a_peak_separate_from_the_background(self):
         from bifooof.analysis.cycles import CycleFit
         from bifooof.analysis.findings import compile_report, report_text
@@ -619,6 +1553,113 @@ class QualityTests(unittest.TestCase):
         self.assertIn("Baseline and Follow-up", custom)
         self.assertIn("higher with Baseline", custom)
         self.assertNotIn("eyes closed", custom.lower())
+
+    def test_a_fractional_fit_window_is_not_rounded_to_a_whole_second(self):
+        from bifooof.analysis.findings import compile_report, report_text
+        from bifooof.analysis.specparam_fit import SpectrumFit
+
+        item = ChannelFit(
+            name="O1", index=0, usable=True, exponent=1.0, r_squared=0.9, peaks=[(10.0, 1.0, 1.0)],
+        )
+        fit = SpectrumFit(channels=[item], fmin=1.0, fmax=31.5, t_start=0.6, t_end=8.4)
+        recording = Recording(
+            data=np.zeros((1, int(8.4 * 256))), ch_names=["O1"], sfreq=256.0,
+            source_path="rec.edf", source_format="edf",
+        )
+        text = report_text(compile_report({"ec": recording}, {"ec": fit}, {}, (8.0, 12.0), "O1"))
+        self.assertIn("0.6–8.4 s", text)
+        self.assertIn("31.5 Hz", text)
+        self.assertNotIn("1–8 s", text)
+        long = Recording(
+            data=np.zeros((1, int(round(10.4 * 256)))), ch_names=["O1"], sfreq=256.0,
+            source_path="rec.edf", source_format="edf",
+        )
+        long_text = report_text(compile_report({"ec": long}, {"ec": fit}, {}, (8.0, 12.0), "O1"))
+        self.assertIn("10.4 s", long_text)
+        self.assertNotIn(", 10 s,", long_text)
+
+    def test_a_missing_ear_is_not_described_as_the_reference_that_was_used(self):
+        from bifooof.analysis.cycles import CycleFit
+        from bifooof.analysis.findings import _MARGINALIA, compile_report, report_text
+        from bifooof.analysis.specparam_fit import SpectrumFit
+        from bifooof.ui.findings_panel import _html
+
+        item = ChannelFit(
+            name="O1", index=0, usable=True, exponent=1.2, r_squared=0.9,
+            peaks=[(10.0, 0.8, 1.2)],
+        )
+        closed = SpectrumFit(channels=[item], fmin=1.0, fmax=40.0, t_start=0.0, t_end=60.0)
+        opened = SpectrumFit(channels=[item], fmin=1.0, fmax=40.0, t_start=0.0, t_end=60.0)
+        note = "Left ear was not in the file. The stored reference was kept."
+        closed.notes = note
+        opened.notes = "Left out samples beyond ±500 µV. " + note
+        closed.provenance = {"reference_applied": "stored"}
+        opened.provenance = {"reference_applied": "stored"}
+        recording = Recording(
+            data=np.zeros((1, 8)), ch_names=["O1"], sfreq=256.0,
+            source_path="closed.edf", source_format="edf",
+        )
+        other = Recording(
+            data=np.zeros((1, 8)), ch_names=["O1"], sfreq=256.0,
+            source_path="open.edf", source_format="edf",
+        )
+        cycles = {"ec": CycleFit(
+            channel="O1", channel_index=0, band=(8.0, 12.0), sfreq=256.0,
+            filtered=np.zeros(8), n_cycles=4, n_burst_cycles=0, n_burst_episodes=0,
+            burst_duration_s=0.0, burst_fraction=0.0, period_ms=100.0, rise_decay=0.5,
+            peak_trough=0.5, volt_amp=10.0, burst_period_ms=None, burst_rise_decay=None,
+            burst_peak_trough=None, burst_volt_amp=None, notes=note,
+        )}
+        sections = compile_report(
+            {"ec": recording, "eo": other},
+            {"ec": closed, "eo": opened},
+            cycles, (8.0, 12.0), "O1", FitSettings(reference="left"),
+        )
+        text = report_text(sections)
+        self.assertIn("Reference: as stored in the file.", text)
+        self.assertIn("Left ear was not in the file.", text)
+        self.assertEqual(text.count("Left ear was not in the file."), 1)
+        self.assertNotIn("minus the left ear", text)
+        self.assertIn("Left out samples beyond ±500 µV.", text)
+        self.assertEqual(sum(line in text for line in _MARGINALIA), 1)
+        for line in text.splitlines():
+            self.assertFalse("O1:" in line and "P7:" in line)
+        page = _html(sections)
+        self.assertIn("font-style: italic", page)
+        self.assertIn("Cambria", page)
+        applied = SpectrumFit(channels=[item], fmin=1.0, fmax=40.0)
+        applied.provenance = {"reference_applied": "left", "reference_contributors": ["A1"]}
+        applied_text = report_text(compile_report(
+            {"ec": recording}, {"ec": applied}, {}, (8.0, 12.0), "O1", FitSettings(reference="left"),
+        ))
+        self.assertIn("Reference: each channel minus A1.", applied_text)
+
+    def test_a_short_display_filter_says_why_and_a_short_stretch_stays_visible(self):
+        from bifooof.analysis.display import display_filter
+
+        sfreq = 256.0
+        short = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(20) / sfreq)
+        with self.assertRaisesRegex(ValueError, "shorter than the display filter"):
+            display_filter(short[None, :], sfreq, "1–30")
+        values = np.full((1, 300), np.nan)
+        long = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(200) / sfreq)
+        island = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(12) / sfreq)
+        values[0, :200] = long
+        values[0, 250:262] = island
+        result, note = display_filter(values, sfreq, "1–30")
+        self.assertIn("left unfiltered", note)
+        self.assertTrue(np.allclose(result[0, 250:262], island))
+        self.assertFalse(np.allclose(result[0, :200], long))
+
+    def test_a_band_range_may_name_its_unit(self):
+        from bifooof.batch import resolve_band
+
+        self.assertEqual(resolve_band("8-12 Hz"), (8.0, 12.0))
+        self.assertEqual(resolve_band("8-12Hz"), (8.0, 12.0))
+        self.assertEqual(resolve_band("8–12"), (8.0, 12.0))
+        with self.assertRaises(ValueError) as caught:
+            resolve_band("8-")
+        self.assertIn("Unknown band", str(caught.exception))
 
 
 def _one_fit(channel: ChannelFit):
@@ -744,6 +1785,22 @@ class WindowTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_the_reference_menu_separates_ears_mastoids_and_rest(self):
+        from bifooof.ui.fit_bar import FitBar
+        bar = FitBar()
+        self.addCleanup(bar.close)
+        self.assertGreaterEqual(bar.reference.findData("linked"), 0)
+        self.assertGreater(bar.reference.findData("mastoid"), bar.reference.findData("linked"))
+        self.assertGreaterEqual(bar.reference.findData("rest"), 0)
+        self.assertGreaterEqual(bar.reference.findData("hjorth"), 0)
+        bar.set_settings(FitSettings(reference="rest"))
+        self.assertEqual(bar.settings().reference, "rest")
+        bar.set_settings(FitSettings(reference="mastoid"))
+        self.assertEqual(bar.settings().reference, "mastoid")
+        for index in range(bar.reference.count()):
+            bar.reference.setCurrentIndex(index)
+            FitSettings(reference=bar.settings().reference).validate()
+
     def test_window_shows_fit(self):
         window = MainWindow()
         window.show_recording(_recording())
@@ -796,6 +1853,17 @@ class WindowTests(unittest.TestCase):
         for fig in (window.trace.canvas.fig, window.spectrum.canvas.fig, window.cycles.canvas.fig):
             self.assertFalse(any(text.get_text() == "EEG Paradox Solutions" for text in fig.texts))
         window.close()
+
+    def test_one_sample_trace_has_a_width(self):
+        from bifooof.ui.trace_panel import TracePanel
+        panel = TracePanel()
+        panel.set_recording(Recording(np.array([[12.0]]), ["O1"], 128.0, "edge", "synthetic"), 0)
+        self.app.processEvents()
+        axes = panel.canvas.fig.axes
+        self.assertTrue(axes)
+        left, right = axes[0].get_xlim()
+        self.assertGreater(right - left, 0.0)
+        panel.close()
 
     def test_marks_open_both_sides(self):
         recording = _tone(20.0, "rest.eeg")

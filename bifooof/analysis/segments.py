@@ -20,6 +20,22 @@ def episode_count(mask: np.ndarray) -> int:
     return len(accepted_runs(mask))
 
 
+def welch_segment_count(length: int, nperseg: int, noverlap: int | None = None) -> int:
+    """How many windows ``scipy.signal.welch`` averages for this length.
+
+    A stretch of one window and a stretch of several windows are not the same
+    amount of spectrum. The count is what has to weight them.
+    """
+    if nperseg <= 0 or length < nperseg:
+        return 0
+    if noverlap is None:
+        noverlap = nperseg // 2
+    step = nperseg - int(noverlap)
+    if step <= 0:
+        return 0
+    return int((length - int(noverlap)) // step)
+
+
 def covered_length(spans: list[tuple[int, int, bool]]) -> int:
     """Sample count covered by burst spans, merging overlaps."""
     chosen = sorted((start, stop) for start, stop, is_burst in spans if is_burst and stop > start)

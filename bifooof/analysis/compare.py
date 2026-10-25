@@ -104,7 +104,11 @@ BAND_CHANGE = (
 
 def band_reactivity_percent(eyes_closed: float | None, eyes_open: float | None) -> float | None:
     """``(EC − EO) / EO × 100``. Missing when either side is missing or eyes-open power is 0."""
-    if eyes_closed is None or eyes_open is None or eyes_open <= 0:
+    if (
+        eyes_closed is None or eyes_open is None
+        or not np.isfinite(eyes_closed) or not np.isfinite(eyes_open)
+        or eyes_open <= 0
+    ):
         return None
     return float((eyes_closed - eyes_open) / eyes_open * 100.0)
 

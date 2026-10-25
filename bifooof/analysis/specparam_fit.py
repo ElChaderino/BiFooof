@@ -10,7 +10,7 @@ from ..jobs import checkpoint, current_job
 from ..io.recording import Recording
 from .prepare import peak_at_width_floor, prepare_recording, sample_provenance
 from .segments import accepted_runs
-from .settings import FitSettings, window_bounds
+from .settings import FitSettings, format_seconds, range_note, segment_note, window_bounds
 from .spectra import welch_spectra
 
 
@@ -97,15 +97,17 @@ def fit_spectra(
         samples = data[index, mask]
         samples = samples[np.isfinite(samples)]
         if samples.size < 16 or float(np.std(samples)) <= 1e-6:
-            if samples.size < 16 and name in recording.dropped_by_amplitude:
-                reason = "Amplitude above the limit."
-            else:
-                reason = "No accepted samples." if samples.size < 16 else "Flat channel."
-            results.append(ChannelFit(name=name, index=index, usable=False, reason=reason))
+            results.append(ChannelFit(
+                name=name, index=index, usable=False,
+                reason=_rejected_reason(samples.size, name, recording),
+            ))
             continue
         results.append(ChannelFit(name=name, index=index, usable=True))
         candidates.append(index)
     if not candidates:
+        reasons = [item.reason for item in results if item.reason]
+        if reasons and len(set(reasons)) == 1:
+            raise ValueError(reasons[0])
         raise ValueError("Every channel is flat or rejected, so there is no spectrum to fit.")
 
     masks = np.vstack([recording.mask(index) for index in candidates])
@@ -143,6 +145,8 @@ def fit_spectra(
         detail = reasons[-1] if reasons else "no spectrum could be modeled"
         raise ValueError(f"specparam could not fit any channel. {detail}")
     _mark_fit_quality(results, chosen)
+    preparation = _join_note(preparation, range_note(recording.sfreq, float(chosen.fmax)))
+    preparation = _join_note(preparation, segment_note(recording.sfreq, chosen.segment_s, nperseg))
     used = {
         item.name: [
             (start, stop) for start, stop in accepted_runs(
@@ -255,6 +259,52 @@ def _peak_rows(values) -> list[tuple[float, float, float]]:
     return rows
 
 
+def _rejected_reason(count: int, name: str, recording) -> str:
+    """Say why one channel cannot be fit. A short sine is not a flat line."""
+    if count < 16 and name in recording.dropped_by_amplitude:
+        return "Amplitude above the limit."
+    if count == 0:
+        return "No accepted samples."
+    if count < 16:
+        return f"Only {count} accepted samples. A spectrum needs at least 16."
+    return "Flat channel."
+
+
+def _join_note(existing: str, extra: str) -> str:
+    return " ".join(part for part in (existing, extra) if part)
+
+
+def _note_sentences(text: str) -> list[str]:
+    """Split notes on sentence ends without breaking numbers such as 31.5 or 4.0."""
+    sentences: list[str] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char != "." or index + 1 >= len(text) or text[index + 1] != " ":
+            continue
+        if index > 0 and text[index - 1].isdigit():
+            continue
+        sentence = text[start:index + 1].strip()
+        if sentence:
+            sentences.append(sentence)
+        start = index + 2
+    tail = text[start:].strip()
+    if tail:
+        if not tail.endswith("."):
+            tail = f"{tail}."
+        sentences.append(tail)
+    return sentences
+
+
+def _merge_notes(*parts: str) -> str:
+    """Keep each sentence once, in the order it first appears."""
+    seen: list[str] = []
+    for part in parts:
+        for sentence in _note_sentences(part):
+            if sentence not in seen:
+                seen.append(sentence)
+    return " ".join(seen)
+
+
 def _preparation_notes(before: list[str], after: list[str]) -> str:
     added = [note for note in after if note not in before and not note.startswith("Fit window")]
     return " ".join(added)
@@ -291,11 +341,11 @@ def _fit_epochs(recording: Recording, settings: FitSettings) -> SpectrumFit:
         single.epoch_s = None
         single.epoch_count = 0
         extra = (
-            f"The window is shorter than one {float(settings.epoch_s):.0f} s epoch, "
+            f"The window is shorter than one {format_seconds(float(settings.epoch_s))} s epoch, "
             "so it was fit as one spectrum."
         )
         preparation = _preparation_notes(list(recording.notes), prepared.notes)
-        single.notes = " ".join(part for part in (preparation, extra) if part)
+        single.notes = _merge_notes(preparation, single.notes, extra)
         single.settings = replace(settings)
         return single
     pieces = []
@@ -304,28 +354,48 @@ def _fit_epochs(recording: Recording, settings: FitSettings) -> SpectrumFit:
         pieces.append((start, start + width))
         start += width
     fits = []
+    skipped = []
     for position, (i0, i1) in enumerate(pieces):
         checkpoint(position, len(pieces), f"Fitting epoch {position + 1} of {len(pieces)}")
+        start_s = t_start + i0 / prepared.sfreq
+        end_s = t_start + i1 / prepared.sfreq
         try:
             epoch = fit_spectra(prepared.cropped(i0, i1), child)
-            epoch.t_start, epoch.t_end = t_start + i0 / prepared.sfreq, t_start + i1 / prepared.sfreq
+            epoch.t_start, epoch.t_end = start_s, end_s
             fits.append(epoch)
-        except ValueError:
-            continue
+        except ValueError as exc:
+            skipped.append((start_s, end_s, str(exc)))
     if not fits:
-        raise ValueError("No epoch was long enough to fit.")
+        reason = skipped[-1][2] if skipped else "No epoch was long enough to fit."
+        raise ValueError(reason)
     combined = _combine_epochs(fits, settings, t_start, t_end)
     combined.epochs = fits
     notes = _preparation_notes(list(recording.notes), prepared.notes)
+    for fit in fits:
+        notes = _merge_notes(notes, fit.notes)
+    for start_s, end_s, reason in skipped:
+        notes = _merge_notes(
+            notes,
+            f"{format_seconds(start_s)}–{format_seconds(end_s)} s was left out. {reason}",
+        )
+    for channel in combined.channels:
+        for epoch in fits:
+            item = next((row for row in epoch.channels if row.name == channel.name), None)
+            if item is None or item.usable:
+                continue
+            notes = _merge_notes(
+                notes,
+                (
+                    f"{channel.name} at {format_seconds(epoch.t_start)}–{format_seconds(epoch.t_end)} s "
+                    f"was left out. {item.reason or 'No accepted samples.'}"
+                ),
+            )
     leftover = prepared.n_samples - start
     if leftover > 0 and prepared.sfreq:
         seconds = leftover / prepared.sfreq
-        shown = f"{seconds:.0f}" if seconds >= 10 else f"{seconds:.1f}"
-        notes = " ".join(
-            part for part in (
-                notes,
-                f"The last {shown} s was shorter than one {float(settings.epoch_s):.0f} s epoch and was left out.",
-            ) if part
+        notes = _merge_notes(
+            notes,
+            f"The last {format_seconds(seconds)} s was shorter than one {format_seconds(float(settings.epoch_s))} s epoch and was left out.",
         )
     combined.notes = notes
     used = {name: [] for name in prepared.ch_names}

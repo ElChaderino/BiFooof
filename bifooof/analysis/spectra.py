@@ -6,7 +6,7 @@ import numpy as np
 from ..jobs import checkpoint
 from scipy.signal import detrend, welch
 
-from .segments import accepted_runs
+from .segments import accepted_runs, welch_segment_count
 
 
 def welch_spectra(
@@ -45,28 +45,38 @@ def welch_spectra(
         accepted = np.ones(values.shape, dtype=bool)
     accepted = accepted & np.isfinite(values)
 
-    # 4 s is 0.25 Hz. Longer segments smooth the spectrum; specparam fits those better.
+    # 4 s at the file's own rate. 4 s is 0.25 Hz at 256 Hz, and 0.5 Hz at 128 Hz.
+    # Do not stretch a shorter request out to 256 samples.
     target = int(round(sfreq * float(segment_s)))
+    if target < 16:
+        raise ValueError(
+            f"A {float(segment_s):g} s Welch segment is {target} samples at {sfreq:g} Hz. "
+            "A spectrum needs at least 16 samples in the segment."
+        )
     longest = _longest_run(accepted)
-    nperseg = int(min(max(target, 256), longest if longest else 0))
+    nperseg = int(min(target, longest if longest else 0))
     if nperseg < 16:
         raise ValueError("No accepted stretch is long enough to estimate a spectrum.")
 
     power = None
     freqs = None
+    noverlap = nperseg // 2
     for index in range(values.shape[0]):
         checkpoint(index, values.shape[0], f"Estimating spectrum {index + 1} of {values.shape[0]}")
         pieces = []
         weights = []
         for start, stop in accepted_runs(accepted[index]):
             segment = values[index, start:stop]
-            if segment.size < nperseg or not np.isfinite(segment).all():
+            windows = welch_segment_count(segment.size, nperseg, noverlap)
+            if windows <= 0 or not np.isfinite(segment).all():
                 continue
             if segment.size >= 2:
                 segment = detrend(segment, type="linear")
-            segment_freqs, segment_power = welch(segment, fs=sfreq, nperseg=nperseg)
+            segment_freqs, segment_power = welch(
+                segment, fs=sfreq, nperseg=nperseg, noverlap=noverlap,
+            )
             pieces.append(np.asarray(segment_power, dtype=np.float64))
-            weights.append(segment.size)
+            weights.append(windows)
             freqs = segment_freqs
         if power is None and pieces:
             power = np.full((values.shape[0], pieces[0].size), np.nan, dtype=np.float64)

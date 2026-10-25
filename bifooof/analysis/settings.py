@@ -39,7 +39,7 @@ class FitSettings:
     min_n_cycles: int = 3
     # 0 keeps every sample. The default drops samples outside a normal EEG range.
     amplitude_limit_uv: float = 500.0
-    # stored keeps the file reference. average and linked are explicit choices.
+    # stored keeps the file reference. The others are explicit remontages.
     reference: str = "stored"
     # None fits the window as one spectrum. A value splits it into equal epochs.
     epoch_s: float | None = None
@@ -76,8 +76,15 @@ class FitSettings:
             raise ValueError("A burst needs at least one cycle.")
         if self.amplitude_limit_uv < 0:
             raise ValueError("The amplitude limit cannot be negative. Use 0 to keep every sample.")
-        if self.reference not in {"stored", "average", "linked"}:
-            raise ValueError("The reference is stored, average, or linked ears.")
+        if self.reference not in {
+            "stored", "average", "linked", "mastoid", "left", "right", "vertex",
+            "ipsilateral", "contralateral", "rest", "hjorth", "csd", "global",
+        }:
+            raise ValueError(
+                "The reference is stored, average, linked ears, linked mastoids, left ear, right ear, "
+                "vertex, ipsilateral ears, contralateral ears, REST, a local Laplacian, "
+                "current source density, or global scale."
+            )
         if self.epoch_s is not None and float(self.epoch_s) < 8.0:
             raise ValueError("An epoch must be at least 8 s.")
 
@@ -185,7 +192,89 @@ def reference_phrase(reference: str) -> str:
         return "average reference"
     if reference == "linked":
         return "linked-ear reference"
+    if reference == "mastoid":
+        return "linked-mastoid reference"
+    if reference == "rest":
+        return "REST, template spherical model"
+    if reference == "hjorth":
+        return "local Laplacian"
+    if reference == "left":
+        return "left-ear reference"
+    if reference == "right":
+        return "right-ear reference"
+    if reference == "vertex":
+        return "vertex reference"
+    if reference == "ipsilateral":
+        return "ipsilateral-ear reference"
+    if reference == "contralateral":
+        return "contralateral-ear reference"
+    if reference == "csd":
+        return "current source density"
+    if reference == "global":
+        return "average reference with the global scale factor"
     return "reference as stored"
+
+
+def amplitude_unit(reference: str) -> str:
+    """Unit of a sample after the remontage. Current source density is not microvolts."""
+    if reference == "csd":
+        return "µV/m²"
+    if reference == "global":
+        return "scaled µV"
+    return "µV"
+
+
+def power_unit(reference: str) -> str:
+    """Unit of a power spectrum after the remontage.
+
+    Current source density is a surface Laplacian, so power is µV²/(m⁴·Hz).
+    Global scale divides that power by the factor and is labelled as scaled.
+    """
+    if reference == "csd":
+        return "µV²/(m⁴·Hz)"
+    if reference == "global":
+        return "scaled µV²/Hz"
+    return "µV²/Hz"
+
+
+def format_number(value: float) -> str:
+    """Print a measured number without rounding 8.4 or 31.5 up to the next whole value."""
+    rounded = round(float(value), 2)
+    if abs(rounded - round(rounded)) < 1e-9:
+        return f"{rounded:.0f}"
+    return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+
+def format_hz(value: float) -> str:
+    """Print a frequency without rounding 31.5 Hz up to 32."""
+    return format_number(value)
+
+
+def format_seconds(value: float) -> str:
+    """Print a time in seconds without rounding 8.4 s up to 8 or 9."""
+    return format_number(value)
+
+
+def range_note(sfreq: float, fmax: float) -> str:
+    """Explain a requested high frequency the sampling rate cannot represent."""
+    limit = float(sfreq) / 2.0 - 0.5
+    if float(fmax) <= limit + 1e-6:
+        return ""
+    return (
+        f"Sampling rate {sfreq:g} Hz reaches {limit:g} Hz, "
+        f"so the {fmax:g} Hz limit was brought down."
+    )
+
+
+def segment_note(sfreq: float, segment_s: float, nperseg: int) -> str:
+    """Explain a Welch window shortened because the accepted stretch is shorter."""
+    requested = int(round(float(sfreq) * float(segment_s)))
+    if nperseg >= requested:
+        return ""
+    return (
+        f"The Welch segment is {nperseg / float(sfreq):g} s ({nperseg} samples) "
+        f"because no accepted stretch covers the {float(segment_s):g} s setting."
+    )
 
 
 def band_phrase(low: float, high: float) -> str:

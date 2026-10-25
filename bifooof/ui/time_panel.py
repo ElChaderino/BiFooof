@@ -19,7 +19,7 @@ from ..analysis.coherence import coherence_pair
 from ..analysis.cycles import CycleFit, fit_cycles
 from ..analysis.pac import phase_amplitude
 from ..analysis.quality import QualitySpan, mask_spans, project_exclusions, quality_spans
-from ..analysis.settings import FitSettings, band_phrase, matched_settings
+from ..analysis.settings import FitSettings, amplitude_unit, band_phrase, format_seconds, matched_settings, power_unit, range_note
 from ..analysis.shape import burst_stats
 from ..analysis.timefreq import (
     SlidingFit, Spectrogram, align_to_events, block_band_power, channel_series,
@@ -110,8 +110,8 @@ class TimePanel(QWidget):
         )
         self.lock_color.toggled.connect(self._on_color_lock)
         self._color_limits: tuple[float, float] | None = None
-        self.color_low = _decibel("Minimum color, in dB relative to 1 µV²/Hz.")
-        self.color_high = _decibel("Maximum color, in dB relative to 1 µV²/Hz.")
+        self.color_low = _decibel("Minimum color, in dB. The color bar names the power unit.")
+        self.color_high = _decibel("Maximum color, in dB. The color bar names the power unit.")
         self.color_low.valueChanged.connect(self._on_color_range)
         self.color_high.valueChanged.connect(self._on_color_range)
         self.top_trace = _choice((("Exponent", "exponent"), ("Offset", "offset"), ("Knee", "knee")), 0)
@@ -415,7 +415,8 @@ class TimePanel(QWidget):
                         "start_s": round(episode.start_s, 3),
                         "duration_s": round(episode.end_s - episode.start_s, 3),
                         "cycles": episode.n_cycles,
-                        "amplitude_uv": episode.volt_amp,
+                        "amplitude": episode.volt_amp,
+                        "amplitude_unit": fit.unit,
                         "frequency_hz": freq,
                     })
             return exported
@@ -560,6 +561,7 @@ class TimePanel(QWidget):
                 draw_spectrogram(
                     fig, self._result, self._episodes(), self._inspection, self._raw_stretch(),
                     self._overlay_tracks(), self._color_limits, window,
+                    trace_unit=amplitude_unit(self.recording.reference_applied),
                 )
             elif mode == "trajectory" and isinstance(self._result, SlidingFit):
                 self._draw_trajectory(fig, self._result)
@@ -589,7 +591,10 @@ class TimePanel(QWidget):
                 if current is None:
                     self._empty(self._waiting())
                     return
-                draw_coherence(fig, current, self._coherence_raw(), other, other_label)
+                draw_coherence(
+                    fig, current, self._coherence_raw(), other, other_label,
+                    trace_unit=amplitude_unit(self.recording.reference_applied),
+                )
             elif mode == "coupling" and self._result is not None:
                 draw_pac(fig, self._result)
             elif mode == "quality":
@@ -698,7 +703,10 @@ class TimePanel(QWidget):
                 locked = (
                     f" Color locked at {self.color_low.value():.0f} to {self.color_high.value():.0f} dB."
                 )
-            return f"{spec.channel}. {spec.notes} Color is dB relative to 1 µV²/Hz.{locked} {burst_text}"
+            return (
+                f"{spec.channel}. {spec.notes} Color is dB relative to 1 {spec.power_unit}."
+                f"{locked} {burst_text}"
+            )
         if mode == "trajectory" and isinstance(self._result, SlidingFit):
             sliding = self._result
             extra = f" {sliding.notes}" if sliding.notes else ""
@@ -708,7 +716,7 @@ class TimePanel(QWidget):
                 scope += " The color scale includes the other open file."
             tracked = self._track_sentence(sliding)
             return (
-                f"{self._channel_name()}, {sliding.window_s:.0f} s windows, {sliding.overlap:.0%} overlap, "
+                f"{self._channel_name()}, {format_seconds(sliding.window_s)} s windows, {sliding.overlap:.0%} overlap, "
                 f"{self.settings.aperiodic_mode} slope, {band}.{extra} "
                 f"The top trace is {self.top_trace.currentText().lower()}. "
                 f"Welch segment {self.settings.segment_s:g} s. "
@@ -751,7 +759,7 @@ class TimePanel(QWidget):
             thin = f" {result.note}" if result.note else ""
             return (
                 f"{result.channel_a} and {result.channel_b}, {result.reference} reference, "
-                f"{result.n_segments} segments, {result.accepted_s:.0f} s accepted. "
+                f"{result.n_segments} segments, {format_seconds(result.accepted_s)} s accepted. "
                 f"High coherence is not a connection between regions.{zero}{thin}"
             )
         if mode == "coupling" and self._result is not None and hasattr(self._result, "note"):
@@ -936,7 +944,8 @@ class TimePanel(QWidget):
             freq = ""
             if episode.period_ms is not None and episode.period_ms > 0:
                 freq = f", {1000.0 / episode.period_ms:.1f} Hz"
-            amp = "" if episode.volt_amp is None else f", {episode.volt_amp:.1f} µV"
+            unit = self.cycle_fit.unit if self.cycle_fit is not None and self.cycle_fit.unit else amplitude_unit(self.settings.reference)
+            amp = "" if episode.volt_amp is None else f", {episode.volt_amp:.1f} {unit}"
             parts.append(
                 f"{episode.start_s:.1f}–{episode.end_s:.1f} s, {duration:.2f} s, "
                 f"{episode.n_cycles} cycles{amp}{freq}"
@@ -955,11 +964,11 @@ class TimePanel(QWidget):
         item = next((channel for channel in fit.channels if channel.name == self._channel_name()), None)
         if item is None or item.spectrum is None:
             reason = item.reason if item is not None and item.reason else "No fit for this channel."
-            return f" {fit.t_start:.0f}–{fit.t_end:.0f} s. {reason}"
+            return f" {format_seconds(fit.t_start)}–{format_seconds(fit.t_end)} s. {reason}"
         peak = alpha_peak(item, self.settings.alpha_band())
         exponent = "no exponent" if item.exponent is None else f"exponent {item.exponent:.2f}"
         peak_text = "no in-band peak" if peak is None else f"in-band peak {peak[0]:.1f} Hz"
-        return f" Window {fit.t_start:.0f}–{fit.t_end:.0f} s, {exponent}, {peak_text}."
+        return f" Window {format_seconds(fit.t_start)}–{format_seconds(fit.t_end)} s, {exponent}, {peak_text}."
 
     def control_values(self) -> dict:
         """Spectrogram and sliding-window settings, for the session metadata."""
@@ -1524,6 +1533,9 @@ class TimePanel(QWidget):
         self._show_table(["Channel", "Usable windows", "Rejected fraction"], rows)
 
     def _rejected_fraction(self, sliding: SlidingFit, name: str) -> float:
+        stored = [row[name] for row in sliding.channel_artifact if name in row]
+        if stored:
+            return float(np.median(stored))
         recording = self.recording
         if recording is None or name not in recording.ch_names or not sliding.windows:
             return float("nan")
@@ -1535,7 +1547,8 @@ class TimePanel(QWidget):
             i1 = min(recording.n_samples, int(round(fit.t_end * recording.sfreq)))
             if i1 <= i0:
                 continue
-            piece = mask[i0:i1]
+            finite = np.isfinite(recording.data[index, i0:i1])
+            piece = mask[i0:i1] & finite
             fractions.append(0.0 if piece.size == 0 else 1.0 - float(np.mean(piece)))
         if not fractions:
             return float("nan")
@@ -1643,12 +1656,26 @@ def _job(mode, recording, settings, index, options):
             list(range(recording.n_channels)) if options["every"] else [index]
         )
         fits = []
+        skipped: list[tuple[str, str]] = []
         for channel in indexes:
             try:
                 fits.append(fit_cycles(recording, channel, options["band"], settings))
-            except ValueError:
-                continue
-        return fits
+            except (ValueError, IndexError) as exc:
+                if 0 <= channel < recording.n_channels:
+                    skipped.append((recording.ch_names[channel], str(exc)))
+                else:
+                    skipped.append((str(channel), str(exc)))
+        if fits:
+            return fits
+        if len(skipped) == 1:
+            raise ValueError(skipped[0][1])
+        if not skipped:
+            raise ValueError("No channel was selected.")
+        reasons = list(dict.fromkeys(reason for _name, reason in skipped))
+        names = ", ".join(name for name, _reason in skipped)
+        if len(reasons) == 1:
+            raise ValueError(f"{names} could not be measured. {reasons[0]}")
+        raise ValueError(f"No channel could be measured. {' '.join(reasons)}")
     if mode == "reactivity":
         return _reactivity(recording, settings, index, options)
     if mode == "coherence":
@@ -1709,6 +1736,7 @@ def _reactivity(recording, settings, index, options) -> dict:
                         short = " Peak height and exponent use the first 8 marks."
             return {
                 "kind": "events",
+                "unit": power_unit(settings.reference),
                 "grid": grid,
                 "curves": curves,
                 "extras": extras,
@@ -1716,33 +1744,58 @@ def _reactivity(recording, settings, index, options) -> dict:
                 "channel": name, "source_start_s": continuous.source_start_s, "direction": direction or "",
                 "supports_change": supported, "baseline": (-pre, -.5), "response": (.5, min(5., post)),
                 "title": f"{name} · {direction or 'eye marks'} · {len(events)} events",
-                "note": (
-                    f"{name}, {band_phrase(*band)}, {pre:.0f} s before and {post:.0f} s after "
-                    f"eye marks on the original file. "
-                    f"Baseline −{pre:g} to −0.5 s; response 0.5 to {min(5., post):g} s. "
-                    f"{count_note}{change} The split sides do not contain the crossing.{short}"
+                "note": _with_range(
+                    (
+                        f"{name}, {band_phrase(*band)}, {format_seconds(pre)} s before and {format_seconds(post)} s after "
+                        f"eye marks on the original file. "
+                        f"Baseline −{pre:g} to −0.5 s; response 0.5 to {min(5., post):g} s. "
+                        f"{count_note}{change} The split sides do not contain the crossing.{short}"
+                    ),
+                    continuous.sfreq,
+                    band,
                 ),
             }
     pair = options.get("pair") or {}
     if "ec" in pair and "eo" in pair:
         return {
             "kind": "separate",
+            "unit": power_unit(settings.reference),
             "left": _one_power(pair["ec"], matched_settings(settings, pair["ec"], [pair["eo"]]), name, band),
             "right": _one_power(pair["eo"], matched_settings(settings, pair["eo"], [pair["ec"]]), name, band),
             "left_label": options.get("left_label") or "Eyes closed",
             "right_label": options.get("right_label") or "Eyes open",
-            "note": (
-                f"{name}, {band_phrase(*band)}, 2 s blocks. "
-                "These are separate recordings. There is no transition between them."
+            "note": _with_range(
+                (
+                    f"{name}, {band_phrase(*band)}, 2 s blocks. "
+                    "These are separate recordings. There is no transition between them."
+                ),
+                pair["ec"].sfreq,
+                band,
+                pair["eo"].sfreq,
             ),
         }
     times, power = block_band_power(recording, settings, index, band, 2.0, 0.5)
     return {
         "kind": "single",
+        "unit": power_unit(settings.reference),
         "single": (times, power),
         "title": f"{name}   ·   {band_phrase(*band)}   ·   2 s blocks",
-        "note": f"{name}, {band_phrase(*band)}, mean Welch power in 2 s blocks.",
+        "note": _with_range(
+            f"{name}, {band_phrase(*band)}, mean Welch power in 2 s blocks.",
+            recording.sfreq,
+            band,
+        ),
     }
+
+
+def _with_range(text: str, sfreq: float, band, *other_rates: float) -> str:
+    """Keep the sentence that says a band was brought down to the sampling rate."""
+    notes = []
+    for rate in (sfreq, *other_rates):
+        sentence = range_note(rate, float(band[1]))
+        if sentence and sentence not in notes:
+            notes.append(sentence)
+    return " ".join(part for part in (text, *notes) if part)
 
 
 def _partner_coherence(recording, settings, index, options):
@@ -1836,7 +1889,12 @@ def _event_change(grid, curves) -> str:
     post = float(np.median(after))
     text = f"Median power {pre:.2f} before the mark and {post:.2f} in the first 5 s after."
     if pre > 1e-6:
-        text += f" That is {(post - pre) / pre * 100.0:+.0f}%."
+        percent = (post - pre) / pre * 100.0
+        if abs(percent) < 1.0:
+            text += " That is about the same."
+        else:
+            shown = f"{percent:+.1f}".rstrip("0").rstrip(".")
+            text += f" That is {shown}%."
     return text
 
 

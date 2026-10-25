@@ -26,9 +26,7 @@ class FindingsPanel(QWidget):
 
         title = QLabel("Findings")
         title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {ACCENT};")
-        hint = QLabel(
-            "A reading of the current fit. The channel follows whatever you select on the other pages."
-        )
+        hint = QLabel("The channel is the one selected on the other pages. These are the same numbers.")
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         self.copy_button = QPushButton("Copy")
@@ -49,7 +47,7 @@ class FindingsPanel(QWidget):
         self.browser.setOpenExternalLinks(False)
         self.browser.setStyleSheet(
             f"QTextBrowser {{ background: {PANEL}; color: {INK}; border: 1px solid {LINE}; "
-            f"border-radius: 10px; padding: 14px 18px; font-size: 14px; }}"
+            "border-radius: 12px; padding: 6px 4px; }"
         )
 
         layout = QVBoxLayout(self)
@@ -79,11 +77,16 @@ class FindingsPanel(QWidget):
         self.browser.setHtml(_html(sections))
 
     def rows(self) -> list[dict]:
-        return [
-            {"section": section.title, "text": line}
-            for section in self.sections
-            for line in section.lines
-        ]
+        rows = []
+        for section in self.sections:
+            rows.extend(
+                {"section": section.title, "text": line}
+                for line in section.lines
+                if line.strip()
+            )
+            if section.aside:
+                rows.append({"section": section.title, "text": section.aside})
+        return rows
 
     def copy(self) -> None:
         QGuiApplication.clipboard().setText(self.plain)
@@ -92,19 +95,58 @@ class FindingsPanel(QWidget):
 
 
 def _html(sections: list[ReportSection]) -> str:
+    quiet = "What this page does not say"
     parts = [
-        "<html><body style='font-family: Segoe UI, Arial, sans-serif; "
-        f"color: {INK}; line-height: 1.45;'>"
+        "<html><body style=\"font-family: Cambria, 'Palatino Linotype', Georgia, serif; "
+        f"color: {INK}; font-size: 16px; line-height: 1.55; margin: 4px 18px 16px 18px;\">"
     ]
-    for section in sections:
+    for index, section in enumerate(sections):
+        top = "4px" if index == 0 else "22px"
         parts.append(
-            f"<h2 style='font-size: 15px; color: {ACCENT}; margin: 16px 0 6px 0;'>"
+            "<h2 style=\"font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; "
+            f"font-weight: 700; letter-spacing: 0.08em; color: {ACCENT}; "
+            f"margin: {top} 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid {LINE};\">"
             f"{html.escape(section.title)}</h2>"
         )
+        muted = section.title == quiet
         for line in section.lines:
-            color = MUTED if section.title == "What this page does not say" else INK
+            parts.append(_paragraph(line, muted))
+        if section.aside:
             parts.append(
-                f"<p style='margin: 0 0 8px 0; color: {color};'>{html.escape(line)}</p>"
+                "<p style=\"font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; "
+                f"font-style: italic; color: {MUTED}; margin: 14px 0 2px 0;\">"
+                f"{html.escape(section.aside)}</p>"
             )
     parts.append("</body></html>")
     return "".join(parts)
+
+
+def _paragraph(line: str, muted: bool) -> str:
+    if not line.strip():
+        return "<div style='height: 8px;'></div>"
+    if _is_label(line):
+        return (
+            "<p style=\"font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; "
+            f"font-weight: 600; color: {ACCENT}; margin: 12px 0 4px 0;\">{html.escape(line)}</p>"
+        )
+    color = MUTED if muted else INK
+    split = _split_label(line)
+    if split is None:
+        return f"<p style='margin: 0 0 8px 0; color: {color};'>{html.escape(line)}</p>"
+    head, tail = split
+    return (
+        f"<p style='margin: 0 0 8px 0; color: {color};'>"
+        "<span style=\"font-family: 'Segoe UI', Arial, sans-serif; font-weight: 600;\">"
+        f"{html.escape(head)}</span> {html.escape(tail)}</p>"
+    )
+
+
+def _is_label(line: str) -> bool:
+    return ":" not in line and len(line) <= 56 and line[-1:] not in ".;"
+
+
+def _split_label(line: str) -> tuple[str, str] | None:
+    head, sep, tail = line.partition(": ")
+    if not sep or not tail or len(head) > 42 or head.count(" ") > 6:
+        return None
+    return head, tail

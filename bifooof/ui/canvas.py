@@ -19,11 +19,11 @@ class MplCanvas(FigureCanvasQTAgg):
         self.setMinimumHeight(200)
 
     def resizeEvent(self, event):  # noqa: N802
-        super().resizeEvent(event)
-        engine = self.fig.get_layout_engine()
-        if engine is None or engine.__class__.__name__ != "ConstrainedLayoutEngine":
+        # Set the engine before the draw. Installing it afterwards, and drawing
+        # again, asks for another resize. Dense bipolar labels never settle.
+        if self.fig.get_layout_engine() is None:
             self.fig.set_layout_engine("tight")
-        self.draw_idle()
+        super().resizeEvent(event)
 
     def clear(self) -> None:
         clear_figure(self.fig)

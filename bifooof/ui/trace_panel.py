@@ -13,15 +13,45 @@ from PySide6.QtWidgets import (
 from ..io.recording import Recording
 from ..jobs import display_envelope
 from ..analysis.display import display_filter
+from ..analysis.prepare import (
+    CIRCUMFERENTIAL_BIPOLAR, LONGITUDINAL_BIPOLAR, TRANSVERSE_BIPOLAR,
+    apply_average_reference, apply_current_source_density, apply_reference,
+    apply_vertex_reference, average_contributor_names, bipolar_derivations,
+    csd_contributor_names,
+)
+from ..analysis.settings import format_seconds
 from .layouts import FlowLayout, control_group
-from ..plots import clear_figure, stamp_figure
+from ..plots import clear_figure, remember_figure, stamp_figure
 from .canvas import MplCanvas, style_axes
 
 _WINDOWS = [("5 s", 5.0), ("10 s", 10.0), ("15 s", 15.0), ("20 s", 20.0), ("30 s", 30.0)]
 _GAINS = [("50 µV", 50.0), ("75 µV", 75.0), ("100 µV", 100.0),
           ("150 µV", 150.0), ("200 µV", 200.0), ("300 µV", 300.0)]
+_CSD_GAINS = [("5k µV/m²", 5000.0), ("10k µV/m²", 10000.0), ("20k µV/m²", 20000.0),
+              ("50k µV/m²", 50000.0), ("100k µV/m²", 100000.0)]
 _TRACE = "#16324f"
 _SELECTED = "#c2410c"
+_RULER_HINT = "Drag to select an interval and measure time/amplitude. Display filters do not alter fits."
+_REFERENCE_LABELS = {
+    "stored": "As stored",
+    "average": "Average",
+    "linked": "Linked ears",
+    "mastoid": "Linked mastoids",
+    "rest": "REST",
+    "left": "Left ear",
+    "right": "Right ear",
+    "vertex": "Vertex (Cz)",
+    "ipsilateral": "Ipsilateral ears",
+    "contralateral": "Contralateral ears",
+    "csd": "Current source density",
+    "global": "Global scale",
+    "mastoid": "Linked mastoids",
+    "rest": "REST (spherical model)",
+    "hjorth": "Local Laplacian",
+    "bipolar": "Bipolar display",
+    "transverse": "Transverse bipolar",
+    "circumferential": "Circumferential bipolar",
+}
 
 
 class TracePanel(QWidget):
@@ -45,6 +75,10 @@ class TracePanel(QWidget):
         self.fit_window = None
         self.overlays = []
         self._drag = None
+        self._rendering = False
+        self._ruler_error = ""
+        self._fit_reference = "stored"
+        self._fit_limit = 500.0
 
         self.channels = QListWidget()
         self.channels.setFixedWidth(168)
@@ -91,7 +125,23 @@ class TracePanel(QWidget):
         for label, value in (("Off", 0), ("50 Hz", 50), ("60 Hz", 60)):
             self.notch.addItem(label, value)
         self.montage = QComboBox()
-        self.montage.addItems(["As stored", "Average display", "Bipolar display"])
+        self.montage.addItem("As stored", "stored")
+        self.montage.addItem("Average display", "average")
+        self.montage.addItem("Vertex (Cz)", "vertex")
+        self.montage.addItem("Ipsilateral ears", "ipsilateral")
+        self.montage.addItem("Contralateral ears", "contralateral")
+        self.montage.addItem("Left ear", "left")
+        self.montage.addItem("Right ear", "right")
+        self.montage.addItem("Bipolar display", "bipolar")
+        self.montage.addItem("Transverse bipolar", "transverse")
+        self.montage.addItem("Circumferential bipolar", "circumferential")
+        self.montage.addItem("Current source density", "csd")
+        self.montage.setToolTip(
+            "These change the picture only. The fit uses the reference on the fit bar. "
+            "Left ear and right ear use that ear alone. "
+            "Bipolar display is the longitudinal double banana. Transverse and circumferential are the other standard chains. "
+            "Current source density is the spherical-spline Laplacian, in µV/m²."
+        )
         self.display_band.currentIndexChanged.connect(self._render)
         self.notch.currentIndexChanged.connect(self._render)
         self.montage.currentIndexChanged.connect(self._render)
@@ -100,9 +150,13 @@ class TracePanel(QWidget):
         for label, widgets in (("JUMP", (self.jump, go)), ("DISPLAY BAND Hz", (self.display_band,)),
                                ("NOTCH", (self.notch,)), ("MONTAGE", (self.montage,))):
             flow.addWidget(control_group(label, *widgets))
-        self.ruler = QLabel("Drag to select an interval and measure time/amplitude. Display filters do not alter fits.")
+        self.ruler = QLabel(_RULER_HINT)
         self.ruler.setWordWrap(True)
         self.ruler.setObjectName("Muted")
+        self.reference_line = QLabel("")
+        self.reference_line.setWordWrap(True)
+        self.reference_line.setObjectName("Muted")
+        self._update_reference_line()
 
         self.canvas = MplCanvas(width=9.0, height=5.2)
         self.canvas.mpl_connect("button_press_event", self._on_click)
@@ -114,6 +168,7 @@ class TracePanel(QWidget):
         right = QVBoxLayout()
         right.addLayout(controls)
         right.addWidget(tools)
+        right.addWidget(self.reference_line)
         right.addWidget(self.ruler)
         right.addWidget(self.canvas, 1)
         right.addWidget(self.scroll)
@@ -205,6 +260,27 @@ class TracePanel(QWidget):
         self._configure_scroll()
         self._render()
 
+    def _ensure_gain(self, csd: bool) -> None:
+        """Use a µV/m² scale while the Laplacian is on the page. Voltage gains clip it."""
+        gains = _CSD_GAINS if csd else _GAINS
+        if self.gain.count() == len(gains) and self.gain.itemData(0) == gains[0][1]:
+            return
+        current = self._gain
+        if all(value != current for _label, value in gains):
+            current = gains[2][1]
+        self.gain.blockSignals(True)
+        self.gain.clear()
+        for label, value in gains:
+            self.gain.addItem(label, value)
+        index = max(0, self.gain.findData(current))
+        self.gain.setCurrentIndex(index)
+        self.gain.blockSignals(False)
+        self._gain = float(self.gain.currentData())
+        self.gain.setToolTip(
+            "Microvolts per square meter from the center of a row to the next row."
+            if csd else "Microvolts from the center of a row to the next row."
+        )
+
     def _on_gain(self, _index: int = 0) -> None:
         self._gain = float(self.gain.currentData())
         self._render()
@@ -256,10 +332,29 @@ class TracePanel(QWidget):
         times, values, names = self._ruler_data
         indices = [min(len(times) - 1, max(0, int(np.searchsorted(times, moment)))) for moment in (start, end)]
         delta_uv = values[row, indices[1]] - values[row, indices[0]]
-        amplitude = f"{delta_uv:+.2f} µV" if np.isfinite(delta_uv) else "unavailable across excluded samples"
+        unit = "µV/m²" if self.montage.currentData() == "csd" else "µV"
+        amplitude = f"{delta_uv:+.2f} {unit}" if np.isfinite(delta_uv) else "unavailable across excluded samples"
         self.ruler.setText(f"Selected {left:.3f}–{right:.3f} s · Δt {right-left:.3f} s · {names[row]} displayed-sample Δamplitude {amplitude}")
         self.interval_selected.emit(left, right)
         self._render()
+
+    def set_fit_reference(self, reference: str, limit_uv: float) -> None:
+        """Remember the fit-bar reference so the trace can show how the two differ."""
+        self._fit_reference = reference or "stored"
+        self._fit_limit = float(limit_uv)
+        self._update_reference_line()
+
+    def _update_reference_line(self) -> None:
+        picture = self.montage.currentData() or "stored"
+        fit = self._fit_reference
+        if self._fit_limit > 0:
+            fit_limit = f"amplitude limit ±{self._fit_limit:g} µV applied before the reference"
+        else:
+            fit_limit = "amplitude limit not set"
+        self.reference_line.setText(
+            f"Trace: {_REFERENCE_LABELS.get(picture, picture)}, amplitude limit not applied. "
+            f"Fit: {_REFERENCE_LABELS.get(fit, fit)}, {fit_limit}."
+        )
 
     def _empty(self, message: str) -> None:
         self._visible = []
@@ -269,8 +364,23 @@ class TracePanel(QWidget):
         ax.axis("off")
         ax.text(0.5, 0.5, message, ha="center", va="center", color="#63748a", fontsize=12)
         self.canvas.draw_idle()
+        if self.recording is not None:
+            self._ruler_error = message
+            self.ruler.setText(message)
+        self._update_reference_line()
 
     def _render(self) -> None:
+        if self._rendering:
+            return
+        self._rendering = True
+        try:
+            self._draw_page()
+        except Exception as exc:
+            self._empty(str(exc).strip() or "This montage could not be drawn.")
+        finally:
+            self._rendering = False
+
+    def _draw_page(self) -> None:
         recording = self.recording
         if recording is None:
             return
@@ -290,28 +400,60 @@ class TracePanel(QWidget):
         all_data = np.array(recording.data[:, start:stop], copy=True)
         if recording.valid is not None:
             all_data[~recording.valid[:, start:stop]] = np.nan
-        if self.montage.currentIndex() == 1:
-            valid = np.isfinite(all_data)
+        montage = self.montage.currentData()
+        self._ensure_gain(montage == "csd")
+        csd_note = ""
+        if montage == "average":
             eligible = np.array([recording.analysis_channel(name) for name in recording.ch_names])
-            valid &= eligible[:, None]
-            count_valid = valid.sum(axis=0)
-            mean = np.divide(np.where(valid, all_data, 0).sum(axis=0), count_valid, out=np.zeros(all_data.shape[1]), where=count_valid >= 2)
-            all_data[eligible] -= mean
+            all_data, csd_note, applied = apply_average_reference(
+                all_data, recording.ch_names, eligible, average_contributor_names(recording),
+            )
+            if not applied:
+                self._empty(csd_note)
+                return
+        if montage == "vertex":
+            eligible = np.array([recording.analysis_channel(name) for name in recording.ch_names])
+            all_data, csd_note, applied = apply_vertex_reference(all_data, recording.ch_names, eligible)
+            if not applied:
+                self._empty(csd_note)
+                return
+        if montage in {"ipsilateral", "contralateral", "left", "right"}:
+            page = recording.cropped(start, stop)
+            referenced = apply_reference(page, montage, 0.0)
+            if referenced.reference_applied == "stored":
+                self._empty(referenced.notes[-1] if referenced.notes else "The stored reference was kept.")
+                return
+            all_data = np.array(referenced.data, dtype=np.float64, copy=True)
+            # Rejected samples stay in the file so this page can show them.
+            # Blank the line again after the remontage.
+            if recording.valid is not None:
+                all_data[~recording.valid[:, start:stop]] = np.nan
+            csd_note = referenced.notes[-1] if referenced.notes else ""
+        if montage == "csd":
+            eligible = np.array([recording.analysis_channel(name) for name in recording.ch_names])
+            all_data, csd_note, applied = apply_current_source_density(
+                all_data, recording.ch_names, eligible, csd_contributor_names(recording),
+            )
+            if not applied:
+                self._empty(csd_note)
+                return
         names = [recording.ch_names[index] for index in visible]
         segment = all_data[visible]
-        if self.montage.currentIndex() == 2:
-            pairs = [(a, b) for a, b in (("Fp1", "F7"), ("F7", "T7"), ("T7", "P7"), ("P7", "O1"),
-                ("Fp2", "F8"), ("F8", "T8"), ("T8", "P8"), ("P8", "O2"), ("Fz", "Cz"), ("Cz", "Pz"))
-                if a in names and b in names]
-            if not pairs:
+        if montage in {"bipolar", "transverse", "circumferential"}:
+            pairs = {
+                "bipolar": LONGITUDINAL_BIPOLAR,
+                "transverse": TRANSVERSE_BIPOLAR,
+                "circumferential": CIRCUMFERENTIAL_BIPOLAR,
+            }[montage]
+            derived = bipolar_derivations(all_data, recording.ch_names, pairs, names)
+            if derived is None:
                 self._empty("No supported bipolar pair is visible. Choose As stored or show both channels of a pair.")
                 return
-            segment = np.vstack([all_data[recording.ch_names.index(a)] - all_data[recording.ch_names.index(b)] for a, b in pairs])
-            names = [f"{a}−{b}" for a, b in pairs]
-            visible = [recording.ch_names.index(a) for a, b in pairs]
+            segment, names, visible = derived
             self._visible = visible
+        filter_note = ""
         try:
-            segment = display_filter(segment, sfreq, self.display_band.currentText(), self.notch.currentData())
+            segment, filter_note = display_filter(segment, sfreq, self.display_band.currentText(), self.notch.currentData())
         except ValueError as exc:
             self._empty(str(exc))
             return
@@ -340,9 +482,16 @@ class TracePanel(QWidget):
         for row, channel_index in enumerate(visible):
             color = _SELECTED if channel_index == self._selected else _TRACE
             width = 1.15 if channel_index == self._selected else 0.7
-            clipped = np.clip(segment[row] * scale, -separation, separation)
+            scaled = segment[row] * scale
+            over = np.isfinite(scaled) & (np.abs(scaled) > separation)
+            clipped = np.clip(scaled, -separation, separation)
             points = display_envelope(segment[row])
             ax.plot(times[points], clipped[points] + offsets[row], color=color, lw=width, zorder=2)
+            if np.any(over):
+                ax.plot(
+                    times[over], clipped[over] + offsets[row], linestyle="none",
+                    marker="|", ms=6, color="#b3261e", zorder=4,
+                )
 
         ax.set_yticks(offsets)
         ax.set_yticklabels(names, fontsize=8)
@@ -351,24 +500,47 @@ class TracePanel(QWidget):
                 label.set_color(_SELECTED)
                 label.set_fontweight("bold")
         ax.set_ylim(-separation * 0.85, (count - 0.15) * separation)
-        ax.set_xlim(times[0], times[-1])
-        bar_x = times[0] + (times[-1] - times[0]) * 0.012
+        sample_span = float(times[-1] - times[0])
+        if sample_span <= 0:
+            pad = 0.5 / sfreq
+            left, right = float(times[0]) - pad, float(times[-1]) + pad
+        else:
+            left, right = float(times[0]), float(times[-1])
+        ax.set_xlim(left, right)
+        width = right - left
+        bar_x = left + width * 0.012
         bar_y = -separation * 0.55
         ax.plot([bar_x, bar_x], [bar_y, bar_y + 0.5], color="#16232f", lw=1.6, solid_capstyle="butt", zorder=3)
-        ax.text(bar_x + (times[-1] - times[0]) * 0.012, bar_y + 0.25, f"{self._gain:.0f} µV",
+        ax.text(bar_x + width * 0.012, bar_y + 0.25, self.gain.currentText(),
                 va="center", ha="left", fontsize=7, color="#63748a")
         ax.set_xlabel("Time (s)")
         end = min(self._t0 + self._win_s, recording.duration_s)
         prefix = f"{self.condition_label}   ·   " if self.condition_label else ""
         hidden = "" if self._selected in visible else "   ·   selected channel is hidden"
         ax.set_title(
-            f"{prefix}{self._t0:.1f}–{end:.1f} s of {recording.duration_s:.0f} s"
+            f"{prefix}{self._t0:.1f}–{end:.1f} s of {format_seconds(recording.duration_s)} s"
             f"   ·   {recording.sfreq:.0f} Hz   ·   {recording.source_format.upper()}{hidden}",
-            fontsize=9, loc="left", color="#16232f",
+            fontsize=9, loc="left", color="#16232f", pad=16,
         )
         style_axes(ax)
-        fig.tight_layout()
+        if fig.get_layout_engine() is None:
+            fig.set_layout_engine("tight")
+        shown = names[0] if names else ""
+        remember_figure(
+            fig, shown,
+            f"{self._t0:.1f}–{end:.1f} s",
+            self.montage.currentText(),
+            "µV/m²" if montage == "csd" else "µV",
+        )
         stamp_figure(fig)
-        ax.text(.99, .99, f"DISPLAY: {self.montage.currentText()} · band {self.display_band.currentText()} · notch {self.notch.currentText()}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=7, color="#63748a")
+        display = f"DISPLAY: {self.montage.currentText()} · band {self.display_band.currentText()} · notch {self.notch.currentText()}"
+        if filter_note:
+            display = f"{display}. {filter_note}"
+        if csd_note:
+            display = f"{display}. {csd_note}"
+        ax.text(0.0, 1.01, display, transform=ax.transAxes, ha="left", va="bottom", fontsize=8, color="#63748a", clip_on=False)
         self.canvas.draw_idle()
+        if self._ruler_error and self.ruler.text() == self._ruler_error:
+            self.ruler.setText(_RULER_HINT)
+        self._ruler_error = ""
+        self._update_reference_line()

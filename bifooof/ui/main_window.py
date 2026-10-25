@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..analysis.compare import compare_spectra
-from ..analysis.settings import FitSettings, matched_settings
+from ..analysis.settings import FitSettings, format_hz, format_seconds, matched_settings
 from ..export import (
     burst_episode_rows, comparison_rows, cycle_detail_rows, cycle_summary_row, fit_metadata, peak_rows,
     save_figure, spectrum_rows, write_csv, write_json,
@@ -128,8 +128,11 @@ class MainWindow(QMainWindow):
 
         self.fit_bar = FitBar()
         self.fit_bar.apply_requested.connect(self._apply_fit)
+        self.fit_bar.reference.currentIndexChanged.connect(self._sync_trace_reference)
+        self.fit_bar.amplitude.valueChanged.connect(self._sync_trace_reference)
 
         self.trace = TracePanel()
+        self._sync_trace_reference()
         self.spectrum = SpectrumPanel()
         self.time = TimePanel()
         self.cycles = CyclePanel()
@@ -563,6 +566,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(note)
         self.trace.condition_label = CONDITION_LABELS.get(condition, "")
         self.trace.set_recording(recording, None if not keep_channel else self._selected)
+        self._sync_trace_reference()
         self.spectrum.set_recording(recording, condition)
         if keep_channel:
             self.spectrum._selected = self._selected
@@ -654,6 +658,10 @@ class MainWindow(QMainWindow):
             return
         self._select(self.recording.ch_names.index(name))
 
+    def _sync_trace_reference(self, *_args) -> None:
+        settings = self.fit_bar.settings()
+        self.trace.set_fit_reference(settings.reference, settings.amplitude_limit_uv)
+
     def _apply_fit(self, settings) -> None:
         try:
             settings.validate()
@@ -672,10 +680,10 @@ class MainWindow(QMainWindow):
         if settings.t_length is None and settings.t_start <= 0:
             window = "the whole recording"
         else:
-            end = "the end" if settings.t_length is None else f"{settings.t_start + settings.t_length:.0f} s"
-            window = f"{settings.t_start:.0f} s to {end}"
+            end = "the end" if settings.t_length is None else f"{format_seconds(settings.t_start + settings.t_length)} s"
+            window = f"{format_seconds(settings.t_start)} s to {end}"
         self.statusBar().showMessage(
-            f"Refitting {window}, {settings.fmin:g}–{settings.fmax:.0f} Hz, {settings.aperiodic_mode} slope."
+            f"Refitting {window}, {settings.fmin:g}–{format_hz(settings.fmax)} Hz, {settings.aperiodic_mode} slope."
         )
 
     def _on_fit_band(self, low: float, high: float) -> None:
@@ -794,34 +802,47 @@ class MainWindow(QMainWindow):
         return f"{stem}.{suffix}"
 
     def show_about(self) -> None:
-        QMessageBox.about(
-            self,
-            "About BiFooof",
-            f"<b>BiFooof {__version__}</b><br><br>"
-            "Spectral parameterization with specparam, and cycle-by-cycle shape with bycycle.<br><br>"
-            "Open an eyes-closed recording and an eyes-open recording. Both fits keep running. "
-            "Compare overlays the two spectra, the exponent change, and reactivity "
-            "in the selected band (eyes closed minus eyes open). Alpha 8–12 Hz is the default. "
-            "Delta, theta, beta, gamma, and a custom range use the same views. "
-            "A WinEEG file whose marks name eyes closed and eyes open opens both sides. "
-            "When cycles are found and none form a burst, the cycle page names the cutoff that stopped the run. "
-            "It also shows how many cycles cleared each cutoff, and lists each burst episode. "
-            "Samples beyond the amplitude limit stay out of the fit. "
-            "The reference stays as stored unless average or linked ears is selected. "
-            "When both files are open and the window is the whole recording, both are fit to the shorter length. "
-            "A weak fit is ringed on the head map, and a peak just outside the band is shown as the nearest peak. "
-            "Findings restates those measurements in short sentences. It does not assign a diagnosis. "
-            "Time shows the same fit across the recording: a spectrogram, sliding specparam, bursts, "
-            "and the other views on that tab. A click there scrolls the trace. "
-            "Δ band % is the percent change in mean Welch power between the two recordings, "
-            "(EC − EO) / EO, not the band's share of the spectrum. "
-            "With epochs, a peak's height is the median of the epochs that found it. "
-            "Epochs that missed it are not entered as zero, and the count of those epochs is separate from the height.<br><br>"
-            "Save image writes the current view. Save data writes the current table. "
-            "Export results writes both conditions, review sidecars, and the comparison into one folder. Save project restores the workspace.<br><br>"
-            "Shortcuts: Ctrl+O opens eyes closed; Ctrl+Shift+O opens eyes open; "
-            "Ctrl+R refits; Ctrl+S saves a project; Ctrl+Shift+E exports results; Ctrl+Shift+S saves an image; Ctrl+E saves data.",
+        box = QMessageBox(self)
+        box.setWindowTitle("About BiFooof")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"<p style='font-size: 15px;'><b>BiFooof {__version__}</b></p>"
+            "<p>Spectral parameterization with specparam, and cycle-by-cycle shape with bycycle.</p>"
+            "<p>Open an eyes-closed recording and an eyes-open recording. Both fits keep running. "
+            "A WinEEG file whose marks name the two states opens both sides.</p>"
+            "<p>Compare overlays the spectra, the exponent change, and reactivity in the selected band "
+            "(eyes closed minus eyes open). Alpha 8–12 Hz is the default. Delta, theta, beta, gamma, "
+            "and a custom range use the same views.</p>"
+            "<p>Samples that rise above the amplitude limit, measured from the channel's straight trend, "
+            "stay out of the fit. The limit is in microvolts on the original samples, before the transform. "
+            "The reference stays as stored unless average, linked ears, linked mastoids, a single ear, "
+            "vertex, ipsilateral ears, contralateral ears, REST, a local Laplacian, current source density, "
+            "or global scale is selected. "
+            "When both files are open and the window is the whole recording, both are fit to the shorter length.</p>"
+            "<p>A weak fit is drawn as a diamond on the head map. The selected channel is ringed. "
+            "A peak just outside the band is shown as the nearest peak. "
+            "Findings restates the measurements. It does not assign a diagnosis.</p>"
+            "<p>When cycles are found and none form a burst, the cycle page names the cutoff that stopped the run. "
+            "It also shows how many cycles cleared each cutoff, and lists each burst episode.</p>"
+            "<p>Time shows the same fit across the recording: a spectrogram, sliding specparam, bursts, "
+            "and the other views on that tab. A click there scrolls the trace.</p>"
+            "<p>Δ band % is the percent change in mean Welch power between the two recordings, "
+            "(EC − EO) / EO, not the band's share of the spectrum. With epochs, a peak's height is the median "
+            "of the epochs that found it. Epochs that missed it are not entered as zero, and that count "
+            "stays separate from the height.</p>"
+            "<p>Save image writes the current view. Save data writes the current table. "
+            "Export results writes both conditions, review sidecars, and the comparison into one folder. "
+            "Save project restores the workspace.</p>"
+            "<p>Ctrl+O opens eyes closed. Ctrl+Shift+O opens eyes open. Ctrl+R refits. "
+            "Ctrl+S saves a project. Ctrl+Shift+E exports results. Ctrl+Shift+S saves an image. "
+            "Ctrl+E saves data.</p>"
         )
+        label = box.findChild(QLabel, "qt_msgbox_label")
+        if label is not None:
+            label.setWordWrap(True)
+            label.setMinimumWidth(460)
+        box.exec()
 
     def _running_workers(self, *owners) -> list:
         return [worker for owner in owners for worker in getattr(owner, "_live_workers", ()) if worker.isRunning() or getattr(worker, "pending", False) is True]

@@ -85,7 +85,7 @@ class Recording:
         ]
         valid, spans = self.slice_exclusions(i0, i1, t0)
         refs = {
-            name: np.ascontiguousarray(values[i0:i1], dtype=np.float64)
+            name: np.copy(np.asarray(values[i0:i1], dtype=np.float64))
             for name, values in self.reference_channels.items()
         }
         notes = list(self.notes)
@@ -94,7 +94,7 @@ class Recording:
         else:
             notes.append(f"Fit window {t0:.1f}–{t1:.1f} s.")
         return Recording(
-            data=self.data[:, i0:i1],
+            data=np.copy(np.asarray(self.data[:, i0:i1], dtype=np.float64)),
             ch_names=list(self.ch_names),
             sfreq=self.sfreq,
             source_path=self.source_path,
@@ -119,7 +119,7 @@ class Recording:
 
     def analysis_channel(self, name: str) -> bool:
         """Voltage EEG channels eligible for neural analysis and referencing."""
-        if name in {"A1", "A2", "M1", "M2"}:
+        if name.upper() in {"A1", "A2", "M1", "M2", "LE", "EL", "RE", "ER", "T9", "T10"}:
             return False
         kind = self.import_info.get("analysis_channel_types", {}).get(name, "eeg")
         return kind in {"eeg", "seeg", "ecog", "dbs", "misc"}
@@ -142,7 +142,7 @@ class Recording:
         piece = self.valid[:, i0:i1]
         if piece.size and bool(piece.all()):
             return None, spans
-        return piece, spans
+        return np.copy(piece), spans
 
     @property
     def n_channels(self) -> int:

@@ -17,8 +17,8 @@ from ..io.recording import Recording
 from .compare import alpha_peak
 from .prepare import R2_WEAK, prepare_recording
 from .segments import accepted_runs
-from .settings import FitSettings, window_bounds
-from .specparam_fit import ChannelFit, SpectrumFit, fit_spectra
+from .settings import FitSettings, format_seconds, power_unit, range_note, window_bounds
+from .specparam_fit import ChannelFit, SpectrumFit, _merge_notes, fit_spectra
 from .spectra import welch_spectra
 
 
@@ -38,6 +38,7 @@ class Spectrogram:
     t_start: float
     t_end: float
     notes: str = ""
+    power_unit: str = "µV²/Hz"
 
 
 @dataclass
@@ -47,6 +48,8 @@ class SlidingFit:
     overlap: float
     artifact_fraction: list[float]
     notes: str = ""
+    # Rejected fraction of each channel in each window, after the amplitude rule.
+    channel_artifact: list[dict[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -100,7 +103,12 @@ def channel_spectrogram(
     prepared = prepare_recording(recording, chosen)
     signal = np.asarray(prepared.data[channel_index], dtype=np.float64)
     mask = prepared.mask(channel_index) & np.isfinite(signal)
-    nperseg = max(16, int(round(prepared.sfreq * float(window_s))))
+    nperseg = int(round(prepared.sfreq * float(window_s)))
+    if nperseg < 16:
+        raise ValueError(
+            f"A {float(window_s):g} s spectrogram window is {nperseg} samples at {prepared.sfreq:g} Hz. "
+            "A spectrogram needs at least 16 samples in the window."
+        )
     noverlap = int(round(nperseg * float(overlap)))
     noverlap = min(max(noverlap, 0), nperseg - 1)
     hop = nperseg - noverlap
@@ -109,8 +117,10 @@ def channel_spectrogram(
 
     columns: list[tuple[float, np.ndarray]] = []
     freqs = None
+    skipped_s = 0.0
     for start, stop in accepted_runs(mask):
         if stop - start < nperseg:
+            skipped_s += (stop - start) / prepared.sfreq
             continue
         piece = detrend(signal[start:stop], type="linear")
         piece_freqs, _times, power = spectrogram(
@@ -174,10 +184,18 @@ def channel_spectrogram(
         dt_s=float(dt),
         t_start=t_start,
         t_end=t_end,
-        notes=(
-            f"Frequency bins {df:.2f} Hz. Time step {dt:.2f} s. "
-            "A burst shorter than the window is spread across that window."
+        notes=_merge_notes(
+            (
+                f"Frequency bins {df:.2f} Hz. Time step {dt:.2f} s. "
+                "A burst shorter than the window is spread across that window."
+            ),
+            range_note(prepared.sfreq, float(chosen.fmax)),
+            (
+                f"{format_seconds(skipped_s)} s in shorter stretches was left out of the spectrogram."
+                if skipped_s > 0.05 else ""
+            ),
         ),
+        power_unit=power_unit(prepared.reference_applied),
     )
 
 
@@ -206,7 +224,7 @@ def sliding_spectra(
     hop = max(1, int(round(width * (1.0 - float(overlap)))))
     if prepared.n_samples < width:
         pieces = [(0, prepared.n_samples)]
-        note = f"Shorter than {float(window_s):.0f} s, so one window was fit."
+        note = f"Shorter than {format_seconds(float(window_s))} s, so one window was fit."
     else:
         pieces = []
         start = 0
@@ -216,9 +234,19 @@ def sliding_spectra(
         note = ""
         if chosen.segment_s * 2 > window_s:
             note = (
-                f"A {float(window_s):.0f} s window with a {chosen.segment_s:g} s Welch segment "
+                f"A {format_seconds(float(window_s))} s window with a {chosen.segment_s:g} s Welch segment "
                 "has few averages."
             )
+    covered = pieces[-1][1] if pieces else 0
+    leftover_s = (prepared.n_samples - covered) / prepared.sfreq if prepared.sfreq else 0.0
+    if leftover_s > 0.05:
+        note = _merge_notes(
+            note,
+            (
+                f"The last {format_seconds(leftover_s)} s was shorter than one "
+                f"{format_seconds(float(window_s))} s window and was left out."
+            ),
+        )
     child = replace(
         chosen,
         epoch_s=None,
@@ -229,10 +257,12 @@ def sliding_spectra(
     )
     windows: list[SpectrumFit] = []
     fractions: list[float] = []
+    channel_artifact: list[dict[str, float]] = []
     mask = None if prepared.valid is None else prepared.valid
     for position, (i0, i1) in enumerate(pieces):
         checkpoint(position, len(pieces), f"Sliding window {position + 1} of {len(pieces)}")
         fractions.append(_fraction(mask, prepared.data, i0, i1, channel_index))
+        channel_artifact.append(_channel_fractions(prepared, i0, i1))
         piece = prepared.cropped(i0, i1)
         if channel_index is not None:
             piece = _only(piece, channel_index)
@@ -247,12 +277,17 @@ def sliding_spectra(
         windows.append(fit)
     if not windows:
         raise ValueError("No window was long enough to fit.")
+    shared = [
+        fit.notes for fit in windows
+        if any(item.usable for item in fit.channels)
+    ]
     return SlidingFit(
         windows=windows,
         window_s=float(window_s),
         overlap=float(overlap),
         artifact_fraction=fractions,
-        notes=note,
+        channel_artifact=channel_artifact,
+        notes=_merge_notes(note, *shared),
     )
 
 
@@ -449,16 +484,34 @@ def block_band_power(
         raise ValueError("The block has to be longer than 0 s.")
     chosen = settings
     chosen.validate()
+    low, high = float(band[0]), float(band[1])
+    if high <= low:
+        raise ValueError("The band needs a low frequency below the high one.")
+    limit = float(recording.sfreq) / 2.0 - 0.5
+    if low >= limit:
+        raise ValueError(
+            f"Sampling rate {recording.sfreq:g} Hz reaches {limit:g} Hz, "
+            f"so {low:g}–{high:g} Hz has no power to measure."
+        )
     t_start, _t_end = window_bounds(recording, chosen)
     prepared = prepare_recording(recording, chosen)
     signal = np.asarray(prepared.data[channel_index], dtype=np.float64)
     mask = prepared.mask(channel_index) & np.isfinite(signal)
     width = max(8, int(round(float(block_s) * prepared.sfreq)))
+    if prepared.n_samples < width:
+        requested = int(round(float(block_s) * prepared.sfreq))
+        available = prepared.n_samples / prepared.sfreq if prepared.sfreq else 0.0
+        if requested > prepared.n_samples:
+            raise ValueError(
+                f"A {float(block_s):g} s block is longer than the {available:g} s available."
+            )
+        raise ValueError(
+            f"A block needs at least 8 samples. This stretch has {prepared.n_samples}."
+        )
     hop = max(1, int(round(width * (1.0 - float(overlap)))))
     segment = min(float(chosen.segment_s), float(block_s))
     times = []
     power = []
-    low, high = float(band[0]), float(band[1])
     for start in range(0, prepared.n_samples - width + 1, hop):
         stop = start + width
         if int(mask[start:stop].sum()) < max(16, width // 2):
@@ -522,15 +575,23 @@ def align_to_events(
 
 
 def _fraction(mask: np.ndarray | None, data: np.ndarray, i0: int, i1: int, channel: int | None) -> float:
-    if mask is None:
-        piece = np.isfinite(data[:, i0:i1] if channel is None else data[channel, i0:i1])
-    elif channel is None:
-        piece = mask[:, i0:i1]
+    if channel is None:
+        finite = np.isfinite(data[:, i0:i1])
+        piece = finite if mask is None else mask[:, i0:i1] & finite
     else:
-        piece = mask[channel, i0:i1]
+        finite = np.isfinite(data[channel, i0:i1])
+        piece = finite if mask is None else mask[channel, i0:i1] & finite
     if piece.size == 0:
         return 1.0
     return float(1.0 - np.mean(piece))
+
+
+def _channel_fractions(recording: Recording, i0: int, i1: int) -> dict[str, float]:
+    mask = None if recording.valid is None else recording.valid
+    return {
+        name: _fraction(mask, recording.data, i0, i1, index)
+        for index, name in enumerate(recording.ch_names)
+    }
 
 
 def _only(recording: Recording, index: int) -> Recording:

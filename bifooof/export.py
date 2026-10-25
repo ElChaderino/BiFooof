@@ -6,12 +6,13 @@ from dataclasses import replace
 
 import csv
 import json
+import math
 from pathlib import Path
 
 from . import __version__
 from .analysis.compare import ChannelComparison
 from .analysis.cycles import CycleFit
-from .analysis.settings import FitSettings, band_label
+from .analysis.settings import FitSettings, amplitude_unit, band_label, power_unit
 from .analysis.prepare import prepare_recording, sample_provenance
 from .analysis.specparam_fit import SpectrumFit
 from .io.condition import CONDITION_LABELS
@@ -28,7 +29,15 @@ def save_figure(fig, path: str | Path) -> Path:
     try:
         if compact:
             fig.set_size_inches(10, 7, forward=False)
-        fig.savefig(destination, dpi=150, bbox_inches="tight", facecolor="white")
+        note = getattr(fig, "_bifooof_stamp", "")
+        artist = fig.text(
+            0.0, 0.005, note, fontsize=8, color="#63748a", ha="left", va="bottom",
+        ) if note else None
+        try:
+            fig.savefig(destination, dpi=150, bbox_inches="tight", facecolor="white")
+        finally:
+            if artist is not None:
+                artist.remove()
     finally:
         if compact:
             fig.set_size_inches(*original_size, forward=False)
@@ -197,6 +206,7 @@ def cycle_summary_row(fit: CycleFit, condition: str, source: str = "") -> dict:
         "rise_decay": fit.rise_decay,
         "peak_trough": fit.peak_trough,
         "volt_amp": fit.volt_amp,
+        "amplitude_unit": fit.unit,
         "burst_period_ms": fit.burst_period_ms,
         "burst_rise_decay": fit.burst_rise_decay,
         "burst_peak_trough": fit.burst_peak_trough,
@@ -226,6 +236,7 @@ def burst_episode_rows(fit: CycleFit, condition: str, source: str = "") -> list[
             "n_cycles": episode.n_cycles,
             "period_ms": episode.period_ms,
             "volt_amp": episode.volt_amp,
+            "amplitude_unit": fit.unit,
         }
         for index, episode in enumerate(fit.episodes)
     ]
@@ -244,8 +255,17 @@ def write_json(path: str | Path, payload: dict) -> Path:
     if destination.suffix.lower() != ".json":
         destination = destination.with_suffix(".json")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    destination.write_text(json.dumps(_blank_nonfinite(payload), indent=2), encoding="utf-8")
     return destination
+
+
+def _result_units(reference: str) -> str:
+    """Physical unit of the samples that were fit."""
+    if reference == "csd":
+        return "µV/m²"
+    if reference == "global":
+        return "scaled microvolts"
+    return "microvolts"
 
 
 def fit_metadata(
@@ -273,7 +293,8 @@ def fit_metadata(
         "source": recording.source_path,
         "format": recording.source_format,
         "sfreq_hz": recording.sfreq,
-        "units": "microvolts",
+        "units": _result_units(str(provenance.get("reference_applied", settings.reference))),
+        "power_units": power_unit(str(provenance.get("reference_applied", settings.reference))),
         "recording_source_start_s": recording.source_start_s,
         "time_window_start_s": None if fit is None else fit.t_start,
         "time_window_end_s": None if fit is None else fit.t_end,
@@ -291,6 +312,8 @@ def fit_metadata(
         "reference": provenance.get("reference_applied", settings.reference),
         "reference_requested": settings.reference,
         "amplitude_limit_uv": settings.amplitude_limit_uv,
+        "amplitude_limit_domain": "original microvolts, before the reference or spatial transform",
+        "amplitude_unit": amplitude_unit(str(provenance.get("reference_applied", settings.reference))),
         "epoch_s": settings.epoch_s,
         "burst_thresholds": settings.cycle_thresholds(),
         "bad_channels": list(recording.bad_channels),
@@ -308,7 +331,8 @@ def fit_metadata(
             "Each condition picks its own tallest peak in the band. A missing peak stays missing."
         ),
         "band_power_definition": (
-            "Mean linear Welch power in the band, in microvolts squared per Hz. "
+            "Mean linear Welch power in the band. After a voltage reference, including REST, the unit is microvolts squared per Hz. "
+            "After current source density it is µV²/(m⁴·Hz). After the global scale factor the power has been divided by that factor. "
             "The percent is the change between recordings, (EC - EO) / EO * 100. "
             "It is not the band's share of total spectral power. "
             "It is blank when eyes-open power is missing or not positive."
@@ -345,5 +369,18 @@ def _cell(value) -> str:
     if value is None:
         return ""
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
         return f"{value:.6g}"
     return str(value)
+
+
+def _blank_nonfinite(value):
+    """JSON has no nan or inf. A missing measurement is null."""
+    if isinstance(value, dict):
+        return {key: _blank_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_blank_nonfinite(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value

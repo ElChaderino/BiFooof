@@ -137,9 +137,26 @@ class FitBar(QFrame):
         self.reference.addItem("As stored", "stored")
         self.reference.addItem("Average", "average")
         self.reference.addItem("Linked ears", "linked")
+        self.reference.addItem("Linked mastoids", "mastoid")
+        self.reference.addItem("Left ear", "left")
+        self.reference.addItem("Right ear", "right")
+        self.reference.addItem("Vertex (Cz)", "vertex")
+        self.reference.addItem("Ipsilateral ears", "ipsilateral")
+        self.reference.addItem("Contralateral ears", "contralateral")
+        self.reference.insertSeparator(self.reference.count())
+        self.reference.addItem("REST (spherical model)", "rest")
+        self.reference.insertSeparator(self.reference.count())
+        self.reference.addItem("Local Laplacian", "hjorth")
+        self.reference.addItem("CSD", "csd")
+        self.reference.insertSeparator(self.reference.count())
+        self.reference.addItem("Global scale", "global")
         self.reference.setToolTip(
-            "As stored keeps the reference in the file. Average subtracts the mean of the fitted channels. "
-            "Linked ears uses A1 and A2, or M1 and M2, when the file has them. Press Refit to apply."
+            "Voltage references: as stored, average, linked ears (A1/A2), linked mastoids (M1/M2), "
+            "one ear, vertex, or the ear on one side. Ears and mastoids are not substitutes. "
+            "REST estimates an infinity reference from a template spherical forward model and stays in microvolts. "
+            "The local Laplacian subtracts an equal neighbor mean and stays in microvolts. "
+            "CSD is the spherical-spline surface Laplacian, in µV/m². "
+            "Global scale is the average reference, then the scale factor. Press Refit to apply."
         )
         self.epochs = QComboBox()
         self.epochs.addItem("Whole window", None)
@@ -158,7 +175,9 @@ class FitBar(QFrame):
         self.amplitude.setValue(500.0)
         self.amplitude.setFixedWidth(88)
         self.amplitude.setToolTip(
-            "Samples beyond this many microvolts stay out of the spectrum and the cycles. 0 keeps every sample. "
+            "Samples that rise more than this many microvolts above the channel's straight trend "
+            "stay out of the spectrum and the cycles. The limit is applied to the original voltage, "
+            "before a reference, REST, or current source density. A constant offset is kept. 0 keeps every sample. "
             "Press Refit to apply."
         )
 
@@ -287,6 +306,13 @@ class FitBar(QFrame):
         self.feedback.style().unpolish(self.feedback)
         self.feedback.style().polish(self.feedback)
 
+    def _reference_choice(self) -> str:
+        """The selected reference. A separator has no value and cannot be applied."""
+        chosen = self.reference.currentData()
+        if isinstance(chosen, str) and chosen:
+            return chosen
+        return "stored"
+
     def settings(self) -> FitSettings:
         t_start, t_length = TIME_PRESETS[self.time.currentIndex()][1:]
         if self.time.currentText() == "Custom":
@@ -317,7 +343,7 @@ class FitBar(QFrame):
             monotonicity=float(mono),
             min_n_cycles=int(min_cycles),
             amplitude_limit_uv=float(self.amplitude.value()),
-            reference=str(self.reference.currentData()),
+            reference=self._reference_choice(),
             epoch_s=None if self.epochs.currentData() is None else float(self.epochs.currentData()),
         )
 

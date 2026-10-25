@@ -5,6 +5,9 @@ eyes-closed/eyes-open comparison. All fourteen approved additions below now
 have working implementation paths in 0.2.0. The original requirements and
 baseline observations are retained after the delivery index for traceability.
 The running guide describes the actual menus, clocks, formulas and limitations.
+Reference, montage, amplitude-limit, global-scale, and figure behavior added
+in this same source tree is specified there. The fourteen items below are the
+review workspace as delivered.
 
 ## Delivery index
 

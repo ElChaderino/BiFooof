@@ -18,6 +18,8 @@ _SUFFIXES = [
 _PREFIXES = ["EEG ", "eeg ", "EEG", "POL ", "POL"]
 
 OLD_TO_MODERN = {"T3": "T7", "T4": "T8", "T5": "P7", "T6": "P8"}
+# Channel names that mean an ear or mastoid, rather than a scalp site.
+_EAR_ALIASES = {"LE": "A1", "EL": "A1", "RE": "A2", "ER": "A2", "T9": "M1", "T10": "M2"}
 
 STANDARD_19 = [
     "Fp1", "Fp2",
@@ -33,19 +35,16 @@ _AUX_TOKENS = (
 )
 
 
-def clean_channel_name(name: str) -> str:
-    """Return a channel name in standard modern 10-20 form."""
+def _stripped(name: str) -> str:
+    """Drop export prefixes and reference suffixes, without renaming T3–T6."""
     n = str(name).strip()
-
     for pref in _PREFIXES:
         if n.upper().startswith(pref.upper()):
             n = n[len(pref):].strip()
             break
-
     for suf in _SUFFIXES:
         n = re.sub(re.escape(suf), "", n, flags=re.IGNORECASE)
     n = n.strip().strip("-").strip()
-
     up = n.upper()
     if up == "FPZ":
         return "Fpz"
@@ -54,9 +53,30 @@ def clean_channel_name(name: str) -> str:
     if len(up) == 2 and up[1] == "Z":
         return up[0] + "z"
     if len(up) >= 2:
-        result = up[0] + up[1:].lower()
-        return OLD_TO_MODERN.get(result, result)
+        return up[0] + up[1:].lower()
     return n
+
+
+def clean_channel_name(name: str) -> str:
+    """Return a channel name in standard modern 10-20 form.
+
+    LE and RE are the left and right ears. T9 and T10 are the mastoids.
+    A suffix such as Fp1-LE is still Fp1, because the suffix is removed first.
+    """
+    token = _stripped(name)
+    renamed = OLD_TO_MODERN.get(token)
+    if renamed:
+        return renamed
+    ear = _EAR_ALIASES.get(token.upper())
+    if ear:
+        return ear
+    return token
+
+
+def already_modern(name: str) -> bool:
+    """True when the source label is already the modern name, not a T3–T6 or ear alias."""
+    token = _stripped(name)
+    return token not in OLD_TO_MODERN and token.upper() not in _EAR_ALIASES
 
 
 def is_auxiliary(name: str) -> bool:

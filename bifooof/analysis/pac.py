@@ -16,7 +16,7 @@ from ..io.recording import Recording
 from .cycles import _bandpass
 from .prepare import prepare_recording
 from .segments import accepted_runs
-from .settings import FitSettings
+from .settings import FitSettings, format_seconds
 
 
 @dataclass
@@ -43,10 +43,22 @@ class PacResult:
 
 def modulation_index(phase: np.ndarray, amplitude: np.ndarray, n_bins: int = 18) -> tuple[float, np.ndarray, np.ndarray]:
     """Tort's modulation index. Returns the index, the bin means, and the bin edges."""
-    edges = np.linspace(-np.pi, np.pi, int(n_bins) + 1)
+    n_bins = int(n_bins)
+    if n_bins < 2:
+        raise ValueError("The modulation index needs at least two phase bins.")
+    edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    phase = np.asarray(phase, dtype=np.float64).ravel()
+    amplitude = np.asarray(amplitude, dtype=np.float64).ravel()
+    if phase.shape != amplitude.shape:
+        raise ValueError("Phase and amplitude must be the same length.")
+    finite = np.isfinite(phase) & np.isfinite(amplitude)
+    phase = phase[finite]
+    amplitude = amplitude[finite]
+    means = np.zeros(n_bins, dtype=np.float64)
+    if phase.size == 0:
+        return float("nan"), means, edges
     which = np.digitize(phase, edges) - 1
     which = np.clip(which, 0, n_bins - 1)
-    means = np.zeros(n_bins, dtype=np.float64)
     for bin_index in range(n_bins):
         chosen = amplitude[which == bin_index]
         if chosen.size:
@@ -104,22 +116,27 @@ def phase_amplitude(
         prepared.mask(channel_index) & prepared.mask(amplitude_index)
         & np.isfinite(phase_signal) & np.isfinite(amp_signal)
     )
-    runs = [pair for pair in accepted_runs(mask) if pair[1] - pair[0] >= int(prepared.sfreq)]
+    all_runs = list(accepted_runs(mask))
+    runs = [pair for pair in all_runs if pair[1] - pair[0] >= int(prepared.sfreq)]
     if not runs:
         return _empty(phase_band, amp_band, n_surrogates, "No accepted stretch to measure.")
     start, stop = max(runs, key=lambda pair: pair[1] - pair[0])
     accepted_s = (stop - start) / prepared.sfreq
+    left_out = _left_out_note(all_runs, prepared.sfreq, start, stop)
     if accepted_s < float(minimum_s):
         return _empty(
             phase_band, amp_band, n_surrogates,
-            f"Needs about {float(minimum_s):.0f} s of accepted signal. This stretch is {accepted_s:.0f} s.",
+            (
+                f"Needs about {format_seconds(float(minimum_s))} s of accepted signal. "
+                f"This stretch is {format_seconds(accepted_s)} s.{left_out}"
+            ),
             accepted_s,
         )
     harmonic = _harmonic_reason(phase_band, amp_band)
     if harmonic and nonsinusoidal:
         return _empty(
             phase_band, amp_band, n_surrogates,
-            harmonic + " The current cycles are far from symmetric, so the index was not computed.",
+            harmonic + " The current cycles are far from symmetric, so the index was not computed." + left_out,
             accepted_s,
         )
     warnings = []
@@ -141,7 +158,10 @@ def phase_amplitude(
     if finite.size:
         mean = float(np.mean(finite))
         sd = float(np.std(finite))
-        p_value = float((np.sum(finite >= index) + 1) / (finite.size + 1))
+        # A missing index is not smaller than the surrogates. ``nan`` comparisons
+        # are false, which would otherwise report a p-value of 1 / (n + 1).
+        if np.isfinite(index):
+            p_value = float((np.sum(finite >= index) + 1) / (finite.size + 1))
     result = PacResult(
         mi=None if not np.isfinite(index) else float(index),
         surrogate_mean=mean,
@@ -156,6 +176,7 @@ def phase_amplitude(
         note=(
             "Surrogates are time shifts of the amplitude. "
             "A purely periodic envelope does not rise above them, because a shift only moves which phase bin is tall."
+            f"{left_out}"
         ),
         warnings=warnings,
         phase_channel=prepared.ch_names[channel_index],
@@ -177,9 +198,21 @@ def phase_amplitude(
             counted = f"{finite} of {result.n_cells} map cells"
         result.note = (
             "Surrogates are time shifts of the amplitude. "
-            f"{counted}. The map is not corrected across those cells."
+            f"{counted}. The map is not corrected across those cells.{left_out}"
         )
     return result
+
+
+def _left_out_note(runs: list[tuple[int, int]], sfreq: float, start: int, stop: int) -> str:
+    """Say when coupling used one stretch and left the others out."""
+    used = (stop - start) / float(sfreq)
+    others = sum(end - begin for begin, end in runs) / float(sfreq) - used
+    if others <= 0.05:
+        return ""
+    return (
+        f" The longest clean stretch is {format_seconds(used)} s. "
+        f"{format_seconds(others)} s in other stretches was left out."
+    )
 
 
 def _phase_and_amplitude(phase_signal, amp_signal, sfreq, phase_band, amp_band):

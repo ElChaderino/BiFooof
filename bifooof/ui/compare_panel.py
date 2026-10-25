@@ -14,11 +14,11 @@ from PySide6.QtWidgets import (
 from ..analysis.compare import BAND_CHANGE, ChannelComparison, alpha_peak, compare_spectra
 from ..analysis.cycles import CycleFit, fit_cycles
 from ..analysis.prepare import R2_WEAK
-from ..analysis.settings import FitSettings, band_label, band_phrase, matched_settings, reference_phrase
+from ..analysis.settings import FitSettings, band_label, band_phrase, format_hz, format_seconds, matched_settings, reference_phrase
 from ..analysis.specparam_fit import ChannelFit, SpectrumFit
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
-from ..plots import clear_figure, mark_spectrum, stamp_figure
+from ..plots import _power_label, clear_figure, mark_spectrum, stamp_figure
 from .canvas import MplCanvas, finish_figure, style_axes
 from .headmap import draw_head
 from .workers import CallWorker, launch, wait_for
@@ -176,6 +176,22 @@ class ComparePanel(QWidget):
     def shutdown(self) -> None:
         wait_for(self)
 
+    def _reference_sentence(self) -> str:
+        """Name the reference that was applied. A fallback is not described as the request."""
+        _left, _right, short_left, short_right = self._names()
+        chosen = []
+        for key, short in (("ec", short_left), ("eo", short_right)):
+            fit = self.fits.get(key)
+            if fit is None:
+                continue
+            applied = (fit.provenance or {}).get("reference_applied") or self.settings.reference
+            chosen.append((short, reference_phrase(str(applied))))
+        if not chosen:
+            return reference_phrase(self.settings.reference).capitalize() + "."
+        if len({phrase for _short, phrase in chosen}) == 1:
+            return chosen[0][1].capitalize() + "."
+        return " ".join(f"{short}: {phrase}." for short, phrase in chosen)
+
     def _names(self) -> tuple[str, str, str, str]:
         mode = self.mode.currentData()
         if mode == "pre":
@@ -230,8 +246,8 @@ class ComparePanel(QWidget):
             band_header.setToolTip(BAND_CHANGE)
         for index, tip in (
             (12, "Absolute difference between the two in-band center frequencies, in Hz."),
-            (13, f"specparam R² for {left.lower()}. Below 0.6 the site is ringed on the head map."),
-            (14, f"specparam R² for {right.lower()}. Below 0.6 the site is ringed on the head map."),
+            (13, f"specparam R² for {left.lower()}. Below 0.6 the site is a diamond on the head map."),
+            (14, f"specparam R² for {right.lower()}. Below 0.6 the site is a diamond on the head map."),
             (15, f"Closest {left.lower()} peak outside the band, and how far outside it sits. The band difference stays blank."),
             (16, f"Closest {right.lower()} peak outside the band, and how far outside it sits. The band difference stays blank."),
         ):
@@ -306,7 +322,7 @@ class ComparePanel(QWidget):
         _plot_condition(ax, ec_item, _EC, side_left, alpha)
         _plot_condition(ax, eo_item, _EO, side_right, alpha)
         ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("log10 power")
+        ax.set_ylabel(_power_label(*self.fits.values()))
         pair = "eyes closed vs eyes open" if self.mode.currentData() == "state" else f"{side_left} vs {side_right}"
         ax.set_title(
             f"{self.channel}   ·   {shown}\n{pair}",
@@ -320,15 +336,17 @@ class ComparePanel(QWidget):
         draw_head(
             fig.add_subplot(maps[0, 0]), names,
             [row.exponent_delta for row in self.rows],
-            f"Exponent\n{fmin:g}–{fmax:.0f} Hz  ·  {short_right} − {short_left}", "viridis", self.channel, weak,
+            f"Exponent\n{fmin:g}–{format_hz(fmax)} Hz  ·  {short_right} − {short_left}", "RdBu_r", self.channel, weak,
+            diverging=True, unit=f"{short_right} − {short_left}",
         )
         draw_head(
             fig.add_subplot(maps[1, 0]), names,
             [row.alpha_reactivity for row in self.rows],
-            f"{shown}\nPeak height  ·  {short_left} − {short_right}", "plasma", self.channel,
+            f"{shown}\nPeak height  ·  {short_left} − {short_right}", "RdBu_r", self.channel,
             [weak[index] or row.peak_at_floor_ec or row.peak_at_floor_eo for index, row in enumerate(self.rows)],
+            diverging=True, unit=f"{short_left} − {short_right}",
         )
-        _paired_dots(fig.add_subplot(curves[3, 0]), self.rows, side_left, side_right)
+        _paired_dots(fig.add_subplot(curves[3, 0]), self.rows, side_left, side_right, self.channel)
         stamp_figure(fig)
         self.canvas.draw_idle()
         chosen = next((row for row in self.rows if row.name == self.channel), None)
@@ -357,7 +375,7 @@ class ComparePanel(QWidget):
             "(above the aperiodic fit; a missing peak stays missing). "
             f"Δ band % {percent_text}: change in mean Welch power, ({short_left} − {short_right}) / {short_right}, "
             "not a share of the spectrum. "
-            f"Slope fit over {fmin:g}–{fmax:.0f} Hz. {reference_phrase(self.settings.reference).capitalize()}."
+            f"Slope fit over {fmin:g}–{format_hz(fmax)} Hz. {self._reference_sentence()}"
             f"{gap}{nearest}{quality}{_voltage_sentence(self.recordings)}{length}"
         )
 
@@ -417,11 +435,13 @@ class ComparePanel(QWidget):
         self.status.emit(detail)
 
     def _fill_cycles(self, eyes_closed: CycleFit | None, eyes_open: CycleFit | None) -> None:
+        units = {fit.unit for fit in (eyes_closed, eyes_open) if fit is not None}
+        voltage = f"Voltage ({units.pop()})" if len(units) == 1 else "Voltage"
         measures = [
             ("Period (ms)", "period_ms"),
             ("Rise–decay", "rise_decay"),
             ("Peak–trough", "peak_trough"),
-            ("Voltage (µV)", "volt_amp"),
+            (voltage, "volt_amp"),
             ("Burst cycles", "n_burst_cycles"),
             ("Burst episodes", "n_burst_episodes"),
             ("Burst time (s)", "burst_duration_s"),
@@ -454,32 +474,16 @@ class ComparePanel(QWidget):
         self.canvas.draw_idle()
 
 
-def _paired_dots(ax, rows, left: str, right: str) -> None:
+def _paired_dots(ax, rows, left: str, right: str, selected: str | None = None) -> None:
     """One point per side that has an in-band peak. A line needs both sides."""
+    from ..plots import _slope_rows
+
     ax.set_xlim(-0.35, 1.35)
     ax.set_xticks([0, 1], [left, right])
-    drawn = 0
-    for row in rows:
-        pair = []
-        xpos = []
-        if row.alpha_power_ec is not None and np.isfinite(row.alpha_power_ec):
-            pair.append(float(row.alpha_power_ec))
-            xpos.append(0)
-        if row.alpha_power_eo is not None and np.isfinite(row.alpha_power_eo):
-            pair.append(float(row.alpha_power_eo))
-            xpos.append(1)
-        if not pair:
-            continue
-        if len(pair) == 2:
-            ax.plot(xpos, pair, color="#9aafc4", lw=0.7, zorder=1)
-            drawn += 1
-        color = _EC if xpos[0] == 0 else _EO
-        ax.scatter([xpos[0]], [pair[0]], s=16, color=color, zorder=2, linewidths=0)
-        if len(pair) == 2:
-            ax.scatter([xpos[1]], [pair[1]], s=16, color=_EO, zorder=2, linewidths=0)
+    drawn = _slope_rows(ax, rows, selected)
     ax.set_ylabel("Peak height")
     ax.set_title(
-        f"{drawn} channels with paired peaks\nA missing peak is a single dot",
+        f"{drawn} paired channels. An open marker is one side only.",
         fontsize=9, loc="left",
     )
     style_axes(ax, grid=True)
@@ -535,7 +539,7 @@ def _quality_sentence(row: ChannelComparison | None) -> str:
         return ""
     notes = []
     if _weak(row.r_squared_ec) or _weak(row.r_squared_eo):
-        notes.append("a weak fit is ringed")
+        notes.append("a weak fit is marked with a diamond")
     if row.peak_at_floor_ec or row.peak_at_floor_eo:
         notes.append("a peak is at the narrowest allowed width")
     if not notes:
@@ -553,8 +557,8 @@ def _length_sentence(recordings: dict, fits: dict, settings: FitSettings) -> str
     if not ends:
         return ""
     return (
-        f" Files differ in length ({min(durations):.0f} s and {max(durations):.0f} s). "
-        f"This comparison uses the first {min(ends):.0f} s of each."
+        f" Files differ in length ({format_seconds(min(durations))} s and {format_seconds(max(durations))} s). "
+        f"This comparison uses the first {format_seconds(min(ends))} s of each."
     )
 
 

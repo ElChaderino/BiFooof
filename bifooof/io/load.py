@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from ..analysis.prepare import voltage_scale_note
-from .channels import clean_channel_name, is_auxiliary, match_standard_19
+from .channels import already_modern, clean_channel_name, is_auxiliary, match_standard_19
 from .sniff import sniff
 from .marks import describe_marks
 from .recording import Mark, Recording
@@ -144,14 +144,10 @@ def finalize(
         if clean_channel_name(raw_name) in bad_names:
             accepted[index, :] = False
 
-    kept_rows: list[int] = []
-    cleaned: list[str] = []
-    seen: set[str] = set()
     dropped_aux = 0
-    dropped_dup = 0
     if channel_types is not None and (not isinstance(channel_types, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in channel_types.items())):
         raise ValueError("channel_types must map channel names to type strings.")
-    analysis_types = {}
+    pending: list[tuple[int, str, str, str, bool]] = []
     for index, raw_name in enumerate(names):
         kind = (channel_types or {}).get(raw_name, "eeg").lower()
         if not channel_types:
@@ -165,13 +161,25 @@ def finalize(
         if not label or is_auxiliary(label):
             dropped_aux += 1
             continue
-        if label in seen:
-            dropped_dup += 1
+        pending.append((index, raw_name, label, kind, already_modern(raw_name)))
+    chosen: dict[str, tuple[int, str, str, bool]] = {}
+    for index, raw_name, label, kind, modern in pending:
+        current = chosen.get(label)
+        # A modern T7 wins over a T3 that only becomes T7 after renaming.
+        if current is None or (modern and not current[3]):
+            chosen[label] = (index, raw_name, kind, modern)
+    collision_notes = []
+    for index, raw_name, label, _kind, _modern in pending:
+        winner = chosen[label]
+        if winner[0] == index:
             continue
-        seen.add(label)
-        cleaned.append(label)
-        analysis_types[label] = kind
-        kept_rows.append(index)
+        collision_notes.append(
+            f"Set aside {raw_name} and kept {winner[1]}, both named {label} after cleaning."
+        )
+    kept_order = sorted(chosen, key=lambda label: chosen[label][0])
+    kept_rows = [chosen[label][0] for label in kept_order]
+    cleaned = list(kept_order)
+    analysis_types = {label: chosen[label][2] for label in kept_order}
 
     if not kept_rows:
         raise ValueError("No EEG channels remained after dropping annotation and marker channels.")
@@ -199,8 +207,7 @@ def finalize(
         notes.append("Retained all voltage channels; auxiliary and ear-reference channels are for trace review only.")
     if dropped_aux:
         notes.append(f"Dropped {dropped_aux} annotation or marker channel(s).")
-    if dropped_dup:
-        notes.append(f"Dropped {dropped_dup} duplicate channel(s) after renaming.")
+    notes.extend(collision_notes)
 
     kept_bad = [name for name in cleaned if name in bad_names]
     if kept_bad:
@@ -223,6 +230,7 @@ def finalize(
     if scale_note:
         notes.append(scale_note)
 
+    kept_source_names = {chosen[label][1] for label in cleaned if label in chosen}
     return Recording(
         data=array,
         ch_names=cleaned,
@@ -236,7 +244,8 @@ def finalize(
         reference_channels=reference_channels,
         import_info={"original_channels": list(names), "normalized_channels": [clean_channel_name(name) for name in names],
             "analysis_channel_types": analysis_types,
-            "included_channels": list(cleaned), "set_aside_channels": [name for name in names if clean_channel_name(name) not in cleaned],
+            "included_channels": list(cleaned),
+            "set_aside_channels": [name for name in names if name not in kept_source_names],
             "channel_policy": _channel_policy.get(), "source_units": "Unknown; converted input is in µV", "stored_reference": "Unknown"},
     )
 
@@ -244,11 +253,24 @@ def finalize(
 def _load_mne(path: Path, kind: str, display_path: Path | None = None) -> Recording:
     import mne
 
+    shown = display_path or path
+    if path.is_file() and path.stat().st_size == 0:
+        raise ValueError(f"{shown.name} is empty.")
     reader_name = _MNE_READERS[kind]
     reader = getattr(mne.io, reader_name)
-    raw = reader(str(path), preload=True, verbose="ERROR")
-    shown = display_path or path
+    try:
+        raw = reader(str(path), preload=True, verbose="ERROR")
+    except Exception as exc:
+        raise _load_error(shown, kind, exc) from exc
     return _recording_from_raw(raw, shown, kind)
+
+
+def _load_error(path: Path, kind: str, exc: Exception) -> ValueError:
+    """Turn a parser traceback into a sentence about this file."""
+    text = " ".join(str(exc).split())
+    if not text or "invalid literal for int()" in text:
+        return ValueError(f"{path.name} is not a readable {kind.upper()} recording.")
+    return ValueError(f"Could not read {path.name}: {text}")
 
 
 def _load_cnt(path: Path) -> Recording:
@@ -448,7 +470,10 @@ def _load_embedded_json(path: Path, meta: dict, sfreq: float | None) -> Recordin
     if not _positive(rate):
         raise ValueError("Embedded JSON requires sfreq.")
     names = [str(name) for name in meta.get("channel_names") or []]
-    data = np.asarray(meta["data"], dtype=np.float64)
+    try:
+        data = np.asarray(meta["data"], dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Embedded JSON rows must all have the same number of samples.") from exc
     if data.ndim != 2:
         raise ValueError("Embedded JSON 'data' must be a 2-D array.")
     notes: list[str] = []

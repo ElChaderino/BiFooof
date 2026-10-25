@@ -20,7 +20,7 @@ from scipy.signal import sawtooth
 from bifooof.analysis.coherence import coherence_pair
 from bifooof.analysis.compare import compare_pair
 from bifooof.analysis.cycles import BurstEpisode, fit_cycles
-from bifooof.analysis.pac import phase_amplitude
+from bifooof.analysis.pac import modulation_index, phase_amplitude
 from bifooof.analysis.quality import quality_spans
 from bifooof.analysis.settings import FitSettings
 from bifooof.analysis.shape import aligned_cycles, burst_stats, cycle_cloud
@@ -28,6 +28,7 @@ from bifooof.analysis.specparam_fit import ChannelFit, SpectrumFit, fit_spectra,
 from bifooof.analysis.timefreq import (
     SlidingFit,
     align_to_events,
+    block_band_power,
     channel_series,
     channel_spectrogram,
     exponent_spread,
@@ -36,7 +37,7 @@ from bifooof.analysis.timefreq import (
     window_at,
 )
 from bifooof.io.recording import Mark, Recording
-from bifooof.ui.time_panel import _reactivity
+from bifooof.ui.time_panel import _event_change, _job, _reactivity
 
 
 def _recording(data, names, sfreq, valid=None, marks=None) -> Recording:
@@ -108,6 +109,33 @@ class SpectrogramTests(unittest.TestCase):
         self.assertTrue(blank)
         self.assertTrue(all(3.2 < moment < 4.8 for moment in blank))
 
+    def test_a_short_window_is_refused_and_a_low_rate_is_explained(self):
+        sfreq = 200.0
+        times = np.arange(int(4.0 * sfreq)) / sfreq
+        recording = _recording(np.sin(2 * np.pi * 10.0 * times), ["Cz"], sfreq)
+        with self.assertRaises(ValueError) as caught:
+            channel_spectrogram(recording, _settings(), 0, window_s=0.05)
+        self.assertIn("16", str(caught.exception))
+        slow = _recording(
+            np.sin(2 * np.pi * 10.0 * np.arange(int(8.0 * 64.0)) / 64.0),
+            ["Cz"], 64.0,
+        )
+        result = channel_spectrogram(slow, _settings(), 0, window_s=2.0, overlap=0.5)
+        self.assertLessEqual(float(result.freqs_hz[-1]), 31.5)
+        self.assertIn("brought down", result.notes)
+        self.assertIn("31.5", result.notes)
+        self.assertIn("Frequency bins", result.notes)
+
+    def test_a_short_stretch_is_named_when_the_spectrogram_skips_it(self):
+        sfreq = 256.0
+        head = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(int(4.0 * sfreq)) / sfreq)
+        tail = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(int(0.4 * sfreq)) / sfreq)
+        signal = np.concatenate([head, np.full(int(0.5 * sfreq), np.nan), tail])
+        result = channel_spectrogram(_recording(signal, ["Cz"], sfreq), _settings(), 0, window_s=1.0, overlap=0.5)
+        self.assertLess(float(result.times_s[-1]), 4.2)
+        self.assertIn("0.4 s", result.notes)
+        self.assertIn("left out", result.notes)
+
 
 class SlidingTests(unittest.TestCase):
     def test_a_peak_can_appear_without_a_large_exponent_step(self):
@@ -129,6 +157,58 @@ class SlidingTests(unittest.TestCase):
         self.assertFalse(np.isfinite(series.peak_height[0]))
         self.assertGreater(series.peak_height[1], 0.15)
         self.assertLess(abs(series.exponent[1] - series.exponent[0]), float(series.peak_height[1]))
+
+    def test_a_low_rate_keeps_the_sampling_note_on_the_sliding_result(self):
+        sfreq = 64.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        recording = _recording(20.0 * np.sin(2 * np.pi * 10.0 * times), ["Cz"], sfreq)
+        sliding = sliding_spectra(recording, _settings(), window_s=30.0, overlap=0.0, channel_index=0)
+        self.assertEqual(len(sliding.windows), 1)
+        self.assertIn("Shorter than 30", sliding.notes)
+        self.assertIn("brought down", sliding.notes)
+        self.assertIn("31.5", sliding.notes)
+        self.assertEqual(sliding.notes.count("brought down"), 1)
+        fractional = sliding_spectra(
+            _recording(np.zeros(32), ["Cz"], 64.0),
+            _settings(), window_s=2.5, overlap=0.0, channel_index=0,
+        )
+        self.assertIn("Shorter than 2.5", fractional.notes)
+        self.assertNotIn("Shorter than 2 s", fractional.notes)
+        self.assertNotIn("Shorter than 3", fractional.notes)
+
+    def test_a_spike_counts_as_rejected_and_a_missing_sample_does_too(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        signal = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        signal = signal.copy()
+        signal[(times >= 3.0) & (times < 4.0)] = 5000.0
+        spiked = sliding_spectra(
+            _recording(signal, ["Cz"], sfreq),
+            _settings(amplitude_limit_uv=500.0),
+            window_s=8.0, overlap=0.0, channel_index=0,
+        )
+        fraction = spiked.channel_artifact[0]["Cz"]
+        self.assertGreater(fraction, 0.1)
+        self.assertLess(fraction, 0.2)
+        missing = signal.copy()
+        missing[(times >= 3.0) & (times < 4.0)] = np.nan
+        blank = sliding_spectra(
+            _recording(missing, ["Cz"], sfreq),
+            _settings(amplitude_limit_uv=0.0),
+            window_s=8.0, overlap=0.0, channel_index=0,
+        )
+        self.assertGreater(blank.channel_artifact[0]["Cz"], 0.1)
+
+    def test_the_uncovered_tail_of_a_sliding_window_is_named(self):
+        sfreq = 256.0
+        times = np.arange(int(10.0 * sfreq)) / sfreq
+        sliding = sliding_spectra(
+            _recording(20.0 * np.sin(2 * np.pi * 10.0 * times), ["Cz"], sfreq),
+            _settings(), window_s=6.0, overlap=0.0, channel_index=0,
+        )
+        self.assertEqual([(window.t_start, window.t_end) for window in sliding.windows], [(0.0, 6.0)])
+        self.assertIn("last 4", sliding.notes)
+        self.assertIn("left out", sliding.notes)
 
     def test_tracks_follow_an_alpha_tone_and_ignore_a_beta_tone(self):
         windows = []
@@ -232,7 +312,7 @@ class SlidingTests(unittest.TestCase):
         series = channel_series(sliding, "O1", (8.0, 12.0))
         figure = Figure()
         draw_trajectory(figure, series, [], "", (chosen, chosen.channels[0], ""), (22.0, 10.0))
-        self.assertIn("log10 power", [ax.get_ylabel() for ax in figure.axes])
+        self.assertTrue(any(label.startswith("log10 power (") for label in (ax.get_ylabel() for ax in figure.axes)))
         titles = " ".join(ax.get_title(loc="left") for ax in figure.axes)
         self.assertIn("20", titles)
         self.assertIn("30", titles)
@@ -362,6 +442,27 @@ class ReactivityTests(unittest.TestCase):
         self.assertEqual(separate["kind"], "separate")
         self.assertNotIn("curves", separate)
         self.assertIn("no transition", separate["note"])
+        small = _event_change(np.array([-2.0, -1.0, 1.0, 2.0]), np.array([[1.0, 1.0, 1.004, 1.004]]))
+        self.assertIn("about the same", small)
+        self.assertNotIn("+0%", small)
+        clear = _event_change(np.array([-2.0, -1.0, 1.0, 2.0]), np.array([[1.0, 1.0, 1.125, 1.125]]))
+        self.assertIn("+12.5%", clear)
+
+    def test_a_channel_that_cannot_be_measured_is_named(self):
+        ear = Recording(np.zeros((1, 64)), ["A1"], 256.0, "ear.csv", "csv")
+        with self.assertRaises(ValueError) as caught:
+            _job("raster", ear, _settings(), 0, {"every": False, "band": (8.0, 12.0), "indexes": None})
+        self.assertIn("auxiliary", str(caught.exception).lower())
+        self.assertNotIn("No burst", str(caught.exception))
+        fast = Recording(np.zeros((1, 64)), ["O1"], 64.0, "fast.csv", "csv")
+        with self.assertRaises(ValueError) as high:
+            _job("raster", fast, _settings(), 0, {"every": False, "band": (30.0, 45.0), "indexes": None})
+        self.assertIn("Nyquist", str(high.exception))
+        mixed = Recording(np.zeros((2, 64)), ["A1", "O1"], 256.0, "mixed.csv", "csv")
+        fits = _job("raster", mixed, _settings(amplitude_limit_uv=0), 0, {
+            "every": False, "band": (8.0, 12.0), "indexes": [0, 1],
+        })
+        self.assertEqual([item.channel for item in fits], ["O1"])
 
     def test_a_gap_between_samples_does_not_become_the_step(self):
         times = np.concatenate([np.arange(0.0, 10.0, 1.0), np.arange(80.0, 90.0, 1.0)])
@@ -390,6 +491,58 @@ class CoherenceTests(unittest.TestCase):
         at_ten = int(np.argmin(np.abs(coupled.freqs_hz - 10.0)))
         self.assertGreater(coupled.coherence[at_ten], 0.8)
         self.assertGreater(peak, noise_peak * 2.0)
+
+    def test_a_short_segment_is_refused_and_a_low_rate_is_explained(self):
+        sfreq = 64.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        tone = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        recording = _recording(np.vstack([tone, tone]), ["C3", "C4"], sfreq)
+        with self.assertRaises(ValueError) as caught:
+            coherence_pair(recording, _settings(segment_s=0.1), 0, 1)
+        self.assertIn("16", str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            coherence_pair(recording, _settings(fmin=36, fmax=40), 0, 1)
+        self.assertIn("cannot cover", str(caught.exception))
+        result = coherence_pair(recording, _settings(segment_s=2), 0, 1)
+        self.assertLessEqual(float(result.freqs_hz[-1]), 31.5)
+        self.assertIn("brought down", result.note)
+        self.assertIn("31.5", result.note)
+
+    def test_a_short_shared_stretch_is_named_when_coherence_skips_it(self):
+        sfreq = 256.0
+        head = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(int(4.0 * sfreq)) / sfreq)
+        tail = 20.0 * np.sin(2 * np.pi * 10.0 * np.arange(int(0.4 * sfreq)) / sfreq)
+        signal = np.vstack([
+            np.concatenate([head, np.full(int(0.5 * sfreq), np.nan), tail]),
+            np.concatenate([head, np.full(int(0.5 * sfreq), np.nan), tail]),
+        ])
+        result = coherence_pair(
+            _recording(signal, ["C3", "C4"], sfreq),
+            _settings(segment_s=2.0), 0, 1,
+        )
+        self.assertIn("0.4 s", result.note)
+        self.assertIn("left out", result.note)
+        self.assertAlmostEqual(result.accepted_s, 4.0, places=2)
+
+    def test_a_missing_reference_is_named_as_the_one_applied(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        tone = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        result = coherence_pair(
+            _recording(np.vstack([tone, tone]), ["C3", "C4"], sfreq),
+            _settings(reference="linked", segment_s=2.0), 0, 1,
+        )
+        self.assertEqual(result.reference, "stored")
+        self.assertIn("stored reference was kept", result.note)
+
+    def test_a_silent_pair_does_not_draw_a_phase_of_zero(self):
+        sfreq = 256.0
+        silent = np.zeros((2, int(8.0 * sfreq)))
+        result = coherence_pair(
+            _recording(silent, ["C3", "C4"], sfreq),
+            _settings(segment_s=2.0), 0, 1,
+        )
+        self.assertTrue(np.isnan(result.phase_deg).all())
 
 
 class CouplingTests(unittest.TestCase):
@@ -422,6 +575,48 @@ class CouplingTests(unittest.TestCase):
             # Both sides are numerical zeros. A pure time shift does not create a peak.
             floor = max(float(result.surrogate_sd), 1e-4)
             self.assertLess(result.mi, result.surrogate_mean + 2.0 * floor)
+
+    def test_a_missing_phase_sample_stays_out_of_the_first_bin(self):
+        phase = np.linspace(-np.pi, np.pi, 180, endpoint=False)
+        amplitude = np.ones(phase.shape)
+        phase_nan = phase.copy()
+        amplitude_nan = amplitude.copy()
+        phase_nan[::9] = np.nan
+        amplitude_nan[::9] = 1.0e6
+        kept = np.isfinite(phase_nan)
+        reference, _means, _edges = modulation_index(phase[kept], amplitude[kept])
+        dirty, means, _edges = modulation_index(phase_nan, amplitude_nan)
+        self.assertAlmostEqual(dirty, reference, places=6)
+        self.assertLess(float(means[0]), 10.0)
+
+    def test_a_missing_index_is_not_a_small_p_value(self):
+        from bifooof.analysis import pac
+
+        sfreq = 250.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        tone = np.sin(2 * np.pi * 6.0 * times) + np.sin(2 * np.pi * 40.0 * times)
+        original = pac.modulation_index
+        calls = {"n": 0}
+
+        def wrapped(phase, amplitude, n_bins=18):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                edges = np.linspace(-np.pi, np.pi, int(n_bins) + 1)
+                return float("nan"), np.zeros(int(n_bins)), edges
+            return original(phase, amplitude, n_bins)
+
+        pac.modulation_index = wrapped
+        try:
+            result = phase_amplitude(
+                _recording(tone, ["Cz"], sfreq), _settings(), 0,
+                (4.0, 9.0), (30.0, 50.0), n_surrogates=8, minimum_s=4.0, seed=1,
+            )
+        finally:
+            pac.modulation_index = original
+        self.assertIsNone(result.mi)
+        self.assertIsNone(result.p_value)
+        self.assertIsNotNone(result.surrogate_mean)
+        self.assertGreater(result.n_surrogates, 0)
 
     def test_a_harmonic_in_the_amplitude_band_is_not_computed(self):
         sfreq = 200.0
@@ -484,6 +679,76 @@ class CouplingTests(unittest.TestCase):
         self.assertIn("4 cells, uncorrected", titles)
 
 
+    def test_a_second_stretch_is_named_when_coupling_uses_the_longest(self):
+        sfreq = 200.0
+        tone = np.sin(2 * np.pi * 6.0 * np.arange(int(8.0 * sfreq)) / sfreq)
+        gap = np.full(int(2.0 * sfreq), np.nan)
+        signal = np.concatenate([tone, gap, tone])
+        recording = _recording(signal, ["Cz"], sfreq)
+        result = phase_amplitude(
+            recording, _settings(), 0, (4.0, 8.0), (30.0, 50.0),
+            n_surrogates=0, minimum_s=4.0,
+        )
+        self.assertIn("left out", result.note)
+        self.assertIn("8 s", result.note)
+        short = phase_amplitude(
+            recording, _settings(), 0, (4.0, 8.0), (30.0, 50.0),
+            n_surrogates=0, minimum_s=30.0,
+        )
+        self.assertIsNone(short.mi)
+        self.assertIn("left out", short.note)
+
+    def test_a_short_or_fractional_stretch_keeps_its_length(self):
+        sfreq = 256.0
+        tone = np.sin(2 * np.pi * 6.0 * np.arange(int(8.0 * sfreq)) / sfreq)
+        gap = np.full(int(0.5 * sfreq), np.nan)
+
+        def measure(seconds: float):
+            extra = np.sin(2 * np.pi * 6.0 * np.arange(int(round(seconds * sfreq))) / sfreq)
+            return phase_amplitude(
+                _recording(np.concatenate([tone, gap, extra]), ["Cz"], sfreq),
+                _settings(), 0, (4.0, 8.0), (30.0, 50.0),
+                n_surrogates=0, minimum_s=30.0,
+            )
+
+        fractional = measure(1.4)
+        self.assertIn("1.4 s", fractional.note)
+        self.assertIn("left out", fractional.note)
+        self.assertNotIn("1 s in other", fractional.note)
+        brief = measure(0.4)
+        self.assertIn("0.4 s", brief.note)
+        self.assertIn("left out", brief.note)
+
+    def test_a_band_above_the_sampling_rate_is_refused_and_a_partial_one_is_named(self):
+        sfreq = 64.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        recording = _recording(20.0 * np.sin(2 * np.pi * 10.0 * times), ["Cz"], sfreq)
+        with self.assertRaises(ValueError) as caught:
+            block_band_power(recording, _settings(), 0, (40.0, 45.0), 2.0, 0.5)
+        self.assertIn("no power", str(caught.exception))
+        short = _recording(
+            20.0 * np.sin(2 * np.pi * 10.0 * np.arange(int(64.0)) / 64.0),
+            ["Cz"], 64.0,
+        )
+        with self.assertRaises(ValueError) as caught:
+            block_band_power(short, _settings(), 0, (8.0, 12.0), 2.0, 0.5)
+        self.assertIn("longer than", str(caught.exception))
+        result = _reactivity(recording, _settings(), 0, {"band": (30.0, 45.0), "channel": "Cz"})
+        self.assertIn("brought down", result["note"])
+        self.assertIn("31.5", result["note"])
+
+    def test_a_short_run_says_why_there_are_no_cycles(self):
+        sfreq = 256.0
+        times = np.arange(int(0.4 * sfreq)) / sfreq
+        fit = fit_cycles(
+            _recording(20.0 * np.sin(2 * np.pi * 10.0 * times), ["Cz"], sfreq),
+            0, (8.0, 12.0), _settings(),
+        )
+        self.assertEqual(fit.n_cycles, 0)
+        self.assertIn("long enough", fit.notes)
+        self.assertIn("1 s", fit.notes)
+
+
 class QualityTests(unittest.TestCase):
     def test_clip_flat_and_a_step_are_marked_and_a_sine_is_not(self):
         sfreq = 256.0
@@ -502,6 +767,64 @@ class QualityTests(unittest.TestCase):
         clean = 25.0 * np.sin(2 * np.pi * 10.0 * times)
         detected = [span for span in quality_spans(_recording(clean, ["Cz"], sfreq), limit_uv=500.0) if span.level == "detected"]
         self.assertEqual(detected, [])
+
+    def test_an_offset_is_not_an_amplitude_span_and_a_spike_is(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        sine = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        offset = quality_spans(_recording(2000.0 + sine, ["Cz"], sfreq), limit_uv=500.0)
+        self.assertFalse(any(span.kind == "amplitude" for span in offset))
+        drift = np.linspace(0.0, 2000.0, times.size) + sine
+        wandered = quality_spans(_recording(drift, ["Cz"], sfreq), limit_uv=500.0)
+        self.assertFalse(any(span.kind == "amplitude" for span in wandered))
+        spiked = sine.copy()
+        spiked[(times >= 3.0) & (times < 4.0)] = 5000.0
+        self.assertTrue(_covers(quality_spans(_recording(spiked, ["Cz"], sfreq), limit_uv=500.0), "amplitude", 3.0, 4.0))
+        flat = quality_spans(_recording(np.full(times.shape, 5000.0), ["Cz"], sfreq), limit_uv=500.0)
+        self.assertTrue(any(span.kind == "amplitude" and span.note.endswith("of the trend.") for span in flat))
+        self.assertTrue(any(span.kind == "amplitude" and span.end_s - span.start_s > 7.0 for span in flat))
+
+    def test_a_sine_is_not_muscle_mains_or_drift_and_a_line_and_a_hum_are(self):
+        sfreq = 256.0
+        times = np.arange(int(8.0 * sfreq)) / sfreq
+        sine = 400.0 * np.sin(2 * np.pi * 10.0 * times)
+        kinds = {span.kind for span in quality_spans(_recording(sine, ["Cz"], sfreq), limit_uv=0.0)}
+        self.assertFalse(kinds & {"muscle", "mains", "drift"})
+        hum = 40.0 * np.sin(2 * np.pi * 60.0 * times)
+        hum_kinds = {span.kind for span in quality_spans(_recording(hum, ["Cz"], sfreq), limit_uv=0.0)}
+        self.assertIn("mains", hum_kinds)
+        self.assertNotIn("muscle", hum_kinds)
+        ramp = np.linspace(0.0, 800.0, times.size)
+        self.assertTrue(any(span.kind == "drift" for span in quality_spans(_recording(ramp, ["Cz"], sfreq), limit_uv=0.0)))
+        noise = np.convolve(np.random.default_rng(0).normal(0.0, 30.0, times.size), [1.0, -1.0], mode="same")
+        self.assertTrue(any(span.kind == "muscle" for span in quality_spans(_recording(noise, ["Cz"], sfreq), limit_uv=0.0)))
+
+    def test_an_excluded_ear_is_not_subtracted_from_the_scalp(self):
+        from bifooof.analysis.prepare import apply_reference
+        from bifooof.analysis.quality import QualitySpan, mask_spans
+
+        sfreq = 256.0
+        times = np.arange(int(4.0 * sfreq)) / sfreq
+        occipital = 20.0 * np.sin(2 * np.pi * 10.0 * times)
+        left = np.zeros_like(times)
+        right = np.zeros_like(times)
+        left[(times >= 1.0) & (times < 1.5)] = 200.0
+        recording = Recording(
+            np.vstack([occipital, left, right]), ["O1", "A1", "A2"], sfreq, "ears.csv", "csv",
+            reference_channels={"A1": left.copy(), "A2": right.copy()},
+        )
+        masked = mask_spans(recording, [QualitySpan("A1", 1.0, 1.5, "user", "confirmed", "artifact")])
+        chosen = (times >= 1.0) & (times < 1.5)
+        self.assertTrue(np.isnan(masked.reference_channels["A1"][chosen]).all())
+        self.assertTrue(np.isfinite(masked.reference_channels["A2"][chosen]).all())
+        linked = apply_reference(masked, "linked", 500.0)
+        self.assertTrue(np.isnan(linked.data[0, chosen]).all())
+        self.assertLess(float(np.nanmax(np.abs(linked.data[0, ~chosen]))), 30.0)
+        kept = mask_spans(recording, [QualitySpan("O1", 1.0, 1.5, "user", "confirmed", "artifact")])
+        self.assertTrue(np.isfinite(kept.reference_channels["A1"][chosen]).all())
+        everything = mask_spans(recording, [QualitySpan("*", 1.0, 1.5, "user", "confirmed", "artifact")])
+        self.assertTrue(np.isnan(everything.reference_channels["A1"][chosen]).all())
+        self.assertTrue(np.isnan(everything.reference_channels["A2"][chosen]).all())
 
 
 class ResidualTests(unittest.TestCase):
@@ -548,6 +871,150 @@ def _finite_median(curves: np.ndarray) -> np.ndarray:
         if column.size:
             median[index] = float(np.median(column))
     return median
+
+
+class FigureDrawTests(unittest.TestCase):
+    def test_the_time_figures_name_their_axes(self):
+        from matplotlib.figure import Figure
+
+        from bifooof.analysis.cycles import BurstEpisode
+        from bifooof.analysis.pac import PacResult
+        from bifooof.analysis.quality import QualitySpan
+        from bifooof.analysis.timefreq import PeakTrack, Spectrogram
+        from bifooof.ui.time_draw import draw_pac, draw_quality, draw_shape, draw_spectrogram
+
+        spec = Spectrogram(
+            channel="O1", channel_index=0,
+            times_s=np.array([0.0, 0.5, 1.0]),
+            freqs_hz=np.array([4.0, 8.0, 12.0]),
+            power_db=np.array([[1.0, 2.0, 1.5], [0.4, 1.2, 0.8], [0.2, 0.3, 0.25]]),
+            window_s=1.0, overlap=0.5, nperseg=64, noverlap=32,
+            df_hz=4.0, dt_s=0.5, t_start=0.0, t_end=1.0, power_unit="µV²/(m⁴·Hz)",
+        )
+        spectrum = Figure()
+        draw_spectrogram(
+            spectrum, spec,
+            [BurstEpisode(0.1, 0.6, 3, 100.0, 12.0)],
+            None,
+            (np.linspace(0.0, 1.0, 16), np.sin(np.linspace(0.0, 1.0, 16))),
+            tracks=[PeakTrack(times=[0.2, 0.8], centers=[10.0, 10.5], heights=[0.4, 0.5])],
+            trace_unit="µV/m²",
+        )
+        labels = [ax.get_ylabel() for ax in spectrum.axes]
+        self.assertTrue(spectrum.axes)
+        self.assertIn("O1", spectrum.axes[0].get_title(loc="left"))
+        self.assertIn("Frequency (Hz)", labels)
+        self.assertIn("µV/m²", labels)
+        self.assertTrue(any("dB re 1" in label and "m⁴" in label for label in labels))
+        legend = [text.get_text() for text in spectrum.axes[0].get_legend().get_texts()]
+        self.assertIn("Burst", legend)
+        self.assertIn("Peak track", legend)
+
+        sfreq = 256.0
+        times = np.arange(int(3.0 * sfreq)) / sfreq
+        wave = 20.0 * np.sin(2.0 * np.pi * 10.0 * times)
+        cycles = fit_cycles(_recording(wave, ["Cz"], sfreq), 0, (8.0, 12.0), _settings())
+        cycles.unit = "scaled µV"
+        shape = Figure()
+        draw_shape(shape, cycles, "trough", False, False)
+        self.assertTrue(shape.axes)
+        self.assertEqual(shape.axes[0].get_ylabel(), "scaled µV")
+        self.assertIn("Cz", shape.axes[0].get_title(loc="left"))
+        self.assertIn("10–90%", [text.get_text() for text in shape.axes[0].get_legend().get_texts()])
+
+        coupling = PacResult(
+            mi=0.1, surrogate_mean=0.02, surrogate_sd=0.01, p_value=0.4, n_surrogates=10,
+            phase_band=(4.0, 8.0), amp_band=(30.0, 50.0),
+            histogram=np.ones(4), bin_edges=np.linspace(-np.pi, np.pi, 5),
+            comodulogram=np.ones((3, 3)),
+            phase_centers=np.array([4.0, 6.0, 8.0]),
+            amp_centers=np.array([30.0, 40.0, 50.0]),
+            phase_channel="O1", amplitude_channel="O2",
+        )
+        pac = Figure()
+        draw_pac(pac, coupling)
+        self.assertTrue(pac.axes)
+        self.assertEqual(pac.axes[1].get_ylabel(), "Amplitude frequency (Hz)")
+        self.assertIn("O1", pac.axes[1].get_title(loc="left"))
+        bands = [text.get_text() for text in pac.axes[1].get_legend().get_texts()]
+        self.assertIn("Phase band", bands)
+        self.assertIn("Amplitude band", bands)
+
+        quality = Figure()
+        draw_quality(quality, ["O1"], [
+            QualitySpan("O1", 1.0, 2.0, "amplitude", "detected", ""),
+            QualitySpan("O1", 1.2, 2.2, "amplitude", "detected", ""),
+            QualitySpan("O1", 3.0, 3.5, "muscle", "suspected", ""),
+        ], None)
+        self.assertTrue(quality.axes)
+        self.assertIn("stripe", quality.axes[0].get_title(loc="left"))
+        self.assertEqual(quality.axes[0].get_xlabel(), "Time (s)")
+        self.assertGreaterEqual(len(quality.axes[0].patches), 3)
+        named = [text.get_text() for text in quality.axes[0].get_legend().get_texts()]
+        self.assertIn("amplitude", named)
+        self.assertIn("muscle", named)
+
+    def test_the_remaining_time_figures_keep_a_readable_axis(self):
+        from matplotlib.figure import Figure
+
+        from bifooof.analysis.cycles import BurstEpisode, CycleFit
+        from bifooof.analysis.timefreq import ChannelSeries
+        from bifooof.ui.time_draw import draw_raster, draw_scatter, draw_trajectory
+
+        series = ChannelSeries(
+            channel="O1",
+            times_s=np.array([0.0, 1.0, 2.0]),
+            exponent=np.array([1.0, 1.2, 1.1]),
+            offset=np.zeros(3),
+            peak_hz=np.array([10.0, 10.2, 9.8]),
+            peak_height=np.array([0.4, 0.3, 0.5]),
+            peak_bandwidth=np.ones(3),
+            r_squared=np.array([0.9, 0.4, 0.95]),
+            weak=np.array([False, True, False]),
+            at_floor=np.zeros(3, dtype=bool),
+            artifact_fraction=np.zeros(3),
+        )
+        trajectory = Figure()
+        draw_trajectory(trajectory, series, [], "three windows", window=None, inspection=None)
+        self.assertGreaterEqual(len(trajectory.axes), 3)
+        labels = [ax.get_ylabel() for ax in trajectory.axes]
+        self.assertIn("Exponent", labels)
+        self.assertIn("Peak height (log10)", labels)
+        self.assertIn("Peak frequency (Hz)", labels)
+        self.assertIn("O1", trajectory.axes[0].get_title(loc="left"))
+        weak = trajectory.axes[0].get_legend()
+        self.assertIsNotNone(weak)
+        self.assertIn("Weak fit", [text.get_text() for text in weak.get_texts()])
+
+        fit = CycleFit(
+            channel="O1", channel_index=0, band=(8.0, 12.0), sfreq=256.0,
+            filtered=np.zeros(8), n_cycles=2, n_burst_cycles=1, n_burst_episodes=2,
+            burst_duration_s=1.0, burst_fraction=0.2, period_ms=100.0, rise_decay=0.5,
+            peak_trough=0.5, volt_amp=10.0, burst_period_ms=100.0, burst_rise_decay=0.5,
+            burst_peak_trough=0.5, burst_volt_amp=10.0, unit="µV/m²",
+            episodes=[
+                BurstEpisode(0.0, 0.4, 3, 100.0, 12.0),
+                BurstEpisode(1.0, 1.4, 3, 100.0, None),
+            ],
+            cycles=[
+                {"period_ms": 100.0, "volt_amp": 12.0, "is_burst": True},
+                {"period_ms": 110.0, "volt_amp": 8.0, "is_burst": False},
+            ],
+        )
+        raster = Figure()
+        draw_raster(raster, [fit], None)
+        self.assertTrue(raster.axes)
+        self.assertEqual(raster.axes[0].get_xlabel(), "Time (s)")
+        self.assertIn("O1", [tick.get_text() for tick in raster.axes[0].get_yticklabels()])
+        self.assertTrue(any("µV/m²" in ax.get_ylabel() for ax in raster.axes))
+        self.assertIn("No amplitude", [text.get_text() for text in raster.axes[0].get_legend().get_texts()])
+
+        cloud = Figure()
+        draw_scatter(cloud, [("Eyes closed", fit, "#1c4e78")], False)
+        self.assertTrue(cloud.axes)
+        self.assertIn("central 96%", cloud.axes[0].get_xlabel())
+        self.assertIn("µV/m²", cloud.axes[0].get_ylabel())
+        self.assertIn("O1", cloud.axes[0].get_title(loc="left"))
 
 
 def _covers(spans, kind: str, start: float, end: float) -> bool:

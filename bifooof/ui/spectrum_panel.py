@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 
 from ..analysis.compare import alpha_peak
 from ..analysis.prepare import R2_WEAK, peak_at_width_floor
-from ..analysis.settings import FitSettings, matched_settings, reference_phrase
+from ..analysis.settings import FitSettings, format_hz, format_seconds, matched_settings, reference_phrase
 from ..analysis.specparam_fit import SpectrumFit, epochs_for_peak, fit_spectra
 from ..io.condition import CONDITION_LABELS
 from ..io.recording import Recording
@@ -285,21 +285,21 @@ class SpectrumPanel(QWidget):
                 knee_hz = np.exp(np.log(item.knee) / item.exponent)
             if np.isfinite(knee_hz) and knee_hz > 0:
                 knee = f"  ·  knee {knee_hz:.1f} Hz"
-        window = f"{self.fit.t_start:.0f}–{self.fit.t_end:.0f} s"
-        span = f"{self.fit.fmin:g}–{self.fit.fmax:.0f} Hz"
+        window = f"{format_seconds(self.fit.t_start)}–{format_seconds(self.fit.t_end)} s"
+        span = f"{self.fit.fmin:g}–{format_hz(self.fit.fmax)} Hz"
         notes = []
         if self.fit.epoch_s and item.n_epochs:
             count = epochs_for_peak(item, band_peak)
             if band_peak is not None and count:
                 note = (
                     f"that in-band peak is in {count} of {item.n_epochs} "
-                    f"epochs of {self.fit.epoch_s:.0f} s"
+                    f"epochs of {format_seconds(self.fit.epoch_s)} s"
                 )
                 if count < item.n_epochs:
                     note += ". Its height is the median of those epochs, not lowered by the epochs that missed it"
                 notes.append(note)
             else:
-                notes.append(f"no in-band peak in {item.n_epochs} epochs of {self.fit.epoch_s:.0f} s")
+                notes.append(f"no in-band peak in {item.n_epochs} epochs of {format_seconds(self.fit.epoch_s)} s")
         floor_peak = band_peak or tallest
         if floor_peak is not None and peak_at_width_floor(floor_peak[2], self.settings.peak_width_low):
             notes.append("peak width is at the narrowest allowed")
@@ -310,12 +310,13 @@ class SpectrumPanel(QWidget):
             and self.settings.t_length is None
             and self.fit.t_end + 1.0 < self.recording.duration_s
         ):
-            notes.append(f"matched to the shorter file, {self.fit.t_end:.0f} s")
+            notes.append(f"matched to the shorter file, {format_seconds(self.fit.t_end)} s")
         if self.fit.notes:
             notes.append(self.fit.notes)
         if self.recording is not None and any("microvolts" in note for note in self.recording.notes):
             notes.append("check voltage")
-        notes.append(reference_phrase(self.settings.reference))
+        applied = (self.fit.provenance or {}).get("reference_applied") or self.settings.reference
+        notes.append(reference_phrase(str(applied)))
         if self._mark_hz is not None and item.freqs is not None and item.spectrum is not None and item.model is not None:
             nearest = int(np.argmin(np.abs(item.freqs - self._mark_hz)))
             notes.append(

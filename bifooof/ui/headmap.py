@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from matplotlib import patheffects
 
 # Unit-circle positions, nose at the top. Legacy temporal names share the modern site.
 HEAD: dict[str, tuple[float, float]] = {
@@ -22,7 +23,8 @@ HEAD["T6"] = HEAD["P8"]
 
 def draw_head(ax, names: list[str], values: list[float | None], title: str,
               cmap: str, selected: str | None = None, marked: list[bool] | None = None,
-              limits: tuple[float, float] | None = None) -> None:
+              limits: tuple[float, float] | None = None, diverging: bool = False,
+              unit: str = "") -> None:
     """Draw one parameter on a 10-20 head. Channels outside the montage are skipped."""
     theta = np.linspace(0, 2 * np.pi, 256)
     ax.plot(np.cos(theta), np.sin(theta), color="#16232f", lw=1.0)
@@ -38,7 +40,7 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
                 ax.scatter([x], [y], s=130, color="#d5dde6", zorder=2)
                 _ring(ax, name, x, y, selected)
                 _mark(ax, name, x, y, names, marked)
-                ax.annotate(name, (x, y), ha="center", va="center", fontsize=8, color="#16232f")
+                _name(ax, name, x, y, "regular")
             continue
         points.append((name, HEAD[name][0], HEAD[name][1], float(value)))
 
@@ -52,6 +54,10 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
         if high - low < 1e-9:
             low -= 0.5
             high += 0.5
+        if diverging:
+            span = max(abs(low), abs(high), 1e-9)
+            low, high = -span, span
+            cmap = "RdBu_r"
         mapper = ax.scatter(
             [item[1] for item in points],
             [item[2] for item in points],
@@ -62,19 +68,20 @@ def draw_head(ax, names: list[str], values: list[float | None], title: str,
             _ring(ax, name, x, y, selected)
             _mark(ax, name, x, y, names, marked)
             weight = "bold" if name == selected else "regular"
-            ax.annotate(name, (x, y), ha="center", va="center", fontsize=8,
-                        color="#16232f", fontweight=weight, zorder=4)
+            _name(ax, name, x, y, weight)
 
-    ax.set_title(title, fontsize=10, color="#16232f", pad=6)
+    ax.set_title(title, fontsize=10, color="#16232f", pad=8)
     ax.set_xlim(-1.62, 1.62)
     ax.set_ylim(-1.52, 1.72)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
     if points:
-        bar = ax.figure.colorbar(mapper, ax=ax, fraction=0.05, pad=0.02)
+        bar = ax.figure.colorbar(mapper, ax=ax, fraction=0.08, pad=0.06)
         bar.ax.tick_params(labelsize=8, length=2, colors="#63748a")
         bar.outline.set_edgecolor("#d2dbe6")
         bar.outline.set_linewidth(0.6)
+        if unit:
+            bar.set_label(unit, fontsize=8, color="#63748a")
 
 
 def _mark(ax, name: str, x: float, y: float, names: list[str], marked: list[bool] | None) -> None:
@@ -82,8 +89,16 @@ def _mark(ax, name: str, x: float, y: float, names: list[str], marked: list[bool
         return
     index = names.index(name)
     if index < len(marked) and marked[index]:
-        ax.scatter([x], [y], s=340, facecolors="none", edgecolors="#9a3412",
-                   linewidths=1.3, zorder=5)
+        ax.scatter([x], [y], s=360, facecolors="none", edgecolors="#9a3412",
+                   linewidths=1.3, marker="D", zorder=5)
+
+
+def _name(ax, name: str, x: float, y: float, weight: str) -> None:
+    ax.annotate(
+        name, (x, y), ha="center", va="center", fontsize=8, color="#16232f",
+        fontweight=weight, zorder=6,
+        path_effects=[patheffects.withStroke(linewidth=2.6, foreground="white")],
+    )
 
 
 def _ring(ax, name: str, x: float, y: float, selected: str | None) -> None:

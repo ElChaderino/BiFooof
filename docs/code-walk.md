@@ -7,8 +7,10 @@ All 14 confirmed findings below were fixed in version 0.1.4. Version 0.1.5
 added desktop polish. Version 0.2.0 implements the fourteen additions in
 [product-roadmap.md](product-roadmap.md), prioritizing individual EEG and EC/EO
 review; [running.md](running.md) documents the current behavior.
-The suite now has 125 normal passing tests: the previous 95 plus 30 workflow
-regressions. There are no expected failures.
+The suite recorded for that review was 125 tests: the previous 95 plus 30
+workflow regressions. There were no expected failures. Later work in this
+source, shipped as 0.3.0, added the reference, montage, scale-factor, and
+figure behavior in the running guide. The suite in this tree is 205 tests.
 
 The original priorities and reproductions are retained below as a record of
 the reviewed revision. Their source line numbers refer to that baseline;
@@ -127,8 +129,14 @@ segments are not concatenated.
 
 - `analysis/settings.py` contains fit choices, presets, window bounds, and
   the GUI's shorter-recording matching helper. `prepare.py` crops, rejects
-  amplitude outliers before referencing, and applies stored/average/linked
-  reference. `segments.py` identifies contiguous accepted runs and merges
+  amplitude outliers before referencing, and applies the fit reference.
+  The choices are stored, average, linked ears, linked mastoids, one ear,
+  vertex, ipsilateral, contralateral, REST, local Laplacian, current source
+  density, and global scale. Ears and mastoids are separate pairs. REST keeps
+  the stored signal when the spherical forward model cannot be built. Global
+  scale is the average reference followed by the Hernández factor, not a
+  spatial regression. `segments.py` identifies contiguous accepted runs,
+  counts Welch windows, and merges
   overlapping burst coverage.
 - `analysis/spectra.py` computes Welch power on accepted runs with linear
   detrending. `specparam_fit.py` fits groups, falls back to individual channels,

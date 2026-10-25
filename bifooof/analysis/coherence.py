@@ -14,8 +14,8 @@ from scipy.signal import csd, detrend, welch
 
 from ..io.recording import Recording
 from .prepare import prepare_recording
-from .segments import accepted_runs
-from .settings import FitSettings, window_bounds
+from .segments import accepted_runs, welch_segment_count
+from .settings import FitSettings, format_seconds, range_note, segment_note, window_bounds
 
 
 @dataclass
@@ -56,10 +56,14 @@ def coherence_pair(
     left = np.asarray(prepared.data[index_a], dtype=np.float64)
     right = np.asarray(prepared.data[index_b], dtype=np.float64)
     mask = prepared.mask(index_a) & prepared.mask(index_b) & np.isfinite(left) & np.isfinite(right)
-    nperseg = int(round(prepared.sfreq * float(chosen.segment_s)))
-    nperseg = max(16, nperseg)
+    target = int(round(prepared.sfreq * float(chosen.segment_s)))
+    if target < 16:
+        raise ValueError(
+            f"A {float(chosen.segment_s):g} s Welch segment is {target} samples at {prepared.sfreq:g} Hz. "
+            "Coherence needs at least 16 samples in the segment."
+        )
     longest = max((stop - start for start, stop in accepted_runs(mask)), default=0)
-    nperseg = min(nperseg, longest)
+    nperseg = min(target, longest)
     if nperseg < 16:
         raise ValueError("No accepted stretch is long enough for coherence.")
 
@@ -67,16 +71,20 @@ def coherence_pair(
     weight = 0.0
     imag_rows: list[np.ndarray] = []
     freqs = None
+    skipped_s = 0.0
+    used_samples = 0
     noverlap = nperseg // 2
     for start, stop in accepted_runs(mask):
         if stop - start < nperseg:
+            skipped_s += (stop - start) / prepared.sfreq
             continue
+        used_samples += stop - start
         piece_a = detrend(left[start:stop], type="linear")
         piece_b = detrend(right[start:stop], type="linear")
         freqs_a, pxx = welch(piece_a, fs=prepared.sfreq, nperseg=nperseg, noverlap=noverlap)
         _freqs_b, pyy = welch(piece_b, fs=prepared.sfreq, nperseg=nperseg, noverlap=noverlap)
         _freqs_xy, pxy = csd(piece_a, piece_b, fs=prepared.sfreq, nperseg=nperseg, noverlap=noverlap)
-        run_weight = float(stop - start)
+        run_weight = float(welch_segment_count(stop - start, nperseg, noverlap))
         if sxx is None:
             sxx = np.zeros(pxx.shape, dtype=np.float64)
             syy = np.zeros(pyy.shape, dtype=np.float64)
@@ -104,6 +112,7 @@ def coherence_pair(
     coherence[usable] = (np.abs(sxy[usable]) ** 2) / denom[usable]
     imaginary[usable] = np.imag(sxy[usable]) / np.sqrt(denom[usable])
     phase = np.degrees(np.angle(sxy))
+    phase[~usable] = np.nan
     wpli = None
     if len(imag_rows) >= 5:
         stacked = np.vstack(imag_rows)
@@ -111,12 +120,29 @@ def coherence_pair(
         wpli = np.full(scale.shape, np.nan, dtype=np.float64)
         usable_w = scale > 0
         wpli[usable_w] = np.abs(np.mean(stacked[:, usable_w], axis=0)) / scale[usable_w]
-    low, high = float(chosen.fmin), min(float(chosen.fmax), prepared.sfreq / 2.0 - 0.5)
+    low = float(chosen.fmin)
+    high = min(float(chosen.fmax), prepared.sfreq / 2.0 - 0.5)
+    if high <= low:
+        raise ValueError(
+            f"Sampling rate {prepared.sfreq:g} Hz cannot cover {low:g}–{float(chosen.fmax):g} Hz."
+        )
     chosen_freq = (freqs >= low) & (freqs <= high)
-    note = ""
-    accepted_s = float(mask.sum()) / prepared.sfreq
+    if int(chosen_freq.sum()) < 2:
+        raise ValueError("Not enough frequency bins in the requested range.")
+    notes = [
+        range_note(prepared.sfreq, float(chosen.fmax)),
+        segment_note(prepared.sfreq, chosen.segment_s, nperseg),
+    ]
+    if prepared.reference_applied != chosen.reference and prepared.notes:
+        notes.append(prepared.notes[-1])
+    accepted_s = used_samples / prepared.sfreq
     if accepted_s < 3.0 * chosen.segment_s:
-        note = "Few clean segments, so this coherence estimate is thin."
+        notes.append("Few clean segments, so this coherence estimate is thin.")
+    if skipped_s > 0.05:
+        notes.append(
+            f"{format_seconds(skipped_s)} s in shorter stretches was left out of the coherence."
+        )
+    note = " ".join(part for part in notes if part)
     _t0, _t1 = window_bounds(recording, chosen)
     return CoherenceResult(
         channel_a=prepared.ch_names[index_a],
@@ -128,7 +154,7 @@ def coherence_pair(
         wpli=None if wpli is None else wpli[chosen_freq],
         n_segments=len(imag_rows),
         accepted_s=accepted_s,
-        reference=chosen.reference,
+        reference=prepared.reference_applied,
         note=note,
     )
 

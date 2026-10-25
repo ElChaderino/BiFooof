@@ -11,7 +11,7 @@ from scipy.signal import butter, detrend, sosfiltfilt
 from ..io.recording import Recording
 from .segments import accepted_runs, covered_length
 from .prepare import prepare_recording
-from .settings import NAMED_BANDS, FitSettings
+from .settings import NAMED_BANDS, FitSettings, amplitude_unit
 
 BANDS: list[tuple[str, tuple[float, float]]] = [
     (f"{name} {low:g}–{high:g} Hz", (low, high)) for name, low, high in NAMED_BANDS
@@ -70,6 +70,7 @@ class CycleFit:
     burst_note: str = ""
     notes: str = ""
     failures: list[dict] = field(default_factory=list)
+    unit: str = "µV"
 
     @property
     def n_bursts(self) -> int:
@@ -123,10 +124,12 @@ def fit_cycles(
     episode_rows: list[BurstEpisode] = []
     minimum = max(int(round(recording.sfreq)), int(round(3.0 * recording.sfreq / low)))
     failures = []
+    short_runs = 0
     runs = list(accepted_runs(mask))
     for position, (start, stop) in enumerate(runs):
         checkpoint(position, len(runs), f"Cycle run {position + 1} of {len(runs)}")
         if stop - start < minimum:
+            short_runs += 1
             continue
         piece = signal[start:stop]
         if not np.isfinite(piece).all():
@@ -184,6 +187,12 @@ def fit_cycles(
     fraction = None if accepted <= 0 else covered / accepted
     thresholds = chosen.cycle_thresholds()
     note = "" if n_burst_cycles else burst_note(frame, thresholds)
+    if not spans and runs and short_runs == len(runs):
+        needed = minimum / recording.sfreq
+        short_note = (
+            f"No run is long enough for cycles. This band needs at least {needed:g} s in one stretch."
+        )
+        preparation = " ".join(part for part in (preparation, short_note) if part)
     return CycleFit(
         channel=recording.ch_names[channel_index],
         channel_index=channel_index,
@@ -212,6 +221,7 @@ def fit_cycles(
         burst_note=note,
         notes=preparation,
         failures=failures,
+        unit=amplitude_unit(recording.reference_applied),
     )
 
 

@@ -4,7 +4,7 @@ The window's current behavior is [running.md](running.md). This file is the plan
 
 This is the build order for the time-resolved and multichannel views. Each view reads the recording, the fit settings, and the results that already exist. A new graph does not get its own filter, reference, or artifact rule.
 
-The app already does the slow part. `prepare_recording` clips the fit window, drops samples outside the amplitude limit, and applies the reference. `welch_spectra` estimates power on accepted runs only. `fit_spectra` turns that into a `ChannelFit`. `fit_cycles` turns the same prepared signal into cycles and `BurstEpisode`s. New code calls those functions and keeps the per-window results they currently throw away.
+The app already does the slow part. `prepare_recording` clips the fit window, drops samples outside the amplitude limit, and applies the reference. The reference choices are the set in [running.md](running.md). A graph still does not choose a reference of its own. `welch_spectra` estimates power on accepted runs only. `fit_spectra` turns that into a `ChannelFit`. `fit_cycles` turns the same prepared signal into cycles and `BurstEpisode`s. New code calls those functions and keeps the per-window results they currently throw away.
 
 Language on every new panel matches the Findings page. The sentences describe the measurement. They do not assign a diagnosis, an arousal label, or a treatment effect.
 

@@ -10,7 +10,7 @@ MEASURES = {
     "exponent": {"units": "unitless", "definition": "Aperiodic exponent over the declared fit range"},
     "peak_hz": {"units": "Hz", "definition": "Fitted in-band peak center; missing when no peak was found"},
     "peak_height": {"units": "log10 power", "definition": "Peak height above the aperiodic background"},
-    "mean_band_psd": {"units": "µV²/Hz", "definition": "Mean linear Welch PSD over the declared band"},
+    "mean_band_psd": {"units": "follows the reference", "definition": "Mean linear Welch PSD over the declared band. µV²/Hz after a voltage reference, scaled µV²/Hz after the global scale factor, and µV²/(m⁴·Hz) after current source density."},
     "band_change_percent": {"units": "%", "definition": "100 * (left - right) / right; missing for absent or nonpositive denominator"},
     "burst_cycles": {"units": "cycles", "definition": "Cycles labeled as part of a burst"},
     "burst_episodes": {"units": "episodes", "definition": "Separate contiguous runs of burst cycles"},
@@ -20,7 +20,7 @@ MEASURES = {
     "r_squared": {"units": "unitless", "definition": "Spectral model goodness of fit; inspect residuals and signal support alongside it"},
     "fit_error": {"units": "log10 power", "definition": "Mean absolute spectral model error"},
     "period_ms": {"units": "ms", "definition": "Median cycle period; burst-prefixed fields restrict this to burst cycles"},
-    "volt_amp": {"units": "µV", "definition": "Median cycle peak-to-trough voltage amplitude"},
+    "volt_amp": {"units": "follows the reference", "definition": "Median cycle peak-to-trough amplitude. µV after a voltage reference, scaled µV after the global scale factor, and µV/m² after current source density."},
     "rise_decay": {"units": "fraction", "definition": "Median fraction of each cycle spent rising"},
     "peak_trough": {"units": "fraction", "definition": "Median fraction of each cycle spent in its peak phase"},
     "log10_power_ratio": {"units": "log10 ratio", "definition": "log10(mean left-region band PSD / mean right-region band PSD), using declared common channel sets"},
@@ -33,7 +33,11 @@ def html_table(rows):
         return "<p>No completed results for this section.</p>"
     fields = list(dict.fromkeys(key for row in rows for key in row))
     def cell(value):
-        return "—" if value is None else f"{value:.6g}" if isinstance(value, float) else str(value)
+        if value is None:
+            return "—"
+        if isinstance(value, float):
+            return "—" if value != value or value in {float("inf"), float("-inf")} else f"{value:.6g}"
+        return str(value)
     return "<table><thead><tr>" + "".join(f"<th>{escape(key.replace('_', ' '))}</th>" for key in fields) + "</tr></thead><tbody>" + "".join(
         "<tr>" + "".join(f"<td>{escape(cell(row.get(key)))}</td>" for key in fields) + "</tr>" for row in rows) + "</tbody></table>"
 

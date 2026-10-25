@@ -22,6 +22,40 @@ Keyboard shortcuts: **Ctrl+O** opens eyes closed, **Ctrl+Shift+O** opens eyes op
 
 File inspection and save errors show a short error with expandable technical details. Closing during analysis keeps the event loop responsive and closes automatically after running workers finish.
 
+## Reference, montage, and amplitude
+
+The fit bar and the trace page do different jobs. **Refit** rebuilds spectrum, cycles, and findings from the fit-bar reference. The trace montage changes only the picture on that page. The trace status line names both, and it says that the amplitude limit is applied on the fit and not on the trace.
+
+The limit is in microvolts on the original samples, before the transform. The default is 500. A sample is dropped when it rises more than that far above the channel's straight trend. A constant offset is kept. `0` keeps every sample. There is no separate limit in µV/m². Rejected samples stay at their original times. Welch and cycle runs do not join the samples on either side of a gap. Runs of unequal length are weighted by the number of Welch windows each run contributes, at the usual 50% overlap, not by the number of samples.
+
+`--reference` accepts `stored`, `average`, `linked`, `mastoid`, `left`, `right`, `vertex`, `ipsilateral`, `contralateral`, `rest`, `hjorth`, `csd`, and `global`.
+
+**As stored** leaves the file reference in place.
+
+**Average** uses one fixed set for the window: the analysis channels that have any accepted sample. The mean is subtracted only where every member of that set is finite. One missing contributor blanks that sample, including when a single channel is all that remains. A recording that never has two analysis channels stays stored.
+
+**Linked ears** use A1 and A2. Those ears are also accepted under the names LE/EL and RE/ER. **Linked mastoids** use M1 and M2, also named T9 and T10. Ears and mastoids are not substitutes, and a channel label is not checked against the acquisition notes to decide whether A1 was an earlobe or a mastoid. A missing pair, or one blank side of a linked pair, keeps the stored reference and the note says so. One ear is not filled in from the other.
+
+**Left** and **right** subtract that one ear. **Ipsilateral** and **contralateral** send a lateral channel to the ear its output depends on. Midline channels need both ears.
+
+**Vertex** on a fit subtracts Cz and then leaves Cz blank, so Cz is not fitted as a channel. The trace vertex montage leaves Cz as the zero line.
+
+**REST** is an infinity reference from a template spherical forward model. The note begins "REST — template geometry/spherical model." The values stay in microvolts. Fewer than four positioned 10-20 channels, a failed forward solution, or a channel set that never shares a finite sample keeps the stored signal and names the reason. The average reference is not put in its place. REST is not a trace montage. A second application is refused.
+
+**Local Laplacian** subtracts the equal mean of a site's listed neighbors. The weights are equal, with no distance scaling, and the result stays in microvolts. A center is used only when every listed neighbor is in the file. A missing sample on a required neighbor blanks that instant. It is fit-only. A second application is refused.
+
+**CSD** is the spherical-spline surface Laplacian, with MNE's defaults: stiffness 4, 50 Legendre terms, and lambda2 of 1e-5. Four analysis channels on the standard 10-20 layout is the minimum the spline will calculate. Fewer than eight adds the note that the surface is sparse. Units are µV/m², and the spectrum is µV²/(m⁴·Hz). A missing sample on any contributor blanks that time on every CSD channel. A second application is refused. The trace page can show the same montage, with its own µV/m² gain. That picture still waits for **Refit** before the fit changes.
+
+**Global scale** is the average reference followed by one factor. The factor is the geometric mean of positive channel-by-frequency Welch power inside the fit band. Nonpositive bins, and bins at or below the larger of 1e-12 and 1e-8 times the peak bin, stay out of that mean. Samples are divided by the square root of the factor, so linear spectra divide by the factor. The aperiodic offset decreases by log10 of the factor. Exponent, peak center frequency, bandwidth, and log-power peak height above the aperiodic background are unchanged apart from ordinary numerical differences in the fit. Each recording is scaled on its own. The factor is stored with the fit. Labels are scaled µV and scaled µV²/Hz. If the factor cannot be estimated, the average reference is kept and the note says so. A second application is refused. This scale factor is not a regression and not a principal-component removal of a global signal.
+
+Captions and metadata keep the reference requested, the reference applied, and the fallback note when those two differ. An eyes-closed / eyes-open pair names both applied transforms when they differ.
+
+### Trace montages
+
+As stored, average, vertex, ipsilateral, contralateral, left ear, right ear, longitudinal bipolar, transverse bipolar, circumferential bipolar, and current source density. Linked ears, linked mastoids, REST, the local Laplacian, and global scale are fit-only.
+
+A bipolar pair is drawn only when both channels are checked. The label is the first site minus the second. Display band and notch run after the montage. The default band is Off. A stretch shorter than the filter can use is named, and the gap is not joined. Samples that would draw past the channel spacing are marked on the clipped line.
+
 ## Pages
 
 Traces, Spectrum, Time, Cycles, Compare, Findings, Review, Study. The channel you select follows you between the analysis pages.
@@ -30,13 +64,13 @@ Traces, Spectrum, Time, Cycles, Compare, Findings, Review, Study. The channel yo
 
 The recording, in microvolts, for the page length and gain on that page. A click on Time scrolls this page so that time is in view. Left/Right and Page Up/Page Down page the trace; Jump moves to an explicit time. Drag to select an interval: the ruler reports time and the displayed-sample amplitude change on the channel where the drag began. Excluded endpoint samples have no amplitude measurement.
 
-Display bandpass/notch filters and average/bipolar montages affect the picture. They do not change fit settings. The average display montage uses eligible neural channels, and supported bipolar pairs must both be visible. Brief extrema and missing-sample gap boundaries survive display reduction. The fit window, review bookmarks and exclusions can appear as overlays.
+Display bandpass and notch, and the trace montages listed above, affect the picture. They do not change fit settings. The average display montage uses the same fixed contributor set as the fit. Supported bipolar pairs must both be visible. Brief extrema and missing-sample gap boundaries survive display reduction. The fit window, review bookmarks and exclusions can appear as overlays. The page states the montage, the display band, and the notch above the stack.
 
 ### Spectrum
 
 specparam on the fit-bar window. The curve is the Welch spectrum, the model, and the aperiodic part, in log10 power. Under it is the residual, spectrum minus model, on the same frequency axis. Click either axes and the caption reports the residual at the nearest bin.
 
-The head maps sit to the right of the spectrum, exponent above peak frequency, large enough to read every site. A weak fit, R² below 0.6, is ringed. A peak at the narrowest allowed width is marked. A site with no fit is empty. The residual has its frequency label underneath; comparison titles use separate lines to stay readable in smaller windows.
+The head maps sit to the right of the spectrum, exponent above peak frequency, large enough to read every site. Names sit on a light halo. A weak fit, R² below 0.6, is a diamond. The selected channel is ringed. A peak at the narrowest allowed width is marked. A site with no fit is gray. Classic bands are tinted and named on the spectrum. The residual is drawn around a zero line. Comparison maps of exponent and peak height are centered on zero. The residual has its frequency label underneath; comparison titles use separate lines to stay readable in smaller windows.
 
 Epochs, 30 s or 60 s, still collapse to one spectrum. Peaks within 1 Hz are grouped. Center, height, and width are medians of the epochs that found the peak. An epoch that missed it is left out of the median. The Time tab does not use that collapse. Each sliding window stays its own fit.
 
@@ -68,7 +102,7 @@ Findings uses those same names. The default is eyes closed and eyes open. Pre / 
 
 One tab, one menu, and a channel menu. The channel menu is the same channel as Traces, Spectrum, Cycles, and Compare. The default view is the spectrogram, so opening a file does not start a sliding specparam fit or a coupling estimate. Every view uses the fit bar: window, reference, amplitude limit, frequency range, and rejected samples. The spectrogram window is not the Welch segment. Welch stays at whatever the fit bar says, default 4 s.
 
-**Spectrogram.** Power for the selected channel, Hann window, in dB relative to 1 µV²/Hz. The choices are 1, 2, or 4 s, and 50% or 75% overlap. The default is 2 s and 75%. The caption states the frequency bin and the time step, and that a burst shorter than the window is spread across that window. Frequency limits are the fit bar. **Bursts** draws the current channel’s burst episodes at `1000 / period` Hz when the cycle fit has a period. **Lock color** holds the 2nd-to-98th percentile range and shows two dB boxes. Typing in those boxes keeps that range. Unchecked, the range is chosen again for the next picture. A rejected stretch is a blank column, not a bridge. Click and the lower strip shows the raw samples around that time. Rejected samples on the strip are marked. The caption names the strongest bin in that column, burst episodes that overlap the click (start, duration, cycles, amplitude, and frequency), and how many cycles from the cycle fit fall in the stretch. If a sliding fit already covers that time, the same click draws that window’s spectrum under the strip. If none does, that row says the Spectrum tab is still the fit-bar window.
+**Spectrogram.** Power for the selected channel, Hann window, in dB relative to 1 of the applied power unit. That unit is µV²/Hz, µV²/(m⁴·Hz) after CSD, or scaled µV²/Hz after global scale. The choices are 1, 2, or 4 s, and 50% or 75% overlap. The default is 2 s and 75%. The caption states the frequency bin and the time step, and that a burst shorter than the window is spread across that window. Frequency limits are the fit bar. **Bursts** draws the current channel’s burst episodes at `1000 / period` Hz when the cycle fit has a period. **Lock color** holds the 2nd-to-98th percentile range and shows two dB boxes. Typing in those boxes keeps that range. Unchecked, the range is chosen again for the next picture. A rejected stretch is a blank column, not a bridge. Click and the lower strip shows the raw samples around that time. Rejected samples on the strip are marked. The caption names the strongest bin in that column, burst episodes that overlap the click (start, duration, cycles, amplitude, and frequency), and how many cycles from the cycle fit fall in the stretch. If a sliding fit already covers that time, the same click draws that window’s spectrum under the strip. If none does, that row says the Spectrum tab is still the fit-bar window.
 
 **Exponent and peaks.** specparam on successive windows. The choices are 10, 30, or 60 s, and no overlap or 50%. The default is 30 s and 50%. A 10 s window with a 4 s Welch segment has few averages, and the caption says so. The caption also names the Welch segment. The top trace is exponent, offset, or knee. A fixed slope has no knee, so that trace is a gap. Under it are in-band peak height and peak frequency. Marker size follows peak height. A missing peak is a gap. An open circle is a weak fit or a peak at the narrowest allowed width. Lines follow each peak only while its center stays within 1.5 Hz, or half its previous bandwidth, of the last point. A window with no in-band peak ends the track. The caption gives the tallest track’s frequency range, median height, median width, and the percent of windows with any in-band peak. Click a time and the lower axes show that window’s spectrum, model, and aperiodic fit. If the click falls outside every window, the caption says the Spectrum tab is still the fit-bar window. **Every channel** fits all channels and adds one head map, either the median exponent or its spread. A site with fewer than three usable windows is left empty. The table lists usable windows and the rejected fraction for each channel. When Every channel is on and another file is open, that file is fit with the same windows and the two maps share one color scale. This is not epoch mode.
 
@@ -86,7 +120,7 @@ One tab, one menu, and a channel menu. The channel menu is the same channel as T
 
 **Coupling.** Phase–amplitude coupling. Phase stays on the selected channel. Amplitude can be that channel or another. It runs when you open this view, not when you press Refit. The default bands are 4–8 Hz for phase and 30–45 Hz for amplitude. Surrogates are 200 time shifts of the amplitude. A perfectly periodic modulation stays high after a time shift, because the shift only moves which phase bin is tall. The recording needs about 60 s of accepted signal; otherwise the page says so and does not invent an index. If the amplitude band contains a harmonic of the phase band, the index is skipped only when the current cycles are far from symmetric: rise/decay or peak/trough at least 0.15 from one half. Otherwise the index is still shown, and the caption says so. **Map** draws a coarse grid of the index and states how many cells were tested. Surrogates are for the selected bands only, and the map is not corrected across cells.
 
-**Quality.** Stretches the rules flag, and a way to leave them out of later fits. The file on disk is not rewritten. Dragging across a channel on the timeline adds a confirmed span for that channel. **Put back** removes it. The file is not rewritten.
+**Quality.** Stretches the rules flag, and a way to leave them out of later fits. The file on disk is not rewritten. Each kind has its own stripe, and the legend names the kinds on the page. Dragging across a channel on the timeline adds a confirmed span for that channel. **Put back** removes it. The file is not rewritten.
 
 | Kind | What it means |
 | --- | --- |
@@ -104,7 +138,7 @@ Confirmed exclusions on either split eye-state recording also apply to the origi
 
 The save buttons follow the current tab and its available results. Pending or failed Time jobs have no data to export. Export results becomes available after background analysis finishes. Checking button availability does not construct the potentially large spectrogram CSV.
 
-**Save image** writes the current page as a PNG. Findings is text; use Copy on that page.
+**Save image** writes the current page as a PNG at 150 dpi. The file carries a one-line caption naming the channel, window, applied reference, and unit. That line is removed from the on-screen figure after the save. A very small figure is written at a readable size and then restored. Findings is text; use Copy on that page.
 
 **Save data** writes the current table.
 

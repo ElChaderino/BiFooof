@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 from ..analysis.coherence import CoherenceResult, zero_lag_mask
 from ..analysis.cycles import CycleFit
@@ -12,7 +14,8 @@ from ..analysis.pac import PacResult
 from ..analysis.quality import QualitySpan
 from ..analysis.shape import BurstStats, aligned_cycles, cycle_cloud
 from ..analysis.timefreq import ChannelSeries, PeakTrack, Spectrogram
-from ..plots import clear_figure, mark_spectrum, stamp_figure, style_axes
+from ..analysis.settings import format_seconds, reference_phrase
+from ..plots import _power_label, clear_figure, mark_spectrum, remember_figure, stamp_figure, style_axes
 
 _TRACE = "#16324f"
 _TEAL = "#0e8f86"
@@ -35,6 +38,7 @@ def draw_spectrogram(
     tracks: list[PeakTrack] | None = None,
     color_limits: tuple[float, float] | None = None,
     window=None,
+    trace_unit: str = "µV",
 ) -> None:
     _open(fig)
     if window is None:
@@ -58,14 +62,17 @@ def draw_spectrogram(
             shading="nearest", cmap="magma", vmin=low, vmax=high,
         )
         bar = fig.colorbar(image, ax=ax, pad=0.01, fraction=0.035)
-        bar.set_label("dB re 1 µV²/Hz", fontsize=8, color=_TRACE)
+        bar.set_label(f"dB re 1 {spec.power_unit}", fontsize=8, color=_TRACE)
         bar.ax.tick_params(labelsize=7, colors=_MUTED)
         bar.outline.set_edgecolor("#d2dbe6")
+        drew_burst = False
         for episode in episodes:
             freq = _episode_hz(episode)
             if freq is None:
                 continue
             ax.plot([episode.start_s, episode.end_s], [freq, freq], color="#fffaf3", lw=1.7, solid_capstyle="butt", zorder=4)
+            drew_burst = True
+        drew_track = False
         if tracks:
             for track in tracks:
                 if len(track.times) < 1:
@@ -74,6 +81,21 @@ def draw_spectrogram(
                     track.times, track.centers, s=_track_sizes(track.heights),
                     facecolors="none", edgecolors="#fffaf3", linewidths=0.8, zorder=5,
                 )
+                drew_track = True
+        handles = []
+        if drew_burst:
+            handles.append(Line2D([0], [0], color="#fffaf3", lw=1.7, label="Burst"))
+        if drew_track:
+            handles.append(Line2D(
+                [0], [0], linestyle="none", marker="o", markerfacecolor="none",
+                markeredgecolor="#fffaf3", label="Peak track",
+            ))
+        if handles:
+            legend = ax.legend(handles=handles, frameon=True, fontsize=8, loc="upper right")
+            legend.get_frame().set_facecolor("#16232f")
+            legend.get_frame().set_edgecolor("#16232f")
+            for text in legend.get_texts():
+                text.set_color("#ffffff")
         _cursor(ax, inspection)
         ax.set_ylabel("Frequency (Hz)")
         ax.set_xlim(spec.t_start, max(spec.t_end, spec.times_s[-1] if spec.times_s.size else spec.t_start + 1))
@@ -85,7 +107,12 @@ def draw_spectrogram(
         )
         style_axes(ax)
     raw_ax = fig.add_subplot(grid[1])
-    _raw(raw_ax, raw, inspection)
+    _raw(raw_ax, raw, inspection, trace_unit)
+    remember_figure(
+        fig, spec.channel,
+        f"{format_seconds(spec.t_start)}–{format_seconds(spec.t_end)} s",
+        spec.power_unit,
+    )
     if window is not None:
         _window_spectrum(fig.add_subplot(grid[2]), window)
     stamp_figure(fig)
@@ -168,9 +195,16 @@ def draw_raster(fig, fits: list[CycleFit], inspection) -> None:
         ax.barh(y, width, left=episode.start_s, height=0.62, color=color, align="center", zorder=2)
     if mapper is not None:
         bar = fig.colorbar(mapper, ax=ax, pad=0.01, fraction=0.03)
-        bar.set_label("Amplitude (µV)", fontsize=8, color=_TRACE)
+        unit = fits[0].unit if fits else "µV"
+        bar.set_label(f"Amplitude ({unit})", fontsize=8, color=_TRACE)
         bar.ax.tick_params(labelsize=7, colors=_MUTED)
         bar.outline.set_edgecolor("#d2dbe6")
+        missing = any(
+            episode.volt_amp is None or not np.isfinite(episode.volt_amp)
+            for _y, episode in placed
+        )
+        if missing:
+            ax.legend(handles=[Patch(facecolor=_TEAL, edgecolor=_TEAL, label="No amplitude")], frameon=False, fontsize=8)
     starts = [episode.start_s for _y, episode in placed]
     ends = [episode.end_s for _y, episode in placed]
     if starts:
@@ -255,11 +289,12 @@ def draw_shape(fig, fit: CycleFit, align: str, bursts_only: bool, normalized: bo
         median = _finite_median(matrix, axis=0)
         finite_rows = np.isfinite(matrix).any(axis=1)
         for row in matrix[finite_rows]:
-            ax.plot(grid, row, color=_BLUE, lw=0.6, alpha=0.18, zorder=1)
+            ax.plot(grid, row, color=_BLUE, lw=0.45, alpha=0.08, zorder=1)
         low = _finite_percentile(matrix, 10)
         high = _finite_percentile(matrix, 90)
-        ax.fill_between(grid, low, high, color=_TEAL, alpha=0.18, lw=0, zorder=2)
-        ax.plot(grid, median, color=_TRACE, lw=1.8, zorder=3, label="Median")
+        ax.fill_between(grid, low, high, color=_TEAL, alpha=0.35, lw=0, zorder=2, label="10–90%")
+        ax.plot(grid, median, color=_TRACE, lw=2.2, zorder=3, label="Median")
+        ax.axhline(0.0, color="#d2dbe6", lw=0.8, zorder=1)
         ax.legend(frameon=False, fontsize=8)
         if normalized:
             ax.set_xlabel("Normalized cycle")
@@ -267,7 +302,7 @@ def draw_shape(fig, fit: CycleFit, align: str, bursts_only: bool, normalized: bo
         else:
             ax.set_xlabel("Seconds from the peak" if align == "peak" else "Seconds from the trough")
             title = "Peak aligned" if align == "peak" else "Trough aligned"
-        ax.set_ylabel("µV")
+        ax.set_ylabel(fit.unit or "µV")
         extra = f"   ·   {hidden} cycles not drawn" if hidden else ""
         ax.set_title(f"{fit.channel}   ·   {title}   ·   {matrix.shape[0]} cycles{extra}", fontsize=9, loc="left")
         style_axes(ax)
@@ -317,8 +352,9 @@ def draw_scatter(fig, groups: list[tuple[str, CycleFit, str]], bursts_only: bool
     cloud_y = np.concatenate(drawn_y)
     _describe_cloud(ax, cloud_x, cloud_y)
     _frame_cloud(ax, cloud_x, cloud_y)
-    ax.set_xlabel("Cycle frequency (Hz)")
-    ax.set_ylabel("Amplitude (µV)")
+    ax.set_xlabel("Cycle frequency (Hz), axis is the central 96%")
+    unit = groups[0][1].unit if groups else "µV"
+    ax.set_ylabel(f"Amplitude ({unit}), axis is the central 96%")
     title = groups[0][1].channel if len(groups) == 1 else "Colored by recording"
     count = int(np.isfinite(cloud_x).sum())
     ax.set_title(
@@ -336,7 +372,7 @@ def draw_reactivity(fig, payload: dict, inspection) -> None:
     if kind == "events":
         extras = list(payload.get("extras") or [])
         axes = fig.subplots(1 + len(extras), 1, sharex=True, squeeze=False).ravel()
-        _event_course(axes[0], payload["grid"], payload["curves"], "Band power (µV²/Hz)", payload.get("title", ""))
+        _event_course(axes[0], payload["grid"], payload["curves"], _power_axis(payload), payload.get("title", ""))
         for ax, extra in zip(axes[1:], extras):
             _event_course(ax, extra["grid"], extra["curves"], extra["ylabel"], "")
         axes[-1].set_xlabel("Seconds from the mark")
@@ -351,7 +387,7 @@ def draw_reactivity(fig, payload: dict, inspection) -> None:
             ax.set_title(label, fontsize=9, loc="left")
             ax.set_xlabel("Time (s)")
             style_axes(ax, grid=True)
-        axes[0].set_ylabel("Band power (µV²/Hz)")
+        axes[0].set_ylabel(_power_axis(payload))
     else:
         ax = fig.add_subplot(111)
         times, power = payload.get("single", (np.zeros(0), np.zeros(0)))
@@ -361,22 +397,24 @@ def draw_reactivity(fig, payload: dict, inspection) -> None:
             ax.plot(times, power, color=_BLUE, lw=1.3)
             _cursor(ax, inspection)
             ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Band power (µV²/Hz)")
+            ax.set_ylabel(_power_axis(payload))
             ax.set_title(payload.get("title", ""), fontsize=9, loc="left")
             style_axes(ax, grid=True)
     stamp_figure(fig)
 
 
-def draw_coherence(fig, result: CoherenceResult, raw=None, other: CoherenceResult | None = None, other_label: str = "") -> None:
+def draw_coherence(fig, result: CoherenceResult, raw=None, other: CoherenceResult | None = None, other_label: str = "", trace_unit: str = "µV") -> None:
     _open(fig)
     rows = 4 if raw is not None else 3
     axes = fig.subplots(rows, 1, sharex=False)
-    label = other_label and "This file" or "Coherence"
-    axes[0].plot(result.freqs_hz, result.coherence, color=_BLUE, lw=1.4, label=label if other is not None else "Coherence")
+    this_label = "This file" if other is not None else "Coherence"
+    other_name = other_label or "Other file"
+    _coherence_bands(axes[0], result)
+    axes[0].plot(result.freqs_hz, result.coherence, color=_BLUE, lw=1.4, label=this_label)
     if result.wpli is not None and other is None:
         axes[0].plot(result.freqs_hz, result.wpli, color=_TEAL, lw=1.1, ls="--", label="wPLI")
     if other is not None:
-        axes[0].plot(other.freqs_hz, other.coherence, color=_ORANGE, lw=1.3, label=other_label or "Other file")
+        axes[0].plot(other.freqs_hz, other.coherence, color=_ORANGE, lw=1.3, label=other_name)
     lag = zero_lag_mask(result)
     if np.any(lag):
         axes[0].plot(result.freqs_hz[lag], result.coherence[lag], linestyle="none", marker="o",
@@ -384,31 +422,33 @@ def draw_coherence(fig, result: CoherenceResult, raw=None, other: CoherenceResul
     axes[0].set_ylim(-0.02, 1.05)
     axes[0].set_ylabel("Coherence")
     axes[0].legend(frameon=False, fontsize=8, ncol=3)
-    axes[1].plot(result.freqs_hz, result.phase_deg, color=_BLUE, lw=1.1, label=None if other is None else "This file")
+    axes[1].plot(result.freqs_hz, result.phase_deg, color=_BLUE, lw=1.1, label=this_label)
     if other is not None:
-        axes[1].plot(other.freqs_hz, other.phase_deg, color=_ORANGE, lw=1.1)
-    axes[1].set_ylabel("Phase (deg)")
-    axes[2].plot(result.freqs_hz, result.imaginary, color=_BLUE if other is not None else _ORANGE, lw=1.2)
+        axes[1].plot(other.freqs_hz, other.phase_deg, color=_ORANGE, lw=1.1, label=other_name)
+        axes[1].legend(frameon=False, fontsize=8)
+    axes[1].set_ylim(-180, 180)
+    axes[1].set_ylabel("Phase (deg), wrapped")
+    axes[2].plot(result.freqs_hz, result.imaginary, color=_BLUE if other is not None else _ORANGE, lw=1.2, label=this_label if other is not None else None)
     if other is not None:
-        axes[2].plot(other.freqs_hz, other.imaginary, color=_ORANGE, lw=1.1)
+        axes[2].plot(other.freqs_hz, other.imaginary, color=_ORANGE, lw=1.1, label=other_name)
+        axes[2].legend(frameon=False, fontsize=8)
     axes[2].axhline(0.0, color="#d2dbe6", lw=0.8)
     axes[2].set_ylabel("Imag. coh.")
     axes[2].set_xlabel("Frequency (Hz)")
     axes[0].set_title(
-        f"{result.channel_a} × {result.channel_b}   ·   {result.reference} reference",
+        f"{result.channel_a} × {result.channel_b}   ·   {reference_phrase(result.reference)}",
         fontsize=9, loc="left",
     )
     for ax in axes[:3]:
         style_axes(ax, grid=True)
     if raw is not None:
-        _pair_raw(axes[3], raw)
+        _pair_raw(axes[3], raw, trace_unit)
+    remember_figure(fig, f"{result.channel_a} × {result.channel_b}", reference_phrase(result.reference))
     stamp_figure(fig)
 
 
 def draw_pac(fig, result: PacResult) -> None:
     _open(fig)
-    if result.phase_channel and result.amplitude_channel:
-        fig.suptitle(f"Phase: {result.phase_channel}   ·   Amplitude: {result.amplitude_channel}", fontsize=10)
     if result.histogram is None and result.comodulogram is None:
         ax = fig.add_subplot(111)
         _blank(ax, result.note or "No coupling estimate.")
@@ -425,9 +465,17 @@ def draw_pac(fig, result: PacResult) -> None:
         bar.set_label("MI", fontsize=8)
         bar.ax.tick_params(labelsize=7, colors=_MUTED)
         bar.outline.set_edgecolor("#d2dbe6")
+        axes[1].axvline(result.phase_band[0], color=_BLUE, lw=1.0, ls="--", label="Phase band")
+        axes[1].axvline(result.phase_band[1], color=_BLUE, lw=1.0, ls="--")
+        axes[1].axhline(result.amp_band[0], color=_TEAL, lw=1.0, ls="--", label="Amplitude band")
+        axes[1].axhline(result.amp_band[1], color=_TEAL, lw=1.0, ls="--")
+        axes[1].legend(frameon=False, fontsize=8)
         axes[1].set_xlabel("Phase frequency (Hz)")
         axes[1].set_ylabel("Amplitude frequency (Hz)")
-        axes[1].set_title(f"Uncorrected map   ·   {_cell_count(result)}", fontsize=9, loc="left")
+        who = ""
+        if result.phase_channel and result.amplitude_channel:
+            who = f"{result.phase_channel} phase, {result.amplitude_channel} amplitude   ·   "
+        axes[1].set_title(f"{who}uncorrected   ·   {_cell_count(result)}", fontsize=9, loc="left")
         style_axes(axes[1])
     else:
         ax = fig.add_subplot(111)
@@ -442,11 +490,22 @@ def draw_quality(fig, recording_names: list[str], spans: list[QualitySpan], insp
         _blank(ax, "No channels.")
         stamp_figure(fig)
         return
-    colors = {
-        "amplitude": _MARK, "step": _MARK, "flat": _MARK, "clip": _MARK,
-        "muscle": _ORANGE, "drift": _ORANGE, "mains": _ORANGE,
-        "file mark": _BLUE, "missing": _BLUE, "left out": _TEAL, "user": _TEAL,
-    }
+    kinds = (
+        ("amplitude", _MARK, ""),
+        ("step", _MARK, "//"),
+        ("flat", _MARK, ".."),
+        ("clip", _MARK, "xx"),
+        ("muscle", _ORANGE, ""),
+        ("drift", _ORANGE, "//"),
+        ("mains", _ORANGE, "xx"),
+        ("file mark", _BLUE, ""),
+        ("missing", _BLUE, "//"),
+        ("left out", _TEAL, ""),
+        ("user", _TEAL, "//"),
+    )
+    style_of = {kind: (color, hatch) for kind, color, hatch in kinds}
+    lane_of = {kind: index for index, (kind, _color, _hatch) in enumerate(kinds)}
+    lane_height = 0.78 / len(kinds)
     y_of = {name: len(recording_names) - 1 - index for index, name in enumerate(recording_names)}
     for span in spans:
         if span.channel and span.channel not in y_of:
@@ -455,17 +514,30 @@ def draw_quality(fig, recording_names: list[str], spans: list[QualitySpan], insp
             rows = [y_of[span.channel]]
         else:
             rows = list(y_of.values())
+        color, hatch = style_of.get(span.kind, (_MUTED, ""))
+        lane = lane_of.get(span.kind, 0)
         for y in rows:
+            center = y - 0.39 + (lane + 0.5) * lane_height
             ax.barh(
-                y, max(span.end_s - span.start_s, 1e-3), left=span.start_s, height=0.55,
-                color=colors.get(span.kind, _MUTED), align="center", alpha=0.9, zorder=2,
+                center, max(span.end_s - span.start_s, 1e-3), left=span.start_s,
+                height=lane_height * 0.86, color=color, hatch=hatch,
+                edgecolor="#ffffff", linewidth=0.4, align="center", zorder=2,
             )
     ax.set_yticks(list(y_of.values()))
     ax.set_yticklabels(list(y_of.keys()))
     ax.set_xlabel("Time (s)")
     ax.set_ylim(-0.8, max(len(recording_names) - 0.2, 0.8))
     _cursor(ax, inspection)
-    ax.set_title("Red detected   ·   orange suspected   ·   blue already left out   ·   teal chosen here", fontsize=9, loc="left")
+    shown = []
+    for kind, color, hatch in kinds:
+        if not any(span.kind == kind for span in spans):
+            continue
+        shown.append(Patch(
+            facecolor=color, edgecolor="#16232f", hatch=hatch, label=kind,
+        ))
+    if shown:
+        ax.legend(handles=shown, frameon=False, fontsize=7, loc="upper right", ncol=2)
+    ax.set_title("Each kind has its own stripe.", fontsize=9, loc="left")
     style_axes(ax)
     stamp_figure(fig)
 
@@ -475,9 +547,9 @@ def _line_series(axes, series: ChannelSeries, tracks: list[PeakTrack], note: str
         values, label = series.exponent, "Exponent"
     else:
         values, label = top
-    _series(axes[0], series.times_s, values, series.weak, label, _BLUE)
-    _series(axes[1], series.times_s, series.peak_height, series.weak | series.at_floor, "Peak height (log10)", _ORANGE)
-    _series(axes[2], series.times_s, series.peak_hz, series.weak | series.at_floor, "Peak frequency (Hz)", _TRACE)
+    _series(axes[0], series.times_s, values, series.weak, label, _BLUE, "Weak fit")
+    _series(axes[1], series.times_s, series.peak_height, series.weak | series.at_floor, "Peak height (log10)", _ORANGE, "Weak fit")
+    _series(axes[2], series.times_s, series.peak_hz, series.weak | series.at_floor, "Peak frequency (Hz)", _TRACE, "Weak fit")
     for track in tracks:
         if len(track.centers) >= 2:
             axes[2].plot(track.times, track.centers, color=_BLUE, lw=1.1, zorder=2)
@@ -492,15 +564,38 @@ def _line_series(axes, series: ChannelSeries, tracks: list[PeakTrack], note: str
         style_axes(ax, grid=True)
 
 
-def _series(ax, times, values, weak, label, color) -> None:
+def _series(ax, times, values, weak, label, color, marker_label: str | None = None) -> None:
     ax.plot(times, values, color=color, lw=1.3, zorder=2)
     if weak is not None and np.any(weak & np.isfinite(values)):
         ax.plot(times[weak], values[weak], linestyle="none", marker="o", ms=4,
-                markerfacecolor="white", markeredgecolor=color, zorder=3)
-    ax.set_ylabel(label)
+                markerfacecolor="white", markeredgecolor=color, zorder=3, label=marker_label)
+        if marker_label:
+            ax.legend(frameon=False, fontsize=8, loc="upper right")
+    ax.set_ylabel(label, fontsize=8)
 
 
-def _raw(ax, raw, inspection) -> None:
+def _power_axis(payload: dict) -> str:
+    return f"Band power ({payload.get('unit') or 'µV²/Hz'})"
+
+
+def _coherence_bands(ax, result: CoherenceResult) -> None:
+    if result.freqs_hz.size == 0:
+        return
+    low = float(result.freqs_hz[0])
+    high = float(result.freqs_hz[-1])
+    for start, stop, _name, color in (
+        (1.0, 4.0, "delta", "#d9e4f2"),
+        (4.0, 8.0, "theta", "#d7efe9"),
+        (8.0, 12.0, "alpha", "#c9dcf0"),
+        (13.0, 30.0, "beta", "#f3e4d4"),
+        (30.0, 45.0, "gamma", "#e6dff0"),
+    ):
+        left, right = max(start, low), min(stop, high)
+        if right > left:
+            ax.axvspan(left, right, color=color, zorder=0, lw=0)
+
+
+def _raw(ax, raw, inspection, unit: str = "µV") -> None:
     if not raw or raw[0].size == 0:
         ax.axis("off")
         ax.text(0.5, 0.5, "Click the spectrogram to see that stretch.", ha="center", va="center", color=_MUTED, fontsize=9)
@@ -518,7 +613,7 @@ def _raw(ax, raw, inspection) -> None:
         center, span = inspection
         ax.axvspan(center - span / 2.0, center + span / 2.0, color=_TEAL, alpha=0.15, lw=0)
     ax.set_xlim(times[0], times[-1])
-    ax.set_ylabel("µV")
+    ax.set_ylabel(unit or "µV")
     ax.set_xlabel("Time (s)")
     style_axes(ax)
 
@@ -542,13 +637,13 @@ def _window_spectrum(ax, window) -> None:
     if item.aperiodic is not None:
         ax.plot(item.freqs, item.aperiodic, color=_TEAL, lw=1.2, ls="--", label="Aperiodic", zorder=3)
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("log10 power")
+    ax.set_ylabel(_power_label(fit))
     exponent = "" if item.exponent is None else f"   ·   exponent {item.exponent:.2f}"
     ax.set_title(
-        f"{item.name}   ·   {fit.t_start:.0f}–{fit.t_end:.0f} s{exponent}",
+        f"{item.name}   ·   {format_seconds(fit.t_start)}–{format_seconds(fit.t_end)} s{exponent}",
         fontsize=9, loc="left",
     )
-    ax.legend(frameon=False, fontsize=8)
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
     style_axes(ax, grid=True)
 
 
@@ -600,7 +695,7 @@ def _event_course(ax, grid, curves, ylabel: str, title: str) -> None:
     style_axes(ax, grid=True)
 
 
-def _pair_raw(ax, raw) -> None:
+def _pair_raw(ax, raw, unit: str = "µV") -> None:
     ax.set_label("raw")
     duration = None
     stretches = []
@@ -627,7 +722,7 @@ def _pair_raw(ax, raw) -> None:
             0.5, 0.5, "Click this row to choose a time.",
             transform=ax.transAxes, ha="center", va="center", color=_MUTED, fontsize=9,
         )
-    ax.set_ylabel("µV")
+    ax.set_ylabel(unit or "µV")
     ax.set_xlabel("Time (s)")
     if plotted:
         ax.legend(frameon=False, fontsize=8)
@@ -636,7 +731,7 @@ def _pair_raw(ax, raw) -> None:
 
 def _shape_histograms(fig, layout, fit: CycleFit, bursts_only: bool) -> None:
     fields = (
-        ("volt_amp", "Amplitude (µV)"),
+        ("volt_amp", f"Amplitude ({fit.unit or 'µV'})"),
         ("period_ms", "Period (ms)"),
         ("rise_decay", "Rise/decay"),
         ("peak_trough", "Peak/trough"),

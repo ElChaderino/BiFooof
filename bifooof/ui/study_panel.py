@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCombo
     QDoubleSpinBox, QInputDialog, QFileDialog, QDialog, QFormLayout, QLineEdit, QDialogButtonBox)
 
 from ..analysis.insights import (epoch_rows, stability_summary, run_stability, alpha_candidates, regional_rows, asymmetry)
-from ..analysis.settings import matched_settings
+from ..analysis.settings import matched_settings, power_unit
 from ..events import event_table
 from ..project import read_project, atomic_json
 from ..plots import clear_figure, style_axes
@@ -175,7 +175,7 @@ class StudyPanel(QWidget):
             self.caption.setText(f"{window.active.upper()} defines the proposed band. Accepting it applies the same edges to both conditions. Select a candidate row." if self._rows else "No supported peak candidate. Inspect the spectrum or change the explicit search range/group.")
             self.accept.setEnabled(bool(self._rows))
             ax.set_xlabel("Frequency (Hz)")
-            ax.set_ylabel("log10 PSD (µV²/Hz)")
+            ax.set_ylabel(_study_power(fit))
             ax.set_title("Posterior/region alpha candidates · reviewer confirmation required", loc="left", fontsize=10)
         elif mode == 2:
             rows = regional_rows(window.spectrum.fits, state["regions"], window.spectrum.settings.alpha_band())
@@ -185,7 +185,7 @@ class StudyPanel(QWidget):
             if chosen:
                 ax.bar(np.arange(len(chosen)), [row[key] for row in chosen], color="#1c4e78")
                 ax.set_xticks(np.arange(len(chosen)), [f"{row['condition']} {row.get('region', '')}" for row in chosen], rotation=20)
-            ax.set_ylabel("log10(left PSD /\nright PSD)" if self.asymmetry.currentIndex() else "Mean PSD\n(µV²/Hz)", fontsize=9)
+            ax.set_ylabel("log10(left PSD /\nright PSD)" if self.asymmetry.currentIndex() else _study_power(fit), fontsize=9)
             ax.set_xlabel("Condition and declared region")
             ax.set_title("Regional channel summaries", loc="left", fontsize=10)
             self.caption.setText("Summaries use common fitted channels across conditions. Missing members are listed. These are summaries of channel fits, not a new fit to an averaged regional spectrum.")
@@ -420,3 +420,8 @@ class StudyPanel(QWidget):
         index = self.table.currentRow()
         if self.mode.currentIndex() == 4 and 0 <= index < len(self._rows):
             self.workspace.open_project(self._rows[index]["project"])
+
+
+def _study_power(fit) -> str:
+    applied = "stored" if fit is None else str((fit.provenance or {}).get("reference_applied", "stored"))
+    return f"log10 power ({power_unit(applied)})"

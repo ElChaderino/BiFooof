@@ -57,6 +57,19 @@ def format_description(info: dict) -> str:
     return "\n".join(lines)
 
 
+def _leading_number(text: str) -> float:
+    """Read the number at the start of a band edge, ignoring a trailing unit."""
+    token = ""
+    for char in text.strip():
+        if char.isdigit() or char in ".+-":
+            token += char
+            continue
+        break
+    if not token or token in {"+", "-", ".", "+.", "-."}:
+        raise ValueError(text)
+    return float(token)
+
+
 def resolve_band(text: str) -> tuple[float, float]:
     key = text.strip().lower().replace("–", "-")
     if key in _BANDS:
@@ -66,7 +79,10 @@ def resolve_band(text: str) -> tuple[float, float]:
             return limits
     parts = key.replace(",", "-").split("-")
     if len(parts) == 2:
-        low, high = float(parts[0]), float(parts[1])
+        try:
+            low, high = _leading_number(parts[0]), _leading_number(parts[1])
+        except ValueError:
+            low = high = 0.0
         if high > low > 0:
             return low, high
     known = ", ".join(_BANDS)

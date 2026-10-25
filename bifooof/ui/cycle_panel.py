@@ -340,7 +340,11 @@ class CyclePanel(QWidget):
             ("Period (ms)", None if fit is None else fit.period_ms, None if fit is None else fit.burst_period_ms),
             ("Rise–decay symmetry", None if fit is None else fit.rise_decay, None if fit is None else fit.burst_rise_decay),
             ("Peak–trough symmetry", None if fit is None else fit.peak_trough, None if fit is None else fit.burst_peak_trough),
-            ("Voltage amplitude (µV)", None if fit is None else fit.volt_amp, None if fit is None else fit.burst_volt_amp),
+            (
+                f"Voltage amplitude ({'µV' if fit is None else fit.unit})",
+                None if fit is None else fit.volt_amp,
+                None if fit is None else fit.burst_volt_amp,
+            ),
         ]
         for row, (label, all_cycles, bursts) in enumerate(rows):
             self.table.setItem(row, 0, _cell(label))
@@ -369,6 +373,8 @@ class CyclePanel(QWidget):
 
     def _fill_episodes(self) -> None:
         fit = self.fit
+        unit = "µV" if fit is None else fit.unit
+        self.episodes.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Cycles", "Period (ms)", f"Voltage ({unit})"])
         rows = [] if fit is None else fit.episodes
         self.episodes.setRowCount(max(len(rows), 1))
         if not rows:
@@ -422,17 +428,19 @@ class CyclePanel(QWidget):
             right = fit.t_offset + span_stop / sfreq
             if right < times[0] or left > t_end:
                 continue
-            ax.axvspan(max(left, times[0]), min(right, t_end), color=_BURST, alpha=0.28, lw=0, zorder=0)
+            ax.axvspan(max(left, times[0]), min(right, t_end), color=_BURST, alpha=0.45, lw=0, zorder=0)
         peak_idx = [peak for peak in fit.peaks if start <= peak < stop]
         if peak_idx:
             ax.plot(fit.t_offset + np.asarray(peak_idx) / sfreq, fit.filtered[peak_idx],
-                    linestyle="none", marker="o", ms=3.5, color="#b3261e", label="Peaks", zorder=3)
+                    linestyle="none", marker="o", ms=5.5, color="#b3261e",
+                    markeredgecolor="white", markeredgewidth=0.6, label="Peaks", zorder=3)
+        ax.axhline(0.0, color="#d2dbe6", lw=0.8, zorder=1)
         ax.plot(view_t, view_y, color=_TRACE, lw=0.95, label="Filtered", zorder=2)
         pad = max(2.0, float(np.nanmax(np.abs(view_y))) * 0.12)
         ax.set_ylim(float(np.nanmin(view_y)) - pad, float(np.nanmax(view_y)) + pad)
         ax.set_xlim(times[0], times[-1])
         ax.set_xlabel("Time (s)")
-        ax.set_ylabel("µV")
+        ax.set_ylabel(fit.unit or "µV")
         ax.set_title(
             f"{fit.channel} filtered {fit.band[0]:g}–{fit.band[1]:g} Hz"
             "    ·    teal = burst",
